@@ -71,3 +71,8 @@ str.txt
 *.mkv
 *.bag
 *.db3
+
+# Generated privacy/release scan reports
+docs/private_string_scan.txt
+private_string_scan.txt
+*_private_string_scan.txt
