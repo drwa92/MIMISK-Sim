@@ -66,19 +66,6 @@ source install/setup.bash
 
 Start the bridge according to the documentation in `docs/` or the bridge package README. The default Unity bridge endpoint used during validation is typically `localhost:30052`.
 
-## Validation
-
-The Unity validation harness can run complete workflow, drone trajectory, MiniROV navigation, tether, and ROS2/gRPC tests. Generated logs and analysis outputs are intentionally ignored by Git and should be stored separately or released as datasets.
-
-Typical generated folders that are not committed:
-
-```text
-Logs/MIMISKValidation/
-Analysis/
-Backups/
-Library/
-UserSettings/
-```
 
 
 
@@ -88,8 +75,9 @@ If you use this simulator in research, please cite the related MIMISK-Sim paper 
 
 ```bibtex
 @software{mimisk_sim,
-  title  = {MIMISK-Sim: A Unity--ROS2--gRPC Digital Twin for Drone-Deployed MiniROV Missions},
-  author = {Waseem and collaborators},
+  title  = {MIMISK: A Modular Aerial–Tether–Underwater Simulation Framework for Kelp Farm Inspection and Marine Monitoring\\
+},
+  author = {Waseem Akram and Fausto Ferreira},
   year   = {2026},
   url    = {https://github.com/drwa92/MIMISK-Sim}
 }
