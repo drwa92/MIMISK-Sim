@@ -100,10 +100,4 @@ ReturnHome cancels:
 
 Then ReturnHome takes control and reaches RecoveryReady.
 
-## Deprecated
 
-PathPlanner.StopAndLookInspection is deprecated.
-
-Use:
-- normal path mission
-- then independent MissionManager.DwellAtCurrentPose
