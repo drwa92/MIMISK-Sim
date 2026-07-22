@@ -11,7 +11,7 @@ MIMISK-Sim is a Unity-based aerial--aquatic digital-twin simulator for drone-dep
 - MiniROV path following, depth control, return-home, and recovery readiness.
 - Guarded mission workflow and agent-based command interface.
 - ROS2/gRPC bridge for telemetry, camera streams, commands, manual input, and external references.
-- Validation harness and analysis scripts for simulator-paper experiments.
+
 
 ## Repository Structure
 
