@@ -1,0 +1,1192 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.UI;
+
+[DisallowMultipleComponent]
+public class MIMISKMissionDashboardGadgets : MonoBehaviour
+{
+    [Header("Gadgets")]
+    public bool gadgetsEnabled = true;
+    public bool buildOnStart = true;
+    public bool autoFindOnStart = true;
+    public bool autoFindPeriodically = true;
+    public float autoFindPeriodS = 2.0f;
+
+    [Header("Canvas")]
+    public Canvas dashboardCanvas;
+    public RectTransform rootRect;
+    public Font uiFont;
+
+    [Header("References")]
+    public MonoBehaviour dashboard;
+
+    public MonoBehaviour droneTrajectoryPlanner;
+    public MonoBehaviour droneMissionManager;
+    public MonoBehaviour droneFlightManager;
+    public MonoBehaviour droneAgent;
+
+    public MonoBehaviour miniRovPathPlanner;
+    public MonoBehaviour miniRovMissionManager;
+    public MonoBehaviour miniRovAgent;
+
+    public MonoBehaviour unifiedTether;
+    public MonoBehaviour lowLevelTether;
+    public MonoBehaviour smartWinch;
+
+    public Transform droneRoot;
+    public Transform miniRovRoot;
+
+    [Header("UI Layout")]
+    public bool coverOldBottomTelemetry = true;
+    public bool coverOldCameraGap = true;
+
+    [Range(0.75f, 1.45f)]
+    public float fontScale = 1.08f;
+
+    public bool useTextShadow = true;
+
+    [Header("Top-down Map")]
+    public bool enableTopDownMap = true;
+    public int mapTextureWidth = 768;
+    public int mapTextureHeight = 512;
+    public float mapHeightM = 35.0f;
+    public float mapOrthographicSizeM = 8.0f;
+    public bool mapFollowRovAndDroneMidpoint = true;
+    public Camera topDownCamera;
+    public RenderTexture topDownTexture;
+    public RawImage topDownRawImage;
+
+    [Header("Dropdown Runtime")]
+    public Dropdown droneTrajectoryDropdown;
+    public Dropdown miniRovPathDropdown;
+    public Text selectorStatusText;
+
+    [Header("Runtime")]
+    public string selectedDroneTrajectory = "missing";
+    public string selectedMiniRovPath = "missing";
+    public string phaseSummary = "idle";
+    public string lastUiEvent = "idle";
+
+    private readonly List<Gauge> gauges = new List<Gauge>();
+    private readonly List<PhaseNode> phaseNodes = new List<PhaseNode>();
+
+    private float autoFindTimerS;
+
+    private Color panel = new Color(0.015f, 0.055f, 0.070f, 0.88f);
+    private Color panel2 = new Color(0.020f, 0.085f, 0.105f, 0.92f);
+    private Color dark = new Color(0.010f, 0.025f, 0.035f, 0.92f);
+    private Color green = new Color(0.10f, 0.65f, 0.22f, 0.96f);
+    private Color blue = new Color(0.02f, 0.34f, 0.78f, 0.96f);
+    private Color yellow = new Color(0.98f, 0.64f, 0.06f, 0.96f);
+    private Color red = new Color(0.86f, 0.08f, 0.08f, 0.96f);
+    private Color white = new Color(0.88f, 0.96f, 1.0f, 1.0f);
+    private Color muted = new Color(0.60f, 0.76f, 0.84f, 1.0f);
+
+    private class Gauge
+    {
+        public string name;
+        public Image fill;
+        public Text label;
+        public Text value;
+    }
+
+    private class PhaseNode
+    {
+        public string name;
+        public Image dot;
+        public Text label;
+    }
+
+    private void OnDisable()
+    {
+        ReleaseTopDownTextureSafely();
+    }
+
+    private void OnDestroy()
+    {
+        ReleaseTopDownTextureSafely();
+    }
+
+    private void Awake()
+    {
+        if (autoFindOnStart)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    private void Start()
+    {
+        if (buildOnStart)
+        {
+            BuildGadgets();
+        }
+    }
+
+    private void Update()
+    {
+        if (!gadgetsEnabled)
+        {
+            if (rootRect != null)
+            {
+                rootRect.gameObject.SetActive(false);
+            }
+
+            return;
+        }
+
+        if (rootRect != null && !rootRect.gameObject.activeSelf)
+        {
+            rootRect.gameObject.SetActive(true);
+        }
+
+        if (autoFindPeriodically)
+        {
+            autoFindTimerS += Time.unscaledDeltaTime;
+
+            if (autoFindTimerS >= autoFindPeriodS)
+            {
+                autoFindTimerS = 0.0f;
+                AutoFindReferences();
+            }
+        }
+
+        UpdateGauges();
+        UpdatePhaseTimeline();
+        UpdateTopDownMap();
+        UpdateSelectorStatus();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (dashboard == null) dashboard = FindBehaviourByTypeName("MIMISKMissionControlDashboard");
+
+        if (droneTrajectoryPlanner == null) droneTrajectoryPlanner = FindBehaviourByTypeName("MIMISKDroneCoreTrajectoryPlanner");
+        if (droneMissionManager == null) droneMissionManager = FindBehaviourByTypeName("MIMISKDroneCoreMissionManager");
+        if (droneFlightManager == null) droneFlightManager = FindBehaviourByTypeName("MIMISKDroneCoreFlightModeManager");
+        if (droneAgent == null) droneAgent = FindBehaviourByTypeName("MIMISKDroneAgent");
+
+        if (miniRovPathPlanner == null) miniRovPathPlanner = FindBehaviourByTypeName("MIMISKMiniROVPathPlanner");
+        if (miniRovMissionManager == null) miniRovMissionManager = FindBehaviourByTypeName("MIMISKMiniROVMissionManager");
+        if (miniRovAgent == null) miniRovAgent = FindBehaviourByTypeName("MIMISKMiniROVAgent");
+
+        if (unifiedTether == null) unifiedTether = FindBehaviourByTypeName("MIMISKUnifiedTetherManager");
+        if (lowLevelTether == null) lowLevelTether = FindBehaviourByTypeName("MIMISKDroneCoreTetherManager");
+        if (smartWinch == null) smartWinch = FindBehaviourByTypeName("MIMISKTetherSmartWinchController");
+
+        if (droneRoot == null)
+        {
+            GameObject drone = GameObject.Find("Drone");
+
+            if (drone != null)
+            {
+                droneRoot = drone.transform;
+            }
+        }
+
+        if (miniRovRoot == null)
+        {
+            Transform t = ReadTransform(unifiedTether, "miniRovRoot");
+
+            if (t != null)
+            {
+                miniRovRoot = t;
+            }
+            else
+            {
+                GameObject rov = GameObject.Find("MiniROV");
+
+                if (rov != null)
+                {
+                    miniRovRoot = rov.transform;
+                }
+            }
+        }
+
+        if (dashboardCanvas == null)
+        {
+            MIMISKMissionControlDashboard d =
+                dashboard as MIMISKMissionControlDashboard;
+
+            if (d != null)
+            {
+                dashboardCanvas = d.canvas;
+            }
+        }
+
+        if (dashboardCanvas == null)
+        {
+            dashboardCanvas = FindObjectOfType<Canvas>();
+        }
+    }
+
+    [ContextMenu("Build Gadgets")]
+    public void BuildGadgets()
+    {
+        AutoFindReferences();
+
+        if (dashboardCanvas == null)
+        {
+            Debug.LogError("[MIMISK] Dashboard gadgets need a Canvas. Run Setup Mission Control Dashboard first.");
+            return;
+        }
+
+        if (uiFont == null)
+        {
+            uiFont = ResolveRuntimeFont();
+        }
+
+        ClearOldRoot();
+
+        GameObject root = new GameObject("MIMISK_Dashboard_Gadgets");
+        root.transform.SetParent(dashboardCanvas.transform, false);
+
+        rootRect = root.AddComponent<RectTransform>();
+        rootRect.anchorMin = new Vector2(0.5f, 0.5f);
+        rootRect.anchorMax = new Vector2(0.5f, 0.5f);
+        rootRect.pivot = new Vector2(0.5f, 0.5f);
+        rootRect.anchoredPosition = Vector2.zero;
+        rootRect.sizeDelta = new Vector2(1920, 1080);
+        rootRect.localScale = Vector3.one;
+
+        gauges.Clear();
+        phaseNodes.Clear();
+
+        if (coverOldBottomTelemetry)
+        {
+            CreatePanel("BottomGadgetBackdrop", rootRect, 290, 715, 880, 285, new Color(0.0f, 0.045f, 0.055f, 0.92f));
+        }
+
+        if (coverOldCameraGap)
+        {
+            CreatePanel("SelectorBackdrop", rootRect, 1180, 380, 350, 320, new Color(0.0f, 0.045f, 0.060f, 0.90f));
+        }
+
+        BuildPhaseTimeline(rootRect);
+        BuildSelectorPanel(rootRect);
+        BuildGaugePanel(rootRect);
+        BuildTopDownMapPanel(rootRect);
+
+        PopulateDropdowns();
+
+        lastUiEvent = "dashboard_gadgets_built";
+    }
+
+    private void BuildPhaseTimeline(Transform parent)
+    {
+        CreatePanel("PhaseTimelinePanel", parent, 300, 92, 850, 58, new Color(0.0f, 0.035f, 0.050f, 0.70f));
+        CreateText("PhaseTitle", parent, 315, 100, 120, 18, "MISSION PHASE", 13, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        string[] phases =
+        {
+            "Surface",
+            "Deploy",
+            "ROV Ctrl",
+            "Mission",
+            "Return",
+            "Recover"
+        };
+
+        float startX = 445.0f;
+        float y = 104.0f;
+        float step = 115.0f;
+
+        for (int i = 0; i < phases.Length; i++)
+        {
+            PhaseNode node = new PhaseNode();
+            node.name = phases[i];
+
+            GameObject dot = CreatePanel("PhaseDot_" + phases[i], parent, startX + i * step, y, 18, 18, muted);
+            node.dot = dot.GetComponent<Image>();
+
+            node.label = CreateText(
+                "PhaseLabel_" + phases[i],
+                parent,
+                startX + i * step - 35,
+                y + 22,
+                90,
+                18,
+                phases[i],
+                11,
+                FontStyle.Bold,
+                white,
+                TextAnchor.MiddleCenter
+            );
+
+            phaseNodes.Add(node);
+
+            if (i < phases.Length - 1)
+            {
+                CreatePanel("PhaseLine_" + i, parent, startX + i * step + 18, y + 7, step - 18, 4, new Color(0.40f, 0.70f, 0.80f, 0.55f));
+            }
+        }
+    }
+
+    private void BuildSelectorPanel(Transform parent)
+    {
+        CreateText("SelectorTitle", parent, 1200, 392, 300, 24, "MISSION / PATH SELECTION", 15, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        CreateText("DronePlanLabel", parent, 1200, 428, 130, 18, "Drone planner", 12, FontStyle.Bold, muted, TextAnchor.MiddleLeft);
+        droneTrajectoryDropdown = CreateDropdown("DroneTrajectoryDropdown", parent, 1200, 452, 310, 34);
+        CreateButton(parent, 1200, 492, 150, 34, "APPLY DRONE", blue, ApplyDroneTrajectorySelection);
+        CreateButton(parent, 1360, 492, 150, 34, "START DRONE", green, StartDroneSelectedMission);
+
+        CreateText("MiniRovPlanLabel", parent, 1200, 538, 150, 18, "MiniROV path", 12, FontStyle.Bold, muted, TextAnchor.MiddleLeft);
+        miniRovPathDropdown = CreateDropdown("MiniRovPathDropdown", parent, 1200, 562, 310, 34);
+        CreateButton(parent, 1200, 602, 150, 34, "APPLY ROV", blue, ApplyMiniRovPathSelection);
+        CreateButton(parent, 1360, 602, 150, 34, "START ROV", green, StartMiniRovSelectedMission);
+
+        selectorStatusText =
+            CreateText(
+                "SelectorStatus",
+                parent,
+                1200,
+                645,
+                310,
+                40,
+                "Selectors ready",
+                11,
+                FontStyle.Normal,
+                white,
+                TextAnchor.UpperLeft
+            );
+    }
+
+    private void BuildGaugePanel(Transform parent)
+    {
+        CreatePanel("TetherGaugePanel", parent, 300, 730, 420, 250, panel);
+        CreateText("TetherGaugeTitle", parent, 320, 745, 360, 24, "TETHER GAUGES", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        CreateGauge(parent, "Deployed", 320, 790, 360);
+        CreateGauge(parent, "Target", 320, 830, 360);
+        CreateGauge(parent, "Slack", 320, 870, 360);
+        CreateGauge(parent, "Stretch", 320, 910, 360);
+        CreateGauge(parent, "Winch", 320, 950, 360);
+    }
+
+    private void BuildTopDownMapPanel(Transform parent)
+    {
+        CreatePanel("TopDownMapPanel", parent, 735, 730, 420, 250, panel);
+        CreateText("TopDownTitle", parent, 755, 745, 360, 24, "TOP-DOWN MAP / TRAJECTORY", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        topDownRawImage =
+            CreateRawImage("TopDownMapRawImage", parent, 755, 780, 380, 185, new Color(0.0f, 0.0f, 0.0f, 0.90f));
+
+        CreateText(
+            "TopDownLegend",
+            parent,
+            755,
+            966,
+            380,
+            18,
+            "Drone / MiniROV / tether projected in scene top view",
+            11,
+            FontStyle.Normal,
+            muted,
+            TextAnchor.MiddleCenter
+        );
+
+        EnsureTopDownCamera();
+    }
+
+    private void CreateGauge(Transform parent, string name, float x, float y, float w)
+    {
+        Gauge g = new Gauge();
+        g.name = name;
+
+        g.label = CreateText("GaugeLabel_" + name, parent, x, y, 80, 20, name, 12, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        CreatePanel("GaugeBack_" + name, parent, x + 90, y + 2, w - 170, 16, new Color(0.05f, 0.12f, 0.14f, 0.90f));
+        GameObject fillGo = CreatePanel("GaugeFill_" + name, parent, x + 90, y + 2, 10, 16, green);
+
+        g.fill = fillGo.GetComponent<Image>();
+        RectTransform fillRt = fillGo.GetComponent<RectTransform>();
+        fillRt.anchorMin = new Vector2(0.0f, 1.0f);
+        fillRt.anchorMax = new Vector2(0.0f, 1.0f);
+        fillRt.pivot = new Vector2(0.0f, 1.0f);
+
+        g.value = CreateText("GaugeValue_" + name, parent, x + w - 70, y, 80, 20, "--", 12, FontStyle.Bold, white, TextAnchor.MiddleRight);
+
+        gauges.Add(g);
+    }
+
+    private void PopulateDropdowns()
+    {
+        PopulateDropdownFromEnumField(droneTrajectoryDropdown, droneTrajectoryPlanner, "trajectoryType");
+        PopulateDropdownFromEnumField(miniRovPathDropdown, miniRovPathPlanner, "selectedPathType");
+
+        selectedDroneTrajectory = CurrentEnumName(droneTrajectoryPlanner, "trajectoryType");
+        selectedMiniRovPath = CurrentEnumName(miniRovPathPlanner, "selectedPathType");
+    }
+
+    private void UpdateGauges()
+    {
+        if (gauges.Count == 0)
+        {
+            return;
+        }
+
+        float deployed = ReadFloat(lowLevelTether, "deployedLengthM", 0.0f);
+        float target = ReadFloat(lowLevelTether, "targetLengthM", 0.0f);
+        float maxLen = Mathf.Max(0.01f, ReadFloat(lowLevelTether, "maximumLengthM", 12.0f));
+        float slack = ReadFloat(lowLevelTether, "slackM", 0.0f);
+        float stretch = ReadFloat(lowLevelTether, "stretchM", 0.0f);
+        float winchRate = ReadFloat(lowLevelTether, "winchCommandRateMS", 0.0f);
+
+        SetGauge("Deployed", deployed / maxLen, deployed.ToString("F2") + " m", green);
+        SetGauge("Target", target / maxLen, target.ToString("F2") + " m", blue);
+
+        Color slackColor = slack > 0.60f ? red : (slack > 0.25f ? yellow : green);
+        SetGauge("Slack", Mathf.Clamp01(slack / 0.80f), slack.ToString("F2") + " m", slackColor);
+
+        Color stretchColor = stretch > 0.03f ? red : (stretch > 0.01f ? yellow : green);
+        SetGauge("Stretch", Mathf.Clamp01(stretch / 0.08f), stretch.ToString("F3") + " m", stretchColor);
+
+        float maxRate = Mathf.Max(
+            0.01f,
+            Mathf.Max(
+                ReadFloat(lowLevelTether, "payoutSpeedMS", 0.25f),
+                ReadFloat(lowLevelTether, "recoverySpeedMS", 0.30f)
+            )
+        );
+
+        Color winchColor = Mathf.Abs(winchRate) > 0.01f ? blue : muted;
+        SetGauge("Winch", Mathf.Clamp01(Mathf.Abs(winchRate) / maxRate), winchRate.ToString("F2") + " m/s", winchColor);
+    }
+
+    private void UpdatePhaseTimeline()
+    {
+        if (phaseNodes.Count == 0)
+        {
+            return;
+        }
+
+        string droneFlight = ReadString(droneFlightManager, "flightMode", "missing");
+        string droneMission = ReadString(droneMissionManager, "missionState", "missing");
+        string tetherState = ReadString(unifiedTether, "tetherState", "missing");
+        string rovMission = ReadString(miniRovMissionManager, "missionState", "missing");
+
+        bool surface =
+            droneFlight.Contains("Surface") ||
+            droneMission.Contains("ReadyForTether");
+
+        bool deploy =
+            tetherState.Contains("Deploying") ||
+            tetherState.Contains("DynamicStabilizing") ||
+            tetherState.Contains("ReadyForRovControl") ||
+            tetherState.Contains("RovControlActive");
+
+        bool rovControl =
+            tetherState.Contains("RovControlActive") ||
+            rovMission.Contains("StationHolding") ||
+            rovMission.Contains("ExecutingMission");
+
+        bool mission =
+            rovMission.Contains("ExecutingMission") ||
+            rovMission.Contains("Dwelling") ||
+            rovMission.Contains("StopAndLook");
+
+        bool returning =
+            rovMission.Contains("ReturningHome") ||
+            rovMission.Contains("RecoveryReady");
+
+        bool recover =
+            tetherState.Contains("Recovering") ||
+            tetherState.Contains("Recovered");
+
+        SetPhase("Surface", surface, surface && !deploy);
+        SetPhase("Deploy", deploy, tetherState.Contains("Deploying") || tetherState.Contains("DynamicStabilizing"));
+        SetPhase("ROV Ctrl", rovControl, tetherState.Contains("RovControlActive") && !mission);
+        SetPhase("Mission", mission, mission);
+        SetPhase("Return", returning, rovMission.Contains("ReturningHome"));
+        SetPhase("Recover", recover, tetherState.Contains("Recovering"));
+
+        phaseSummary =
+            "Drone=" + droneFlight +
+            "; Tether=" + tetherState +
+            "; ROV=" + rovMission;
+    }
+
+    private void UpdateTopDownMap()
+    {
+        if (!enableTopDownMap || topDownRawImage == null)
+        {
+            return;
+        }
+
+        EnsureTopDownCamera();
+
+        if (topDownCamera == null || topDownTexture == null)
+        {
+            return;
+        }
+
+        Vector3 center = Vector3.zero;
+
+        if (mapFollowRovAndDroneMidpoint && droneRoot != null && miniRovRoot != null)
+        {
+            center = 0.5f * (droneRoot.position + miniRovRoot.position);
+        }
+        else if (miniRovRoot != null)
+        {
+            center = miniRovRoot.position;
+        }
+        else if (droneRoot != null)
+        {
+            center = droneRoot.position;
+        }
+
+        topDownCamera.transform.position =
+            new Vector3(center.x, mapHeightM, center.z);
+
+        topDownCamera.transform.rotation =
+            Quaternion.Euler(90.0f, 0.0f, 0.0f);
+
+        topDownCamera.orthographic = true;
+        topDownCamera.orthographicSize = mapOrthographicSizeM;
+        topDownCamera.targetTexture = topDownTexture;
+        topDownCamera.enabled = true;
+
+        topDownRawImage.texture = topDownTexture;
+    }
+
+    private void UpdateSelectorStatus()
+    {
+        if (selectorStatusText == null)
+        {
+            return;
+        }
+
+        selectorStatusText.text =
+            "Drone: " + CurrentEnumName(droneTrajectoryPlanner, "trajectoryType") + "\n" +
+            "MiniROV: " + CurrentEnumName(miniRovPathPlanner, "selectedPathType") + "\n" +
+            "Last: " + lastUiEvent;
+    }
+
+    private void ApplyDroneTrajectorySelection()
+    {
+        if (droneTrajectoryDropdown == null)
+        {
+            return;
+        }
+
+        string value =
+            droneTrajectoryDropdown.options[droneTrajectoryDropdown.value].text;
+
+        bool okPlanner =
+            SetEnumFieldOrProperty(droneTrajectoryPlanner, "trajectoryType", value);
+
+        // Mission manager uses the same trajectory enum type for survey/transit/deployment fields.
+        // We set surveyTrajectory because the UI is a user-selected mission/pattern choice.
+        SetEnumFieldOrProperty(droneMissionManager, "surveyTrajectory", value);
+
+        selectedDroneTrajectory = value;
+        lastUiEvent = okPlanner ? "applied_drone_trajectory_" + value : "failed_apply_drone_trajectory";
+    }
+
+    private void StartDroneSelectedMission()
+    {
+        ApplyDroneTrajectorySelection();
+
+        if (!CallFirst(droneAgent, "AgentStartDroneMission", "AgentStartSelectedMission"))
+        {
+            if (!CallFirst(droneMissionManager, "StartMission"))
+            {
+                lastUiEvent = "failed_start_drone_mission";
+                return;
+            }
+        }
+
+        lastUiEvent = "started_drone_mission_" + selectedDroneTrajectory;
+    }
+
+    private void ApplyMiniRovPathSelection()
+    {
+        if (miniRovPathDropdown == null)
+        {
+            return;
+        }
+
+        string value =
+            miniRovPathDropdown.options[miniRovPathDropdown.value].text;
+
+        bool okPlanner =
+            SetEnumFieldOrProperty(miniRovPathPlanner, "selectedPathType", value);
+
+        SetBoolFieldOrProperty(miniRovMissionManager, "usePathPlannerSelectedPath", true);
+
+        selectedMiniRovPath = value;
+        lastUiEvent = okPlanner ? "applied_minirov_path_" + value : "failed_apply_minirov_path";
+    }
+
+    private void StartMiniRovSelectedMission()
+    {
+        ApplyMiniRovPathSelection();
+
+        if (!CallFirst(miniRovAgent, "AgentStartSelectedMission", "AgentStartCurrentPath", "AgentStartMission"))
+        {
+            if (!CallFirst(miniRovMissionManager, "StartSelectedMission", "StartMission"))
+            {
+                lastUiEvent = "failed_start_minirov_mission";
+                return;
+            }
+        }
+
+        lastUiEvent = "started_minirov_path_" + selectedMiniRovPath;
+    }
+
+    private void SetGauge(string name, float fraction, string value, Color fillColor)
+    {
+        Gauge g = gauges.Find(x => x.name == name);
+
+        if (g == null || g.fill == null)
+        {
+            return;
+        }
+
+        RectTransform rt = g.fill.GetComponent<RectTransform>();
+        float maxWidth = 190.0f;
+        rt.sizeDelta = new Vector2(Mathf.Clamp01(fraction) * maxWidth, rt.sizeDelta.y);
+
+        g.fill.color = fillColor;
+
+        if (g.value != null)
+        {
+            g.value.text = value;
+        }
+    }
+
+    private void SetPhase(string name, bool completedOrAvailable, bool active)
+    {
+        PhaseNode node = phaseNodes.Find(x => x.name == name);
+
+        if (node == null || node.dot == null)
+        {
+            return;
+        }
+
+        if (active)
+        {
+            node.dot.color = yellow;
+        }
+        else if (completedOrAvailable)
+        {
+            node.dot.color = green;
+        }
+        else
+        {
+            node.dot.color = muted;
+        }
+    }
+
+    private void ReleaseTopDownTextureSafely()
+    {
+        if (topDownCamera != null &&
+            topDownCamera.targetTexture == topDownTexture)
+        {
+            topDownCamera.targetTexture = null;
+        }
+
+        if (topDownRawImage != null &&
+            topDownRawImage.texture == topDownTexture)
+        {
+            topDownRawImage.texture = null;
+        }
+
+        if (topDownTexture != null)
+        {
+            topDownTexture.Release();
+            topDownTexture = null;
+        }
+    }
+
+    private void EnsureTopDownCamera()
+    {
+        if (!enableTopDownMap)
+        {
+            return;
+        }
+
+        if (topDownTexture == null ||
+            topDownTexture.width != mapTextureWidth ||
+            topDownTexture.height != mapTextureHeight)
+        {
+            ReleaseTopDownTextureSafely();
+
+            topDownTexture =
+                new RenderTexture(
+                    Mathf.Max(128, mapTextureWidth),
+                    Mathf.Max(128, mapTextureHeight),
+                    16,
+                    RenderTextureFormat.ARGB32
+                );
+
+            topDownTexture.name =
+                "MIMISK_TopDownMap_RT";
+
+            topDownTexture.Create();
+        }
+
+        if (topDownCamera == null)
+        {
+            GameObject go = GameObject.Find("MIMISK_TopDownMapCamera");
+
+            if (go == null)
+            {
+                go = new GameObject("MIMISK_TopDownMapCamera");
+                go.hideFlags = HideFlags.DontSave;
+            }
+
+            topDownCamera = go.GetComponent<Camera>();
+
+            if (topDownCamera == null)
+            {
+                topDownCamera = go.AddComponent<Camera>();
+            }
+
+            AudioListener listener = go.GetComponent<AudioListener>();
+
+            if (listener != null)
+            {
+                listener.enabled = false;
+            }
+        }
+
+        topDownCamera.clearFlags = CameraClearFlags.SolidColor;
+        topDownCamera.backgroundColor = new Color(0.0f, 0.05f, 0.07f, 1.0f);
+        topDownCamera.orthographic = true;
+        topDownCamera.targetDisplay = 0;
+        topDownCamera.depth = -80.0f;
+        topDownCamera.targetTexture = topDownTexture;
+    }
+
+    private void PopulateDropdownFromEnumField(Dropdown dropdown, object target, string memberName)
+    {
+        if (dropdown == null || target == null)
+        {
+            return;
+        }
+
+        Type enumType = GetMemberType(target, memberName);
+
+        dropdown.ClearOptions();
+
+        if (enumType == null || !enumType.IsEnum)
+        {
+            dropdown.AddOptions(new List<string> { "missing" });
+            return;
+        }
+
+        string[] names = Enum.GetNames(enumType);
+        dropdown.AddOptions(new List<string>(names));
+
+        string current = CurrentEnumName(target, memberName);
+        int index = Mathf.Max(0, Array.IndexOf(names, current));
+        dropdown.value = index;
+        dropdown.RefreshShownValue();
+    }
+
+    private bool SetEnumFieldOrProperty(object target, string memberName, string enumName)
+    {
+        if (target == null || string.IsNullOrEmpty(enumName))
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (field != null && field.FieldType.IsEnum)
+        {
+            object enumValue = Enum.Parse(field.FieldType, enumName);
+            field.SetValue(target, enumValue);
+            return true;
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (prop != null && prop.CanWrite && prop.PropertyType.IsEnum)
+        {
+            object enumValue = Enum.Parse(prop.PropertyType, enumName);
+            prop.SetValue(target, enumValue, null);
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool SetBoolFieldOrProperty(object target, string memberName, bool value)
+    {
+        if (target == null)
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (field != null && field.FieldType == typeof(bool))
+        {
+            field.SetValue(target, value);
+            return true;
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (prop != null && prop.CanWrite && prop.PropertyType == typeof(bool))
+        {
+            prop.SetValue(target, value, null);
+            return true;
+        }
+
+        return false;
+    }
+
+    private string CurrentEnumName(object target, string memberName)
+    {
+        object value = GetMember(target, memberName);
+        return value != null ? value.ToString() : "missing";
+    }
+
+    private Type GetMemberType(object target, string memberName)
+    {
+        if (target == null)
+        {
+            return null;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (field != null)
+        {
+            return field.FieldType;
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (prop != null)
+        {
+            return prop.PropertyType;
+        }
+
+        return null;
+    }
+
+    private bool CallFirst(object target, params string[] methodNames)
+    {
+        if (target == null)
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        for (int i = 0; i < methodNames.Length; i++)
+        {
+            MethodInfo method =
+                type.GetMethod(
+                    methodNames[i],
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+                );
+
+            if (method != null && method.GetParameters().Length == 0)
+            {
+                method.Invoke(target, null);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private object GetMember(object target, string name)
+    {
+        if (target == null || string.IsNullOrEmpty(name))
+        {
+            return null;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (field != null)
+        {
+            return field.GetValue(target);
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        if (prop != null && prop.CanRead)
+        {
+            return prop.GetValue(target, null);
+        }
+
+        return null;
+    }
+
+    private string ReadString(object target, string member, string fallback)
+    {
+        object value = GetMember(target, member);
+        return value != null ? value.ToString() : fallback;
+    }
+
+    private float ReadFloat(object target, string member, float fallback)
+    {
+        object value = GetMember(target, member);
+
+        if (value is float)
+        {
+            return (float)value;
+        }
+
+        if (value is int)
+        {
+            return (int)value;
+        }
+
+        if (value is double)
+        {
+            return (float)(double)value;
+        }
+
+        return fallback;
+    }
+
+    private bool ReadBool(object target, string member, bool fallback)
+    {
+        object value = GetMember(target, member);
+
+        if (value is bool)
+        {
+            return (bool)value;
+        }
+
+        return fallback;
+    }
+
+    private Transform ReadTransform(object target, string member)
+    {
+        return GetMember(target, member) as Transform;
+    }
+
+    private MonoBehaviour FindBehaviourByTypeName(string typeName)
+    {
+        MonoBehaviour[] behaviours = Resources.FindObjectsOfTypeAll<MonoBehaviour>();
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b = behaviours[i];
+
+            if (b == null || b.gameObject == null || !b.gameObject.scene.IsValid())
+            {
+                continue;
+            }
+
+            if (b.GetType().Name == typeName)
+            {
+                return b;
+            }
+        }
+
+        return null;
+    }
+
+    private Font ResolveRuntimeFont()
+    {
+        Font f = null;
+
+        try
+        {
+            f = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        }
+        catch
+        {
+            f = null;
+        }
+
+        if (f != null)
+        {
+            return f;
+        }
+
+        try
+        {
+            f = Font.CreateDynamicFontFromOSFont("Arial", 14);
+        }
+        catch
+        {
+            f = null;
+        }
+
+        return f;
+    }
+
+    private void ClearOldRoot()
+    {
+        if (dashboardCanvas == null)
+        {
+            return;
+        }
+
+        Transform old = dashboardCanvas.transform.Find("MIMISK_Dashboard_Gadgets");
+
+        if (old != null)
+        {
+            if (Application.isPlaying)
+            {
+                Destroy(old.gameObject);
+            }
+            else
+            {
+                DestroyImmediate(old.gameObject);
+            }
+        }
+    }
+
+    private GameObject CreatePanel(string name, Transform parent, float x, float y, float w, float h, Color color)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+
+        RectTransform rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.0f, 1.0f);
+        rt.anchorMax = new Vector2(0.0f, 1.0f);
+        rt.pivot = new Vector2(0.0f, 1.0f);
+        rt.anchoredPosition = new Vector2(x, -y);
+        rt.sizeDelta = new Vector2(w, h);
+
+        Image img = go.AddComponent<Image>();
+        img.color = color;
+
+        return go;
+    }
+
+    private Text CreateText(string name, Transform parent, float x, float y, float w, float h, string text, int size, FontStyle style, Color color, TextAnchor anchor)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+
+        RectTransform rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.0f, 1.0f);
+        rt.anchorMax = new Vector2(0.0f, 1.0f);
+        rt.pivot = new Vector2(0.0f, 1.0f);
+        rt.anchoredPosition = new Vector2(x, -y);
+        rt.sizeDelta = new Vector2(w, h);
+
+        Text t = go.AddComponent<Text>();
+        t.font = uiFont;
+        t.text = text;
+        t.fontSize = Mathf.Max(9, Mathf.RoundToInt(size * fontScale));
+        t.fontStyle = style;
+        t.color = color;
+        t.alignment = anchor;
+        t.horizontalOverflow = HorizontalWrapMode.Wrap;
+        t.verticalOverflow = VerticalWrapMode.Truncate;
+
+        if (useTextShadow)
+        {
+            Shadow shadow = go.AddComponent<Shadow>();
+            shadow.effectColor = new Color(0, 0, 0, 0.70f);
+            shadow.effectDistance = new Vector2(1.0f, -1.0f);
+        }
+
+        return t;
+    }
+
+    private RawImage CreateRawImage(string name, Transform parent, float x, float y, float w, float h, Color color)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+
+        RectTransform rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.0f, 1.0f);
+        rt.anchorMax = new Vector2(0.0f, 1.0f);
+        rt.pivot = new Vector2(0.0f, 1.0f);
+        rt.anchoredPosition = new Vector2(x, -y);
+        rt.sizeDelta = new Vector2(w, h);
+
+        RawImage raw = go.AddComponent<RawImage>();
+        raw.color = Color.white;
+
+        return raw;
+    }
+
+    private Button CreateButton(Transform parent, float x, float y, float w, float h, string label, Color color, UnityEngine.Events.UnityAction action)
+    {
+        GameObject go = CreatePanel("Button_" + label.Replace(" ", "_"), parent, x, y, w, h, color);
+        Button b = go.AddComponent<Button>();
+        b.targetGraphic = go.GetComponent<Image>();
+        b.onClick.AddListener(action);
+
+        Text t = CreateText("Label", go.transform, 0, 0, w, h, label, 12, FontStyle.Bold, white, TextAnchor.MiddleCenter);
+        t.raycastTarget = false;
+
+        return b;
+    }
+
+    private Dropdown CreateDropdown(string name, Transform parent, float x, float y, float w, float h)
+    {
+        GameObject root = CreatePanel(name, parent, x, y, w, h, dark);
+        Dropdown dropdown = root.AddComponent<Dropdown>();
+
+        Text label = CreateText("Label", root.transform, 10, 0, w - 40, h, "Select", 12, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        label.raycastTarget = false;
+
+        Text caption = label;
+
+        GameObject arrowGo = CreatePanel("Arrow", root.transform, w - 28, 8, 16, 16, muted);
+        arrowGo.GetComponent<Image>().raycastTarget = false;
+
+        GameObject template = CreatePanel("Template", root.transform, 0, h + 2, w, 180, new Color(0.02f, 0.045f, 0.060f, 0.98f));
+        template.SetActive(false);
+
+        ScrollRect scroll = template.AddComponent<ScrollRect>();
+        scroll.horizontal = false;
+
+        GameObject viewport = CreatePanel("Viewport", template.transform, 0, 0, w, 180, new Color(0, 0, 0, 0));
+        Mask mask = viewport.AddComponent<Mask>();
+        mask.showMaskGraphic = false;
+        Image viewportImg = viewport.GetComponent<Image>();
+        viewportImg.color = new Color(0, 0, 0, 0.1f);
+
+        GameObject content = CreatePanel("Content", viewport.transform, 0, 0, w, 180, new Color(0, 0, 0, 0));
+        RectTransform contentRt = content.GetComponent<RectTransform>();
+        contentRt.anchorMin = new Vector2(0, 1);
+        contentRt.anchorMax = new Vector2(1, 1);
+        contentRt.pivot = new Vector2(0, 1);
+
+        GameObject item = CreatePanel("Item", content.transform, 0, 0, w, 26, panel2);
+        Toggle toggle = item.AddComponent<Toggle>();
+
+        Text itemLabel = CreateText("Item Label", item.transform, 10, 0, w - 20, 26, "Option", 12, FontStyle.Normal, white, TextAnchor.MiddleLeft);
+        itemLabel.raycastTarget = false;
+
+        toggle.targetGraphic = item.GetComponent<Image>();
+        toggle.graphic = item.GetComponent<Image>();
+
+        dropdown.targetGraphic = root.GetComponent<Image>();
+        dropdown.captionText = caption;
+        dropdown.template = template.GetComponent<RectTransform>();
+        dropdown.itemText = itemLabel;
+
+        scroll.viewport = viewport.GetComponent<RectTransform>();
+        scroll.content = contentRt;
+
+        return dropdown;
+    }
+}

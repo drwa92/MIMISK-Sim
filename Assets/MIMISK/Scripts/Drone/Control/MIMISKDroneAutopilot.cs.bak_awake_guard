@@ -1,0 +1,492 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[RequireComponent(typeof(Rigidbody))]
+[RequireComponent(typeof(MIMISKDroneRotorModel))]
+public class MIMISKDroneAutopilot : MonoBehaviour
+{
+    public enum FlightMode
+    {
+        Disarmed,
+        ArmedIdle,
+        Takeoff,
+        AltitudeHold,
+        ManualAttitude,
+        LandingOnWater,
+        SurfaceStable,
+        Failsafe
+    }
+
+    [Header("Mode")]
+    public FlightMode mode = FlightMode.Disarmed;
+
+    [Header("References")]
+    public MIMISKDroneRotorModel rotorModel;
+
+    [Header("Vehicle")]
+    public float droneMassKg = 4.0f;
+    public float waterSurfaceY = 0.0f;
+    public float surfaceStableHeight = 0.35f;
+
+    [Header("Throttle")]
+    [Range(0f, 1f)] public float idleOutput = 0.06f;
+    [Range(0f, 1f)] public float collectiveOutput;
+    [Range(0f, 1f)] public float hoverOutput;
+    public float maxTakeoffAltitude = 2.5f;
+
+    [Header("Command Limits")]
+    public float maxTiltDeg = 14.0f;
+    public float maxYawRateDegPerSec = 55.0f;
+
+    [Header("Attitude PID")]
+    public float rollKp = 0.035f;
+    public float rollKd = 0.020f;
+    public float pitchKp = 0.035f;
+    public float pitchKd = 0.020f;
+    public float yawRateKp = 0.018f;
+    public float yawHoldKp = 0.035f;
+
+    [Header("Altitude PID")]
+    public float targetAltitude = 2.5f;
+    public float altitudeKp = 0.12f;
+    public float altitudeKd = 0.08f;
+    public float altitudeIntegralGain = 0.015f;
+    public float altitudeIntegralLimit = 0.25f;
+
+    [Header("Mixer Limits")]
+    [Range(0f, 0.5f)] public float maxAttitudeCorrection = 0.25f;
+    [Range(0f, 0.5f)] public float maxYawCorrection = 0.18f;
+
+    [Header("Input")]
+    public bool enableKeyboardInput = true;
+
+    [Header("Manual Commands")]
+    [Range(-1f, 1f)] public float forwardCommand;
+    [Range(-1f, 1f)] public float rightCommand;
+    [Range(-1f, 1f)] public float yawCommand;
+    [Range(-1f, 1f)] public float altitudeCommand;
+
+    [Header("Axis / Sign Tuning")]
+    public bool invertPitchCommand = false;
+    public bool invertRollCommand = false;
+    public bool invertYawCommand = false;
+
+    [Header("Diagnostics")]
+    public float measuredRollDeg;
+    public float measuredPitchDeg;
+    public float measuredYawDeg;
+    public float measuredYawRateDeg;
+    public float targetRollDeg;
+    public float targetPitchDeg;
+    public float targetYawDeg;
+    public float targetYawRateDeg;
+    public float rollCorrection;
+    public float pitchCorrection;
+    public float yawCorrection;
+    public float altitudeError;
+    public float altitudeIntegral;
+    public Vector4 mixedMotors;
+
+    private Rigidbody rb;
+    private Vector3 holdPosition;
+    private Quaternion holdRotation;
+    private bool yawHoldSet;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+
+        if (rotorModel == null)
+        {
+            rotorModel = GetComponent<MIMISKDroneRotorModel>();
+        }
+
+        ConfigureHoldPhysics();
+    }
+
+    private void Start()
+    {
+        hoverOutput = EstimateHoverOutput();
+        targetAltitude = Mathf.Max(transform.position.y, waterSurfaceY + maxTakeoffAltitude);
+        targetYawDeg = GetYawDeg();
+        SetMode(mode);
+    }
+
+    private void Update()
+    {
+        if (enableKeyboardInput)
+        {
+            ReadKeyboardInput();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        UpdateMeasurements();
+
+        switch (mode)
+        {
+            case FlightMode.Disarmed:
+                MaintainHold();
+                rotorModel.StopMotors();
+                return;
+
+            case FlightMode.ArmedIdle:
+                MaintainHold();
+                rotorModel.SetIdle(idleOutput);
+                return;
+
+            case FlightMode.SurfaceStable:
+                MaintainHold();
+                rotorModel.StopMotors();
+                return;
+
+            case FlightMode.Failsafe:
+                RunFailsafeLanding();
+                return;
+
+            case FlightMode.Takeoff:
+                RunAltitudeController();
+                RunAttitudeController();
+                RunMixer();
+
+                if (Mathf.Abs(transform.position.y - targetAltitude) < 0.15f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.25f)
+                {
+                    SetMode(FlightMode.AltitudeHold);
+                }
+                return;
+
+            case FlightMode.AltitudeHold:
+                forwardCommand = 0f;
+                rightCommand = 0f;
+                altitudeCommand = 0f;
+                RunAltitudeController();
+                RunAttitudeController();
+                RunMixer();
+                return;
+
+            case FlightMode.ManualAttitude:
+                targetAltitude += altitudeCommand * 0.8f * Time.fixedDeltaTime;
+                targetAltitude = Mathf.Clamp(
+                    targetAltitude,
+                    waterSurfaceY + surfaceStableHeight + 0.2f,
+                    maxTakeoffAltitude + 10f
+                );
+
+                RunAltitudeController();
+                RunAttitudeController();
+                RunMixer();
+                return;
+
+            case FlightMode.LandingOnWater:
+                targetAltitude = waterSurfaceY + surfaceStableHeight;
+                forwardCommand = 0f;
+                rightCommand = 0f;
+                yawCommand = 0f;
+                altitudeCommand = 0f;
+
+                RunAltitudeController();
+                RunAttitudeController();
+                RunMixer();
+
+                if (transform.position.y <= targetAltitude + 0.08f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.2f)
+                {
+                    SetMode(FlightMode.SurfaceStable);
+                }
+                return;
+        }
+    }
+
+    public void SetMode(FlightMode newMode)
+    {
+        mode = newMode;
+
+        if (mode == FlightMode.Disarmed ||
+            mode == FlightMode.ArmedIdle ||
+            mode == FlightMode.SurfaceStable)
+        {
+            EnterHoldPhysics();
+        }
+        else
+        {
+            EnterFlightPhysics();
+        }
+
+        if (mode == FlightMode.Takeoff)
+        {
+            targetAltitude = waterSurfaceY + maxTakeoffAltitude;
+            targetYawDeg = GetYawDeg();
+            altitudeIntegral = 0f;
+        }
+
+        if (mode == FlightMode.ManualAttitude)
+        {
+            targetAltitude = transform.position.y;
+            targetYawDeg = GetYawDeg();
+        }
+
+        if (mode == FlightMode.LandingOnWater)
+        {
+            targetAltitude = waterSurfaceY + surfaceStableHeight;
+        }
+
+        if (mode == FlightMode.SurfaceStable)
+        {
+            Vector3 p = transform.position;
+            p.y = waterSurfaceY + surfaceStableHeight;
+            transform.position = p;
+            holdPosition = p;
+            holdRotation = Quaternion.Euler(0f, transform.eulerAngles.y, 0f);
+        }
+    }
+
+    private void ConfigureHoldPhysics()
+    {
+        rb.mass = droneMassKg;
+        rb.useGravity = false;
+        rb.isKinematic = true;
+        rb.linearDamping = 0.2f;
+        rb.angularDamping = 0.3f;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+    }
+
+    private void EnterHoldPhysics()
+    {
+        holdPosition = transform.position;
+        holdRotation = transform.rotation;
+
+        if (rb.isKinematic)
+        {
+            rb.isKinematic = false;
+        }
+
+        rb.linearVelocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        rb.useGravity = false;
+        rb.isKinematic = true;
+    }
+
+    private void MaintainHold()
+    {
+        if (!rb.isKinematic)
+        {
+            EnterHoldPhysics();
+        }
+
+        transform.position = holdPosition;
+        transform.rotation = holdRotation;
+    }
+
+    private void EnterFlightPhysics()
+    {
+        rb.isKinematic = false;
+        rb.useGravity = true;
+        rb.mass = droneMassKg;
+        rb.WakeUp();
+    }
+
+    private float EstimateHoverOutput()
+    {
+        if (rotorModel == null || rotorModel.maxThrustPerRotorN <= 0.001f)
+        {
+            return 0.55f;
+        }
+
+        float hover = droneMassKg * Mathf.Abs(Physics.gravity.y) /
+                      (4.0f * rotorModel.maxThrustPerRotorN);
+
+        return Mathf.Clamp01(hover);
+    }
+
+    private void ReadKeyboardInput()
+    {
+        Keyboard keyboard = Keyboard.current;
+
+        if (keyboard == null)
+        {
+            return;
+        }
+
+        if (keyboard.digit0Key.wasPressedThisFrame) SetMode(FlightMode.Disarmed);
+        if (keyboard.digit1Key.wasPressedThisFrame) SetMode(FlightMode.ArmedIdle);
+        if (keyboard.digit2Key.wasPressedThisFrame) SetMode(FlightMode.Takeoff);
+        if (keyboard.digit3Key.wasPressedThisFrame) SetMode(FlightMode.LandingOnWater);
+        if (keyboard.digit4Key.wasPressedThisFrame) SetMode(FlightMode.AltitudeHold);
+        if (keyboard.digit5Key.wasPressedThisFrame) SetMode(FlightMode.ManualAttitude);
+        if (keyboard.digit9Key.wasPressedThisFrame) SetMode(FlightMode.Failsafe);
+
+        forwardCommand = 0f;
+        rightCommand = 0f;
+        yawCommand = 0f;
+        altitudeCommand = 0f;
+
+        if (keyboard.wKey.isPressed) forwardCommand += 1f;
+        if (keyboard.sKey.isPressed) forwardCommand -= 1f;
+        if (keyboard.dKey.isPressed) rightCommand += 1f;
+        if (keyboard.aKey.isPressed) rightCommand -= 1f;
+        if (keyboard.eKey.isPressed) yawCommand += 1f;
+        if (keyboard.qKey.isPressed) yawCommand -= 1f;
+        if (keyboard.rKey.isPressed) altitudeCommand += 1f;
+        if (keyboard.fKey.isPressed) altitudeCommand -= 1f;
+
+        bool hasManual =
+            Mathf.Abs(forwardCommand) > 0.02f ||
+            Mathf.Abs(rightCommand) > 0.02f ||
+            Mathf.Abs(yawCommand) > 0.02f ||
+            Mathf.Abs(altitudeCommand) > 0.02f;
+
+        if (hasManual &&
+            (mode == FlightMode.Takeoff || mode == FlightMode.AltitudeHold))
+        {
+            SetMode(FlightMode.ManualAttitude);
+        }
+    }
+
+    private void UpdateMeasurements()
+    {
+        measuredRollDeg = NormalizeAngle(transform.eulerAngles.z);
+        measuredPitchDeg = NormalizeAngle(transform.eulerAngles.x);
+        measuredYawDeg = GetYawDeg();
+        measuredYawRateDeg = rb.angularVelocity.y * Mathf.Rad2Deg;
+    }
+
+    private void RunAltitudeController()
+    {
+        altitudeError = targetAltitude - transform.position.y;
+        altitudeIntegral += altitudeError * Time.fixedDeltaTime;
+        altitudeIntegral = Mathf.Clamp(
+            altitudeIntegral,
+            -altitudeIntegralLimit,
+            altitudeIntegralLimit
+        );
+
+        float verticalVelocity = rb.linearVelocity.y;
+
+        collectiveOutput =
+            hoverOutput
+            + altitudeKp * altitudeError
+            - altitudeKd * verticalVelocity
+            + altitudeIntegralGain * altitudeIntegral;
+
+        collectiveOutput = Mathf.Clamp01(collectiveOutput);
+    }
+
+    private void RunAttitudeController()
+    {
+        float forwardSign = invertPitchCommand ? -1f : 1f;
+        float rightSign = invertRollCommand ? -1f : 1f;
+
+        // Forward command means nose down.
+        targetPitchDeg = -forwardCommand * maxTiltDeg * forwardSign;
+
+        // Right command means roll right.
+        targetRollDeg = -rightCommand * maxTiltDeg * rightSign;
+
+        if (Mathf.Abs(yawCommand) < 0.03f)
+        {
+            if (!yawHoldSet)
+            {
+                targetYawDeg = measuredYawDeg;
+                yawHoldSet = true;
+            }
+
+            float headingError = Mathf.DeltaAngle(measuredYawDeg, targetYawDeg);
+            targetYawRateDeg = headingError * yawHoldKp;
+        }
+        else
+        {
+            yawHoldSet = false;
+            targetYawRateDeg = yawCommand * maxYawRateDegPerSec;
+        }
+
+        if (invertYawCommand)
+        {
+            targetYawRateDeg = -targetYawRateDeg;
+        }
+
+        float rollError = targetRollDeg - measuredRollDeg;
+        float pitchError = targetPitchDeg - measuredPitchDeg;
+
+        Vector3 localAngularVelocity = transform.InverseTransformDirection(rb.angularVelocity);
+
+        rollCorrection =
+            rollKp * rollError
+            - rollKd * localAngularVelocity.z * Mathf.Rad2Deg;
+
+        pitchCorrection =
+            pitchKp * pitchError
+            - pitchKd * localAngularVelocity.x * Mathf.Rad2Deg;
+
+        float yawRateError = targetYawRateDeg - measuredYawRateDeg;
+
+        yawCorrection =
+            yawRateKp * yawRateError;
+
+        rollCorrection = Mathf.Clamp(rollCorrection, -maxAttitudeCorrection, maxAttitudeCorrection);
+        pitchCorrection = Mathf.Clamp(pitchCorrection, -maxAttitudeCorrection, maxAttitudeCorrection);
+        yawCorrection = Mathf.Clamp(yawCorrection, -maxYawCorrection, maxYawCorrection);
+    }
+
+    private void RunMixer()
+    {
+        // Mixer inspired by the uploaded DIY controller:
+        // M1 = Rear Right
+        // M2 = Front Right
+        // M3 = Rear Left
+        // M4 = Front Left
+
+        float m4_FL = collectiveOutput + pitchCorrection - rollCorrection + yawCorrection;
+        float m2_FR = collectiveOutput + pitchCorrection + rollCorrection - yawCorrection;
+        float m3_RL = collectiveOutput - pitchCorrection - rollCorrection - yawCorrection;
+        float m1_RR = collectiveOutput - pitchCorrection + rollCorrection + yawCorrection;
+
+        m1_RR = Mathf.Clamp01(m1_RR);
+        m2_FR = Mathf.Clamp01(m2_FR);
+        m3_RL = Mathf.Clamp01(m3_RL);
+        m4_FL = Mathf.Clamp01(m4_FL);
+
+        mixedMotors = new Vector4(m1_RR, m2_FR, m3_RL, m4_FL);
+
+        rotorModel.SetOutputs(m1_RR, m2_FR, m3_RL, m4_FL);
+    }
+
+    private void RunFailsafeLanding()
+    {
+        EnterFlightPhysics();
+
+        targetAltitude = Mathf.Max(
+            waterSurfaceY + surfaceStableHeight,
+            transform.position.y - 0.25f * Time.fixedDeltaTime
+        );
+
+        forwardCommand = 0f;
+        rightCommand = 0f;
+        yawCommand = 0f;
+
+        RunAltitudeController();
+        RunAttitudeController();
+        RunMixer();
+    }
+
+    private float GetYawDeg()
+    {
+        float yaw = Mathf.Atan2(transform.forward.x, transform.forward.z) * Mathf.Rad2Deg;
+
+        if (yaw < 0f)
+        {
+            yaw += 360f;
+        }
+
+        return yaw;
+    }
+
+    private float NormalizeAngle(float angle)
+    {
+        while (angle > 180f) angle -= 360f;
+        while (angle < -180f) angle += 360f;
+        return angle;
+    }
+}

@@ -1,0 +1,9 @@
+std_msgs/Header header
+geometry_msgs/Vector3 position
+geometry_msgs/Vector3 velocity
+float64 yaw_deg
+float64 depth_m
+string mission_state
+string path_type
+string control_mode
+float64 distance_to_home_m

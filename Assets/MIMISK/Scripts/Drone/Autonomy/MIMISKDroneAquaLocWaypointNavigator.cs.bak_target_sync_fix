@@ -1,0 +1,361 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneAquaLocWaypointNavigator : MonoBehaviour
+{
+    public enum NavState
+    {
+        Idle,
+        InitialHold,
+        Navigating,
+        Loitering,
+        Completed,
+        Aborted,
+        LandingAtFinal
+    }
+
+    [Header("References")]
+    public MIMISKDroneAquaLocEstimator aquaLoc;
+    public MIMISKDroneAquaLocPositionHold aquaHold;
+    public MIMISKDroneKeyboardStationKeeping keyboardStationKeeping;
+    public MIMISKDroneUdpGamepadReceiver udpReceiver;
+
+    [Header("Keyboard")]
+    public Key startMissionKey = Key.N;
+    public Key abortMissionKey = Key.B;
+
+    [Header("Mission")]
+    public bool missionActive;
+    public NavState navState = NavState.Idle;
+
+    [Tooltip("Waypoint offsets from the position where the mission starts. X=east/right, Y=altitude change, Z=north/forward.")]
+    public Vector3[] localWaypointOffsets = new Vector3[]
+    {
+        new Vector3(0f, 0f, 3f),
+        new Vector3(2f, 0f, 3f),
+        new Vector3(2f, 0f, 0f),
+        new Vector3(0f, 0f, 0f)
+    };
+
+    public Vector3[] worldWaypoints;
+    public int currentWaypointIndex;
+
+    [Header("Acceptance")]
+    public float waypointRadiusM = 0.28f;
+    public float waypointSpeedThresholdMS = 0.13f;
+    public float waypointLoiterSeconds = 2.0f;
+
+    [Header("Behavior")]
+    public bool holdAtEnd = true;
+    public bool landAtFinalWaypoint = false;
+    public bool useCurrentYawForMission = true;
+
+    [Header("Runtime")]
+    public Vector3 missionStartPositionWorld;
+    public float missionYawDeg;
+    public Vector3 currentTargetWorld;
+    public float distanceToCurrentWaypointM;
+    public float loiterTimerS;
+    public string lastEvent = "none";
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Update()
+    {
+        AutoFindReferencesIfNeeded();
+
+        if (Keyboard.current != null)
+        {
+            if (Keyboard.current[startMissionKey].wasPressedThisFrame)
+            {
+                StartMissionFromCurrentAquaLocPose();
+            }
+
+            if (Keyboard.current[abortMissionKey].wasPressedThisFrame)
+            {
+                AbortMissionAndReturnManual();
+            }
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!missionActive || aquaLoc == null || aquaHold == null || !aquaLoc.estimatorReady)
+        {
+            return;
+        }
+
+        if (navState == NavState.Navigating)
+        {
+            UpdateNavigation();
+        }
+        else if (navState == NavState.Loitering)
+        {
+            UpdateLoiter(Time.fixedDeltaTime);
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (aquaLoc == null)
+        {
+            aquaLoc = GetComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        if (aquaHold == null)
+        {
+            aquaHold = GetComponent<MIMISKDroneAquaLocPositionHold>();
+        }
+
+        if (keyboardStationKeeping == null)
+        {
+            keyboardStationKeeping = GetComponent<MIMISKDroneKeyboardStationKeeping>();
+        }
+
+        if (udpReceiver == null)
+        {
+            udpReceiver = GetComponent<MIMISKDroneUdpGamepadReceiver>();
+        }
+    }
+
+    private void AutoFindReferencesIfNeeded()
+    {
+        if (aquaLoc == null || aquaHold == null || keyboardStationKeeping == null || udpReceiver == null)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    [ContextMenu("Start Mission From Current AquaLoc Pose")]
+    public void StartMissionFromCurrentAquaLocPose()
+    {
+        AutoFindReferences();
+
+        if (aquaLoc == null || !aquaLoc.estimatorReady)
+        {
+            lastEvent = "Mission rejected: AquaLoc not ready";
+            Debug.LogWarning("[MIMISK] AquaNav mission rejected: AquaLoc not ready.");
+            return;
+        }
+
+        if (aquaHold == null)
+        {
+            Debug.LogError("[MIMISK] AquaHold missing.");
+            return;
+        }
+
+        missionStartPositionWorld = aquaLoc.estimatedPositionWorld;
+        missionYawDeg = useCurrentYawForMission ? aquaLoc.estimatedYawDeg : 0.0f;
+
+        BuildWorldWaypoints();
+
+        missionActive = true;
+        navState = NavState.InitialHold;
+        currentWaypointIndex = 0;
+        loiterTimerS = 0.0f;
+
+        // Disable manual gamepad path during mission.
+        if (udpReceiver != null)
+        {
+            udpReceiver.enabled = false;
+        }
+
+        if (keyboardStationKeeping != null)
+        {
+            keyboardStationKeeping.stationKeepingActive = true;
+        }
+
+        ActivateWaypoint(currentWaypointIndex);
+
+        lastEvent = "Mission started";
+        Debug.Log("[MIMISK] AquaNav mission started.");
+    }
+
+    private void BuildWorldWaypoints()
+    {
+        if (localWaypointOffsets == null || localWaypointOffsets.Length == 0)
+        {
+            localWaypointOffsets = new Vector3[]
+            {
+                new Vector3(0f, 0f, 3f),
+                new Vector3(2f, 0f, 3f),
+                new Vector3(2f, 0f, 0f),
+                new Vector3(0f, 0f, 0f)
+            };
+        }
+
+        worldWaypoints = new Vector3[localWaypointOffsets.Length];
+
+        Quaternion yawRotation = Quaternion.Euler(0.0f, missionYawDeg, 0.0f);
+
+        for (int i = 0; i < localWaypointOffsets.Length; i++)
+        {
+            worldWaypoints[i] = missionStartPositionWorld + yawRotation * localWaypointOffsets[i];
+        }
+    }
+
+    private void ActivateWaypoint(int index)
+    {
+        if (worldWaypoints == null || index < 0 || index >= worldWaypoints.Length)
+        {
+            CompleteMission();
+            return;
+        }
+
+        currentTargetWorld = worldWaypoints[index];
+
+        aquaHold.targetPositionWorld = currentTargetWorld;
+        aquaHold.targetYawDeg = missionYawDeg;
+        aquaHold.enableGuidance = true;
+        aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.GoToTarget;
+        aquaHold.takeControlOfDrone = true;
+
+        navState = NavState.Navigating;
+        loiterTimerS = 0.0f;
+
+        lastEvent = "Navigating to waypoint " + index;
+        Debug.Log("[MIMISK] AquaNav navigating to waypoint " + index);
+    }
+
+    private void UpdateNavigation()
+    {
+        Vector3 error = currentTargetWorld - aquaLoc.estimatedPositionWorld;
+        error.y = 0.0f;
+
+        distanceToCurrentWaypointM = error.magnitude;
+
+        Vector3 horizontalVelocity = new Vector3(
+            aquaLoc.estimatedVelocityWorld.x,
+            0.0f,
+            aquaLoc.estimatedVelocityWorld.z
+        );
+
+        bool reached =
+            distanceToCurrentWaypointM <= waypointRadiusM &&
+            horizontalVelocity.magnitude <= waypointSpeedThresholdMS;
+
+        if (reached)
+        {
+            navState = NavState.Loitering;
+            loiterTimerS = 0.0f;
+            aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.HoldTarget;
+            lastEvent = "Loitering waypoint " + currentWaypointIndex;
+        }
+    }
+
+    private void UpdateLoiter(float dt)
+    {
+        loiterTimerS += dt;
+
+        if (loiterTimerS < waypointLoiterSeconds)
+        {
+            return;
+        }
+
+        currentWaypointIndex++;
+
+        if (currentWaypointIndex >= worldWaypoints.Length)
+        {
+            if (landAtFinalWaypoint)
+            {
+                navState = NavState.LandingAtFinal;
+                aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.LandOnWaterAtTarget;
+                lastEvent = "Landing at final waypoint";
+            }
+            else
+            {
+                CompleteMission();
+            }
+
+            return;
+        }
+
+        ActivateWaypoint(currentWaypointIndex);
+    }
+
+    private void CompleteMission()
+    {
+        missionActive = false;
+        navState = NavState.Completed;
+
+        if (holdAtEnd && aquaHold != null)
+        {
+            aquaHold.enableGuidance = true;
+            aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.HoldTarget;
+        }
+        else
+        {
+            ReleaseToManual();
+        }
+
+        lastEvent = "Mission completed";
+        Debug.Log("[MIMISK] AquaNav mission completed.");
+    }
+
+    [ContextMenu("Abort Mission And Return Manual")]
+    public void AbortMissionAndReturnManual()
+    {
+        missionActive = false;
+        navState = NavState.Aborted;
+        ReleaseToManual();
+
+        lastEvent = "Mission aborted";
+        Debug.Log("[MIMISK] AquaNav mission aborted. Manual gamepad restored.");
+    }
+
+    private void ReleaseToManual()
+    {
+        if (aquaHold != null)
+        {
+            aquaHold.enableGuidance = false;
+            aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.Disabled;
+            aquaHold.DisableAquaHold();
+        }
+
+        if (keyboardStationKeeping != null)
+        {
+            keyboardStationKeeping.stationKeepingActive = false;
+        }
+
+        if (udpReceiver != null)
+        {
+            udpReceiver.enabled = true;
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (missionActive)
+        {
+            ReleaseToManual();
+        }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        if (worldWaypoints == null)
+        {
+            return;
+        }
+
+        Gizmos.color = Color.blue;
+
+        for (int i = 0; i < worldWaypoints.Length; i++)
+        {
+            Gizmos.DrawWireSphere(worldWaypoints[i], waypointRadiusM);
+
+            if (i > 0)
+            {
+                Gizmos.DrawLine(worldWaypoints[i - 1], worldWaypoints[i]);
+            }
+        }
+
+        Gizmos.color = Color.green;
+        Gizmos.DrawWireSphere(currentTargetWorld, waypointRadiusM * 1.2f);
+    }
+}

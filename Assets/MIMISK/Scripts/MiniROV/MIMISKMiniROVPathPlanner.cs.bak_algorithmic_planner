@@ -1,0 +1,700 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVPathPlanner : MonoBehaviour
+{
+    public enum MiniROVPathType
+    {
+        StationHold,
+        GoToPoint,
+        LineOutAndBack,
+        Square,
+        LawnmowerSurvey,
+        CircleInspection,
+        SpiralSearch,
+        HelixInspection,
+        FigureEight,
+        ReturnHome
+    }
+
+    [Header("References")]
+    public Rigidbody rb;
+    public MIMISKMiniROVPlantBasedController controller;
+
+    [Header("Selected Plan")]
+    public MiniROVPathType selectedPathType =
+        MiniROVPathType.StationHold;
+
+    public bool startImmediately = true;
+    public bool stopAndHoldAtEnd = true;
+
+    [Header("Home / Recovery")]
+    public bool homeSet;
+    public Vector3 homeWorld;
+    public float homeDepthM = 1.0f;
+
+    [Header("Common Depth")]
+    public bool useCurrentDepthAtStart = true;
+    public float missionDepthM = 1.0f;
+
+    [Header("Go To Point")]
+    public Vector3 goToPointWorld;
+    public float goToPointDepthM = 1.0f;
+
+    [Header("Line / Square")]
+    public float lineLengthM = 2.5f;
+    public float squareSideM = 1.2f;
+
+    [Header("Lawnmower Survey")]
+    public float lawnmowerLengthM = 3.0f;
+    public float lawnmowerWidthM = 1.5f;
+    public float lawnmowerLaneSpacingM = 0.35f;
+
+    [Header("Circle Inspection")]
+    public float circleRadiusM = 0.8f;
+    public int circleLaps = 1;
+    public bool circleClockwise = true;
+    public bool circleStartWithTangentForward = true;
+
+    [Header("Spiral Search")]
+    public float spiralInitialRadiusM = 0.15f;
+    public float spiralFinalRadiusM = 1.2f;
+    public int spiralTurns = 3;
+    public int spiralSamplesPerTurn = 48;
+
+    [Header("Helix Inspection")]
+    public float helixRadiusM = 0.8f;
+    public int helixTurns = 2;
+    public int helixSamplesPerTurn = 48;
+    public float helixStartDepthM = 1.0f;
+    public float helixEndDepthM = 2.0f;
+
+    [Header("Figure Eight")]
+    public float figureEightLengthM = 1.6f;
+    public float figureEightWidthM = 0.8f;
+    public int figureEightSamples = 160;
+
+    [Header("Runtime")]
+    public Vector3[] lastGeneratedPath;
+    public string lastPlanName = "none";
+    public string lastEvent = "idle";
+
+    private void Awake()
+    {
+        AutoFindReferences();
+
+        if (!homeSet)
+        {
+            SetHomeToCurrentPose();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (controller == null)
+        {
+            controller =
+                GetComponent<MIMISKMiniROVPlantBasedController>();
+        }
+    }
+
+    [ContextMenu("Set Home To Current Pose")]
+    public void SetHomeToCurrentPose()
+    {
+        AutoFindReferences();
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        homeWorld = p;
+        homeDepthM = CurrentDepth();
+        homeSet = true;
+
+        lastEvent = "home_set_current_pose";
+    }
+
+    [ContextMenu("Start Selected Plan")]
+    public void StartSelectedPlan()
+    {
+        AutoFindReferences();
+
+        if (controller == null)
+        {
+            lastEvent = "start_failed_missing_controller";
+            return;
+        }
+
+        if (useCurrentDepthAtStart)
+        {
+            missionDepthM = CurrentDepth();
+        }
+
+        if (selectedPathType == MiniROVPathType.StationHold)
+        {
+            controller.StartHoldCurrentPose();
+            lastPlanName = "station_hold";
+            lastEvent = "station_hold_started";
+            return;
+        }
+
+        if (selectedPathType == MiniROVPathType.GoToPoint)
+        {
+            StartGoToPointPlan();
+            return;
+        }
+
+        if (selectedPathType == MiniROVPathType.CircleInspection)
+        {
+            StartCirclePlan();
+            return;
+        }
+
+        if (selectedPathType == MiniROVPathType.ReturnHome)
+        {
+            StartReturnHomePlan();
+            return;
+        }
+
+        Vector3[] path =
+            BuildPath(selectedPathType);
+
+        StartPolylinePath(
+            selectedPathType.ToString(),
+            path
+        );
+    }
+
+    [ContextMenu("Start Return Home")]
+    public void StartReturnHomePlan()
+    {
+        AutoFindReferences();
+
+        if (!homeSet)
+        {
+            lastEvent = "return_home_failed_home_not_set";
+            return;
+        }
+
+        goToPointWorld = homeWorld;
+        goToPointDepthM = homeDepthM;
+
+        selectedPathType = MiniROVPathType.ReturnHome;
+
+        if (controller == null)
+        {
+            lastEvent = "return_home_failed_missing_controller";
+            return;
+        }
+
+        controller.targetPointWorld = homeWorld;
+        controller.targetPointDepthM = homeDepthM;
+        controller.StartController(
+            MIMISKMiniROVPlantBasedController.ControlMode.GoToPoint
+        );
+
+        lastPlanName = "return_home";
+        lastEvent = "return_home_started";
+    }
+
+    [ContextMenu("Stop And Hold")]
+    public void StopAndHold()
+    {
+        AutoFindReferences();
+
+        if (controller != null)
+        {
+            controller.StartHoldCurrentPose();
+        }
+
+        lastEvent = "stop_and_hold_requested";
+    }
+
+    private void StartGoToPointPlan()
+    {
+        if (controller == null)
+        {
+            lastEvent = "go_to_point_failed_missing_controller";
+            return;
+        }
+
+        controller.targetPointWorld = goToPointWorld;
+        controller.targetPointDepthM = goToPointDepthM;
+        controller.goToPointStopAtTarget = stopAndHoldAtEnd;
+
+        controller.StartController(
+            MIMISKMiniROVPlantBasedController.ControlMode.GoToPoint
+        );
+
+        lastPlanName = "go_to_point";
+        lastEvent = "go_to_point_started";
+    }
+
+    private void StartCirclePlan()
+    {
+        if (controller == null)
+        {
+            lastEvent = "circle_failed_missing_controller";
+            return;
+        }
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        Vector3 right =
+            HorizontalRight();
+
+        Vector3 center =
+            p;
+
+        if (circleStartWithTangentForward)
+        {
+            center =
+                p +
+                (circleClockwise ? right : -right) *
+                Mathf.Max(0.2f, circleRadiusM);
+        }
+
+        center.y =
+            DepthToWorldY(missionDepthM);
+
+        controller.circleCenterWorld = center;
+        controller.circleRadiusM = Mathf.Max(0.2f, circleRadiusM);
+        controller.circleDepthM = missionDepthM;
+        controller.circleClockwise = circleClockwise;
+        controller.circleStopAfterCompletedLaps = stopAndHoldAtEnd;
+        controller.circleTargetLaps = Mathf.Max(1, circleLaps);
+
+        controller.circleAngularProgressRad = 0.0f;
+        controller.circleHasPhase = false;
+        controller.circleCompleted = false;
+
+        controller.StartController(
+            MIMISKMiniROVPlantBasedController.ControlMode.CircleLOS
+        );
+
+        lastPlanName = "circle_inspection";
+        lastEvent = "circle_inspection_started";
+    }
+
+    private void StartPolylinePath(
+        string planName,
+        Vector3[] path)
+    {
+        if (path == null || path.Length < 2)
+        {
+            lastEvent = "polyline_failed_invalid_path";
+            return;
+        }
+
+        controller.pathPointsWorld = path;
+        controller.pathSegmentIndex = 0;
+        controller.pathComplete = false;
+        controller.holdFinalPointWhenPathComplete = stopAndHoldAtEnd;
+        controller.polylineStopAtEnd = stopAndHoldAtEnd;
+
+        controller.StartController(
+            MIMISKMiniROVPlantBasedController.ControlMode.PolylineLOS
+        );
+
+        lastGeneratedPath = path;
+        lastPlanName = planName;
+        lastEvent = "polyline_started_" + planName;
+    }
+
+    public Vector3[] BuildPath(MiniROVPathType type)
+    {
+        if (type == MiniROVPathType.LineOutAndBack)
+        {
+            return BuildLineOutAndBack();
+        }
+
+        if (type == MiniROVPathType.Square)
+        {
+            return BuildSquare();
+        }
+
+        if (type == MiniROVPathType.LawnmowerSurvey)
+        {
+            return BuildLawnmower();
+        }
+
+        if (type == MiniROVPathType.SpiralSearch)
+        {
+            return BuildSpiral();
+        }
+
+        if (type == MiniROVPathType.HelixInspection)
+        {
+            return BuildHelix();
+        }
+
+        if (type == MiniROVPathType.FigureEight)
+        {
+            return BuildFigureEight();
+        }
+
+        return BuildLineOutAndBack();
+    }
+
+    private Vector3[] BuildLineOutAndBack()
+    {
+        Vector3 p =
+            CurrentPositionAtDepth(missionDepthM);
+
+        Vector3 f =
+            HorizontalForward();
+
+        return new Vector3[]
+        {
+            p,
+            p + f * Mathf.Max(0.2f, lineLengthM),
+            p
+        };
+    }
+
+    private Vector3[] BuildSquare()
+    {
+        Vector3 p =
+            CurrentPositionAtDepth(missionDepthM);
+
+        Vector3 f =
+            HorizontalForward();
+
+        Vector3 r =
+            HorizontalRight();
+
+        float side =
+            Mathf.Max(0.2f, squareSideM);
+
+        return new Vector3[]
+        {
+            p,
+            p + f * side,
+            p + f * side + r * side,
+            p + r * side,
+            p
+        };
+    }
+
+    private Vector3[] BuildLawnmower()
+    {
+        Vector3 p =
+            CurrentPositionAtDepth(missionDepthM);
+
+        Vector3 f =
+            HorizontalForward();
+
+        Vector3 r =
+            HorizontalRight();
+
+        float length =
+            Mathf.Max(0.5f, lawnmowerLengthM);
+
+        float width =
+            Mathf.Max(0.2f, lawnmowerWidthM);
+
+        float spacing =
+            Mathf.Max(0.05f, lawnmowerLaneSpacingM);
+
+        int lanes =
+            Mathf.Max(
+                2,
+                Mathf.FloorToInt(width / spacing) + 1
+            );
+
+        List<Vector3> pts =
+            new List<Vector3>();
+
+        Vector3 origin =
+            p - r * (width * 0.5f);
+
+        pts.Add(p);
+
+        for (int i = 0; i < lanes; i++)
+        {
+            float alpha =
+                lanes <= 1
+                    ? 0.0f
+                    : (float)i / (float)(lanes - 1);
+
+            Vector3 laneBase =
+                origin + r * (alpha * width);
+
+            Vector3 a =
+                laneBase;
+
+            Vector3 b =
+                laneBase + f * length;
+
+            if (i % 2 == 0)
+            {
+                pts.Add(a);
+                pts.Add(b);
+            }
+            else
+            {
+                pts.Add(b);
+                pts.Add(a);
+            }
+        }
+
+        return pts.ToArray();
+    }
+
+    private Vector3[] BuildSpiral()
+    {
+        Vector3 center =
+            CurrentPositionAtDepth(missionDepthM);
+
+        Vector3 f =
+            HorizontalForward();
+
+        Vector3 r =
+            HorizontalRight();
+
+        int samples =
+            Mathf.Max(
+                16,
+                Mathf.Max(1, spiralTurns) *
+                Mathf.Max(8, spiralSamplesPerTurn)
+            );
+
+        List<Vector3> pts =
+            new List<Vector3>();
+
+        pts.Add(center);
+
+        for (int i = 0; i <= samples; i++)
+        {
+            float q =
+                (float)i / (float)samples;
+
+            float angle =
+                q *
+                Mathf.Max(1, spiralTurns) *
+                2.0f *
+                Mathf.PI;
+
+            float radius =
+                Mathf.Lerp(
+                    Mathf.Max(0.02f, spiralInitialRadiusM),
+                    Mathf.Max(spiralInitialRadiusM, spiralFinalRadiusM),
+                    q
+                );
+
+            Vector3 point =
+                center +
+                r * (Mathf.Sin(angle) * radius) +
+                f * (Mathf.Cos(angle) * radius);
+
+            point.y =
+                DepthToWorldY(missionDepthM);
+
+            pts.Add(point);
+        }
+
+        return pts.ToArray();
+    }
+
+    private Vector3[] BuildHelix()
+    {
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        Vector3 f =
+            HorizontalForward();
+
+        Vector3 r =
+            HorizontalRight();
+
+        float radius =
+            Mathf.Max(0.2f, helixRadiusM);
+
+        Vector3 center =
+            p + r * radius;
+
+        int samples =
+            Mathf.Max(
+                16,
+                Mathf.Max(1, helixTurns) *
+                Mathf.Max(8, helixSamplesPerTurn)
+            );
+
+        List<Vector3> pts =
+            new List<Vector3>();
+
+        for (int i = 0; i <= samples; i++)
+        {
+            float q =
+                (float)i / (float)samples;
+
+            float angle =
+                q *
+                Mathf.Max(1, helixTurns) *
+                2.0f *
+                Mathf.PI;
+
+            float depth =
+                Mathf.Lerp(
+                    helixStartDepthM,
+                    helixEndDepthM,
+                    q
+                );
+
+            Vector3 point =
+                center +
+                r * (-Mathf.Cos(angle) * radius) +
+                f * (Mathf.Sin(angle) * radius);
+
+            point.y =
+                DepthToWorldY(depth);
+
+            pts.Add(point);
+        }
+
+        return pts.ToArray();
+    }
+
+    private Vector3[] BuildFigureEight()
+    {
+        Vector3 c =
+            CurrentPositionAtDepth(missionDepthM);
+
+        Vector3 f =
+            HorizontalForward();
+
+        Vector3 r =
+            HorizontalRight();
+
+        int samples =
+            Mathf.Max(32, figureEightSamples);
+
+        float halfLength =
+            Mathf.Max(0.2f, figureEightLengthM) * 0.5f;
+
+        float halfWidth =
+            Mathf.Max(0.1f, figureEightWidthM) * 0.5f;
+
+        List<Vector3> pts =
+            new List<Vector3>();
+
+        for (int i = 0; i <= samples; i++)
+        {
+            float q =
+                (float)i / (float)samples;
+
+            float theta =
+                q *
+                2.0f *
+                Mathf.PI;
+
+            Vector3 point =
+                c +
+                r * (Mathf.Sin(theta) * halfLength) +
+                f * (Mathf.Sin(2.0f * theta) * halfWidth);
+
+            point.y =
+                DepthToWorldY(missionDepthM);
+
+            pts.Add(point);
+        }
+
+        return pts.ToArray();
+    }
+
+    private Vector3 CurrentPositionAtDepth(float depth)
+    {
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        p.y =
+            DepthToWorldY(depth);
+
+        return p;
+    }
+
+    private Vector3 HorizontalForward()
+    {
+        Vector3 f =
+            transform.forward;
+
+        f.y =
+            0.0f;
+
+        if (f.sqrMagnitude < 0.0001f)
+        {
+            f =
+                Vector3.forward;
+        }
+
+        return f.normalized;
+    }
+
+    private Vector3 HorizontalRight()
+    {
+        Vector3 r =
+            transform.right;
+
+        r.y =
+            0.0f;
+
+        if (r.sqrMagnitude < 0.0001f)
+        {
+            r =
+                Vector3.right;
+        }
+
+        return r.normalized;
+    }
+
+    private float CurrentDepth()
+    {
+        if (controller != null && controller.depthM > 0.001f)
+        {
+            return controller.depthM;
+        }
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        float water =
+            controller != null
+                ? controller.waterLevelY
+                : 0.0f;
+
+        return water - p.y;
+    }
+
+    private float DepthToWorldY(float depth)
+    {
+        float water =
+            controller != null
+                ? controller.waterLevelY
+                : 0.0f;
+
+        bool positiveDown =
+            controller == null ||
+            controller.depthPositiveDown;
+
+        return positiveDown
+            ? water - depth
+            : water + depth;
+    }
+}

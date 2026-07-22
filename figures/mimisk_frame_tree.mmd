@@ -1,0 +1,16 @@
+flowchart TD
+    W["mimisk_world"]
+
+    W --> D["drone_base_link"]
+    D --> DI["drone_imu_link"]
+    D --> DC["drone_camera_optical"]
+    D --> DP["drone_payload_frame"]
+
+    W --> F["winch_fairlead"]
+    W --> TE["tether_end"]
+
+    W --> R["minirov_base_link"]
+    R --> RI["minirov_imu_link"]
+    R --> RP["minirov_pressure_link"]
+    R --> RC["minirov_front_camera_optical"]
+    R --> RA["minirov_tether_anchor"]

@@ -1,0 +1,41 @@
+flowchart LR
+    subgraph Unity["Unity / MIMISK Simulator"]
+        U1["Drone physics + controller"]
+        U2["Surface landing / buoyancy"]
+        U3["Winch + tether manager"]
+        U4["MiniROV physics + controller"]
+        U5["Cameras + sensors"]
+        U6["Mission + recovery logic"]
+    end
+
+    subgraph GRPC["gRPC Bridge"]
+        G1["Telemetry"]
+        G2["Commands"]
+        G3["Command results"]
+        G4["Camera frames"]
+        G5["Manual gamepad"]
+        G6["External references"]
+    end
+
+    subgraph ROS["ROS 2 Layer"]
+        R1["State / odom / IMU / depth"]
+        R2["Camera topics"]
+        R3["Mission services"]
+        R4["Manual control"]
+        R5["External references"]
+        R6["TF + clock"]
+        R7["Rosbag + experiment runner"]
+    end
+
+    subgraph Research["Research Modules"]
+        X1["Localization"]
+        X2["Tether localization"]
+        X3["Trajectory planning"]
+        X4["AI / VLM perception"]
+        X5["Custom reference control"]
+        X6["Dataset generation"]
+    end
+
+    Unity <--> GRPC
+    GRPC <--> ROS
+    ROS <--> Research

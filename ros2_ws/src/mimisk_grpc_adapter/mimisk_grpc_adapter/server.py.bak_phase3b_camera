@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import math
+import sys
+from collections import deque
+from concurrent import futures
+from pathlib import Path
+from threading import Lock
+
+import grpc
+import rclpy
+
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import FluidPressure, Imu
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+from mimisk_msgs.msg import CommandResult as CommandResultMsg
+from mimisk_msgs.msg import DroneState as DroneStateMsg
+from mimisk_msgs.msg import MiniROVState as MiniROVStateMsg
+from mimisk_msgs.msg import TetherState as TetherStateMsg
+from mimisk_msgs.srv import SetString
+
+PROTO_DIR = Path(__file__).resolve().parent / "protobuf"
+if str(PROTO_DIR) not in sys.path:
+    sys.path.insert(0, str(PROTO_DIR))
+
+import mimisk_bridge_pb2 as pb2
+import mimisk_bridge_pb2_grpc as pb2_grpc
+
+
+WATER_DENSITY_KG_M3 = 997.0
+GRAVITY_M_S2 = 9.80665
+ATM_PRESSURE_PA = 101325.0
+
+
+def make_stamp(sim_time_sec: float):
+    sec = int(sim_time_sec)
+    nsec = int((sim_time_sec - sec) * 1e9)
+    return sec, nsec
+
+
+def make_header(frame_id: str, sim_time_sec: float):
+    from std_msgs.msg import Header
+
+    header = Header()
+    header.frame_id = frame_id
+    sec, nsec = make_stamp(sim_time_sec)
+    header.stamp.sec = sec
+    header.stamp.nanosec = nsec
+    return header
+
+
+def vec_to_dict(v) -> dict[str, float]:
+    return {
+        "x": float(v.x),
+        "y": float(v.y),
+        "z": float(v.z),
+    }
+
+
+def unity_vec_to_ros_tuple(v) -> tuple[float, float, float]:
+    # ROS-friendly mapping:
+    # Unity X -> ROS X
+    # Unity Z -> ROS Y
+    # Unity Y -> ROS Z
+    return float(v.x), float(v.z), float(v.y)
+
+
+def fill_ros_vector(msg_vec, proto_vec) -> None:
+    x, y, z = unity_vec_to_ros_tuple(proto_vec)
+    msg_vec.x = x
+    msg_vec.y = y
+    msg_vec.z = z
+
+
+def yaw_to_quaternion_z(yaw_deg: float):
+    yaw = math.radians(float(yaw_deg))
+    half = 0.5 * yaw
+
+    qx = 0.0
+    qy = 0.0
+    qz = math.sin(half)
+    qw = math.cos(half)
+
+    return qx, qy, qz, qw
+
+
+def vec_to_pose_msg(frame_id: str, sim_time_sec: float, position, yaw_deg: float = 0.0) -> PoseStamped:
+    msg = PoseStamped()
+    msg.header = make_header(frame_id, sim_time_sec)
+
+    x, y, z = unity_vec_to_ros_tuple(position)
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.position.z = z
+
+    qx, qy, qz, qw = yaw_to_quaternion_z(yaw_deg)
+    msg.pose.orientation.x = qx
+    msg.pose.orientation.y = qy
+    msg.pose.orientation.z = qz
+    msg.pose.orientation.w = qw
+
+    return msg
+
+
+def build_odom(
+    frame_id: str,
+    child_frame_id: str,
+    sim_time_sec: float,
+    position,
+    velocity,
+    yaw_deg: float,
+) -> Odometry:
+    msg = Odometry()
+    msg.header = make_header(frame_id, sim_time_sec)
+    msg.child_frame_id = child_frame_id
+
+    x, y, z = unity_vec_to_ros_tuple(position)
+    msg.pose.pose.position.x = x
+    msg.pose.pose.position.y = y
+    msg.pose.pose.position.z = z
+
+    qx, qy, qz, qw = yaw_to_quaternion_z(yaw_deg)
+    msg.pose.pose.orientation.x = qx
+    msg.pose.pose.orientation.y = qy
+    msg.pose.pose.orientation.z = qz
+    msg.pose.pose.orientation.w = qw
+
+    vx, vy, vz = unity_vec_to_ros_tuple(velocity)
+    msg.twist.twist.linear.x = vx
+    msg.twist.twist.linear.y = vy
+    msg.twist.twist.linear.z = vz
+
+    # Covariances are left zero in Phase 3A.
+    # Later, sensor-noise models will fill these properly.
+    return msg
+
+
+def build_imu(
+    frame_id: str,
+    sim_time_sec: float,
+    yaw_deg: float,
+) -> Imu:
+    msg = Imu()
+    msg.header = make_header(frame_id, sim_time_sec)
+
+    qx, qy, qz, qw = yaw_to_quaternion_z(yaw_deg)
+    msg.orientation.x = qx
+    msg.orientation.y = qy
+    msg.orientation.z = qz
+    msg.orientation.w = qw
+
+    # Phase 3A publishes yaw-only orientation from telemetry.
+    # Angular velocity and linear acceleration will be populated from
+    # dedicated Unity sensor streams in Phase 3C.
+    msg.angular_velocity_covariance[0] = -1.0
+    msg.linear_acceleration_covariance[0] = -1.0
+
+    return msg
+
+
+def build_depth_pressure(
+    frame_id: str,
+    sim_time_sec: float,
+    depth_m: float,
+) -> FluidPressure:
+    msg = FluidPressure()
+    msg.header = make_header(frame_id, sim_time_sec)
+
+    depth = max(0.0, float(depth_m))
+    msg.fluid_pressure = ATM_PRESSURE_PA + WATER_DENSITY_KG_M3 * GRAVITY_M_S2 * depth
+    msg.variance = 0.0
+
+    return msg
+
+
+class MIMISKBridgeService(pb2_grpc.MIMISKBridgeServicer):
+    def __init__(self, node):
+        self.node = node
+        self.frames_received = 0
+        self.last_sim_time_sec = 0.0
+
+        # Human-readable debug topics.
+        self.drone_state_text_pub = node.create_publisher(String, "/mimisk/drone/state_text", 10)
+        self.minirov_state_text_pub = node.create_publisher(String, "/mimisk/minirov/state_text", 10)
+        self.tether_state_text_pub = node.create_publisher(String, "/mimisk/tether/state_text", 10)
+        self.system_events_pub = node.create_publisher(String, "/mimisk/system/events", 10)
+
+        # Existing pose topics, now ROS-coordinate mapped.
+        self.drone_pose_pub = node.create_publisher(PoseStamped, "/mimisk/drone/pose", 10)
+        self.minirov_pose_pub = node.create_publisher(PoseStamped, "/mimisk/minirov/pose", 10)
+
+        # Typed MIMISK state topics.
+        self.drone_state_pub = node.create_publisher(DroneStateMsg, "/mimisk/drone/state", 10)
+        self.minirov_state_pub = node.create_publisher(MiniROVStateMsg, "/mimisk/minirov/state", 10)
+        self.tether_state_pub = node.create_publisher(TetherStateMsg, "/mimisk/tether/state", 10)
+
+        # Standard ROS localization/navigation topics.
+        self.drone_odom_pub = node.create_publisher(Odometry, "/mimisk/drone/odom", 10)
+        self.minirov_odom_pub = node.create_publisher(Odometry, "/mimisk/minirov/odom", 10)
+
+        self.drone_imu_pub = node.create_publisher(Imu, "/mimisk/drone/imu", 10)
+        self.minirov_imu_pub = node.create_publisher(Imu, "/mimisk/minirov/imu", 10)
+
+        self.minirov_depth_pub = node.create_publisher(FluidPressure, "/mimisk/minirov/depth", 10)
+
+        # Command system.
+        self.command_queue = deque()
+        self.command_lock = Lock()
+        self.commands_enqueued = 0
+        self.commands_sent_to_unity = 0
+
+        self.command_ack_pub = node.create_publisher(String, "/mimisk/command_ack", 10)
+        self.command_result_pub = node.create_publisher(String, "/mimisk/command_result", 10)
+        self.command_result_typed_pub = node.create_publisher(
+            CommandResultMsg,
+            "/mimisk/command_result_typed",
+            10,
+        )
+
+        self.command_json_sub = node.create_subscription(
+            String,
+            "/mimisk/command_json",
+            self.command_json_callback,
+            10,
+        )
+
+        self.create_trigger_service("/mimisk/drone/land_surface", "drone", "land_surface")
+        self.create_trigger_service("/mimisk/drone/takeoff", "drone", "takeoff")
+        self.create_trigger_service("/mimisk/drone/hold", "drone", "hold")
+        self.create_trigger_service("/mimisk/drone/start_mission", "drone", "start_mission")
+
+        self.create_trigger_service("/mimisk/tether/attach_rov", "tether", "attach_rov")
+        self.create_trigger_service("/mimisk/tether/deploy_rov", "tether", "deploy_rov")
+        self.create_trigger_service("/mimisk/tether/activate_rov_control", "tether", "activate_rov_control")
+        self.create_trigger_service("/mimisk/tether/enable_smart_tms", "tether", "enable_smart_tms")
+        self.create_trigger_service("/mimisk/tether/disable_smart_tms", "tether", "disable_smart_tms")
+        self.create_trigger_service("/mimisk/tether/recover_rov", "tether", "recover_rov")
+        self.create_trigger_service("/mimisk/tether/hold_winch", "tether", "hold_winch")
+
+        self.create_trigger_service("/mimisk/minirov/station_hold", "minirov", "station_hold")
+        self.create_trigger_service("/mimisk/minirov/start_mission", "minirov", "start_mission")
+        self.create_trigger_service("/mimisk/minirov/return_home", "minirov", "return_home")
+        self.create_trigger_service("/mimisk/minirov/dwell", "minirov", "dwell")
+        self.create_trigger_service("/mimisk/minirov/abort_to_hold", "minirov", "abort_to_hold")
+
+        self.create_set_string_service("/mimisk/drone/set_trajectory", "drone", "set_trajectory")
+        self.create_set_string_service("/mimisk/minirov/set_path", "minirov", "set_path")
+
+    def Ping(self, request, context):
+        self.node.get_logger().info(
+            f"Ping from Unity/client: {request.client_name}"
+        )
+
+        return pb2.PingReply(
+            ok=True,
+            message="MIMISK gRPC adapter alive",
+        )
+
+    def SendTelemetry(self, request, context):
+        self.frames_received += 1
+        self.last_sim_time_sec = float(request.header.sim_time_sec)
+        self.publish_telemetry(request)
+
+        return pb2.TelemetryAck(
+            accepted=True,
+            message=f"telemetry accepted frame={self.frames_received}",
+        )
+
+    def ReportCommandResult(self, request, context):
+        result_dict = {
+            "sim_time_sec": float(request.header.sim_time_sec),
+            "command_seq": int(request.command_seq),
+            "target_agent": request.target_agent,
+            "verb": request.verb,
+            "string_arg": request.string_arg,
+            "numeric_arg": float(request.numeric_arg),
+            "executed": bool(request.executed),
+            "result": request.result,
+        }
+
+        msg = String()
+        msg.data = json.dumps(result_dict)
+        self.command_result_pub.publish(msg)
+
+        typed = CommandResultMsg()
+        typed.header = make_header("unity_command_result", float(request.header.sim_time_sec))
+        typed.command_seq = int(request.command_seq)
+        typed.target_agent = request.target_agent
+        typed.verb = request.verb
+        typed.string_arg = request.string_arg
+        typed.numeric_arg = float(request.numeric_arg)
+        typed.executed = bool(request.executed)
+        typed.result = request.result
+        self.command_result_typed_pub.publish(typed)
+
+        if request.executed:
+            self.node.get_logger().info(
+                f"Unity executed command #{request.command_seq}: "
+                f"{request.target_agent}/{request.verb} -> {request.result}"
+            )
+        else:
+            self.node.get_logger().warn(
+                f"Unity rejected command #{request.command_seq}: "
+                f"{request.target_agent}/{request.verb} -> {request.result}"
+            )
+
+        return pb2.TelemetryAck(
+            accepted=True,
+            message="command result received",
+        )
+
+    def GetPendingCommands(self, request, context):
+        with self.command_lock:
+            commands = list(self.command_queue)
+            self.command_queue.clear()
+
+        self.commands_sent_to_unity += len(commands)
+
+        if commands:
+            self.node.get_logger().info(
+                f"Sending {len(commands)} pending command(s) to Unity client '{request.sim_id}'"
+            )
+
+        return pb2.CommandBatch(commands=commands)
+
+    def create_trigger_service(self, service_name, target_agent, verb):
+        def callback(request, response):
+            self.enqueue_command(
+                target_agent=target_agent,
+                verb=verb,
+                string_arg="",
+                numeric_arg=0.0,
+            )
+
+            response.success = True
+            response.message = f"queued {target_agent}/{verb}"
+            return response
+
+        self.node.create_service(
+            Trigger,
+            service_name,
+            callback,
+        )
+
+    def create_set_string_service(self, service_name, target_agent, verb):
+        def callback(request, response):
+            value = str(request.value).strip()
+
+            if not value:
+                response.success = False
+                response.message = f"{service_name} requires non-empty value"
+                return response
+
+            self.enqueue_command(
+                target_agent=target_agent,
+                verb=verb,
+                string_arg=value,
+                numeric_arg=0.0,
+            )
+
+            response.success = True
+            response.message = f"queued {target_agent}/{verb} value='{value}'"
+            return response
+
+        self.node.create_service(
+            SetString,
+            service_name,
+            callback,
+        )
+
+    def command_json_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+
+            target_agent = str(
+                data.get("target_agent", data.get("target", ""))
+            ).strip()
+
+            verb = str(
+                data.get("verb", data.get("command", ""))
+            ).strip()
+
+            string_arg = str(
+                data.get("string_arg", data.get("arg", ""))
+            )
+
+            numeric_arg = float(
+                data.get("numeric_arg", 0.0)
+            )
+
+            if not target_agent or not verb:
+                raise ValueError("command_json requires target_agent and verb")
+
+            self.enqueue_command(
+                target_agent=target_agent,
+                verb=verb,
+                string_arg=string_arg,
+                numeric_arg=numeric_arg,
+            )
+
+        except Exception as exc:
+            self.node.get_logger().error(
+                f"Failed to parse /mimisk/command_json: {exc}"
+            )
+
+            ack = String()
+            ack.data = json.dumps(
+                {
+                    "accepted": False,
+                    "error": str(exc),
+                    "raw": msg.data,
+                }
+            )
+            self.command_ack_pub.publish(ack)
+
+    def enqueue_command(self, target_agent, verb, string_arg="", numeric_arg=0.0):
+        self.commands_enqueued += 1
+
+        cmd = pb2.MIMISKCommand(
+            header=pb2.Header(
+                sim_time_sec=float(self.last_sim_time_sec),
+                seq=int(self.commands_enqueued),
+                frame_id="ros2_command",
+            ),
+            target_agent=str(target_agent),
+            verb=str(verb),
+            string_arg=str(string_arg),
+            numeric_arg=float(numeric_arg),
+        )
+
+        with self.command_lock:
+            self.command_queue.append(cmd)
+
+        ack = String()
+        ack.data = json.dumps(
+            {
+                "accepted": True,
+                "queued_index": self.commands_enqueued,
+                "target_agent": target_agent,
+                "verb": verb,
+                "string_arg": string_arg,
+                "numeric_arg": numeric_arg,
+            }
+        )
+        self.command_ack_pub.publish(ack)
+
+        self.node.get_logger().info(
+            f"Queued command #{self.commands_enqueued}: {target_agent}/{verb} arg='{string_arg}'"
+        )
+
+    def publish_telemetry(self, frame):
+        sim_time = float(frame.header.sim_time_sec)
+
+        drone = frame.drone
+        rov = frame.minirov
+        tether = frame.tether
+
+        # JSON debug topics.
+        drone_dict = {
+            "sim_time_sec": sim_time,
+            "position": vec_to_dict(drone.position),
+            "velocity": vec_to_dict(drone.velocity),
+            "yaw_deg": float(drone.yaw_deg),
+            "flight_mode": drone.flight_mode,
+            "mission_state": drone.mission_state,
+            "control_mode": drone.control_mode,
+        }
+
+        rov_dict = {
+            "sim_time_sec": sim_time,
+            "position": vec_to_dict(rov.position),
+            "velocity": vec_to_dict(rov.velocity),
+            "yaw_deg": float(rov.yaw_deg),
+            "depth_m": float(rov.depth_m),
+            "mission_state": rov.mission_state,
+            "path_type": rov.path_type,
+            "control_mode": rov.control_mode,
+            "distance_to_home_m": float(rov.distance_to_home_m),
+        }
+
+        tether_dict = {
+            "sim_time_sec": sim_time,
+            "unified_state": tether.unified_state,
+            "low_level_state": tether.low_level_state,
+            "deployed_length_m": float(tether.deployed_length_m),
+            "target_length_m": float(tether.target_length_m),
+            "winch_rate_m_s": float(tether.winch_rate_m_s),
+            "straight_distance_m": float(tether.straight_distance_m),
+            "slack_m": float(tether.slack_m),
+            "stretch_m": float(tether.stretch_m),
+            "tension_n": float(tether.tension_n),
+            "tether_start": vec_to_dict(tether.tether_start),
+            "tether_end": vec_to_dict(tether.tether_end),
+            "drone_motion_allowed": bool(tether.drone_motion_allowed),
+            "safe_to_deploy": bool(tether.safe_to_deploy),
+        }
+
+        msg = String()
+        msg.data = json.dumps(drone_dict)
+        self.drone_state_text_pub.publish(msg)
+
+        msg = String()
+        msg.data = json.dumps(rov_dict)
+        self.minirov_state_text_pub.publish(msg)
+
+        msg = String()
+        msg.data = json.dumps(tether_dict)
+        self.tether_state_text_pub.publish(msg)
+
+        # Typed MIMISK state topics.
+        drone_msg = DroneStateMsg()
+        drone_msg.header = make_header("mimisk_world", sim_time)
+        fill_ros_vector(drone_msg.position, drone.position)
+        fill_ros_vector(drone_msg.velocity, drone.velocity)
+        drone_msg.yaw_deg = float(drone.yaw_deg)
+        drone_msg.flight_mode = drone.flight_mode
+        drone_msg.mission_state = drone.mission_state
+        drone_msg.control_mode = drone.control_mode
+        self.drone_state_pub.publish(drone_msg)
+
+        rov_msg = MiniROVStateMsg()
+        rov_msg.header = make_header("mimisk_world", sim_time)
+        fill_ros_vector(rov_msg.position, rov.position)
+        fill_ros_vector(rov_msg.velocity, rov.velocity)
+        rov_msg.yaw_deg = float(rov.yaw_deg)
+        rov_msg.depth_m = float(rov.depth_m)
+        rov_msg.mission_state = rov.mission_state
+        rov_msg.path_type = rov.path_type
+        rov_msg.control_mode = rov.control_mode
+        rov_msg.distance_to_home_m = float(rov.distance_to_home_m)
+        self.minirov_state_pub.publish(rov_msg)
+
+        tether_msg = TetherStateMsg()
+        tether_msg.header = make_header("mimisk_world", sim_time)
+        tether_msg.unified_state = tether.unified_state
+        tether_msg.low_level_state = tether.low_level_state
+        tether_msg.deployed_length_m = float(tether.deployed_length_m)
+        tether_msg.target_length_m = float(tether.target_length_m)
+        tether_msg.winch_rate_m_s = float(tether.winch_rate_m_s)
+        tether_msg.straight_distance_m = float(tether.straight_distance_m)
+        tether_msg.slack_m = float(tether.slack_m)
+        tether_msg.stretch_m = float(tether.stretch_m)
+        tether_msg.tension_n = float(tether.tension_n)
+        fill_ros_vector(tether_msg.tether_start, tether.tether_start)
+        fill_ros_vector(tether_msg.tether_end, tether.tether_end)
+        tether_msg.drone_motion_allowed = bool(tether.drone_motion_allowed)
+        tether_msg.safe_to_deploy = bool(tether.safe_to_deploy)
+        self.tether_state_pub.publish(tether_msg)
+
+        # Standard ROS topics.
+        self.drone_pose_pub.publish(
+            vec_to_pose_msg("mimisk_world", sim_time, drone.position, drone.yaw_deg)
+        )
+
+        self.minirov_pose_pub.publish(
+            vec_to_pose_msg("mimisk_world", sim_time, rov.position, rov.yaw_deg)
+        )
+
+        self.drone_odom_pub.publish(
+            build_odom(
+                "mimisk_world",
+                "drone_base_link",
+                sim_time,
+                drone.position,
+                drone.velocity,
+                drone.yaw_deg,
+            )
+        )
+
+        self.minirov_odom_pub.publish(
+            build_odom(
+                "mimisk_world",
+                "minirov_base_link",
+                sim_time,
+                rov.position,
+                rov.velocity,
+                rov.yaw_deg,
+            )
+        )
+
+        self.drone_imu_pub.publish(
+            build_imu("drone_imu_link", sim_time, drone.yaw_deg)
+        )
+
+        self.minirov_imu_pub.publish(
+            build_imu("minirov_imu_link", sim_time, rov.yaw_deg)
+        )
+
+        self.minirov_depth_pub.publish(
+            build_depth_pressure("minirov_pressure_link", sim_time, rov.depth_m)
+        )
+
+        if self.frames_received % 100 == 0:
+            event = String()
+            event.data = json.dumps(
+                {
+                    "event": "telemetry_heartbeat",
+                    "frames_received": self.frames_received,
+                    "sim_time_sec": sim_time,
+                }
+            )
+            self.system_events_pub.publish(event)
+
+
+def main():
+    rclpy.init()
+
+    node = rclpy.create_node("mimisk_grpc_adapter")
+
+    server_ip = node.declare_parameter("server_ip", "0.0.0.0").value
+    server_port = int(node.declare_parameter("server_port", 30052).value)
+
+    max_message_length = 100 * 1024 * 1024
+
+    grpc_server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=[
+            ("grpc.max_send_message_length", max_message_length),
+            ("grpc.max_receive_message_length", max_message_length),
+        ],
+    )
+
+    service = MIMISKBridgeService(node)
+    pb2_grpc.add_MIMISKBridgeServicer_to_server(service, grpc_server)
+
+    address = f"{server_ip}:{server_port}"
+    grpc_server.add_insecure_port(address)
+    grpc_server.start()
+
+    node.get_logger().info(f"MIMISK gRPC adapter started on {address}")
+    node.get_logger().info("Phase 3A: typed state + odom/IMU/depth topics enabled")
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.get_logger().info("Stopping MIMISK gRPC adapter")
+        grpc_server.stop(grace=1.0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

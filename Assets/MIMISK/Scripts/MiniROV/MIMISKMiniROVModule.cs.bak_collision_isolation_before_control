@@ -1,0 +1,801 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVModule : MonoBehaviour
+{
+    public enum MiniROVState
+    {
+        NotConfigured,
+        PassiveKinematic,
+        CableAttachedKinematic,
+        FreeDynamicPassive,
+        ExternalControlActive,
+        RecoveryKinematic,
+        Fault
+    }
+
+    [Header("References")]
+    public Transform miniRovRoot;
+    public Rigidbody miniRovRigidbody;
+    public Transform rovTetherAnchor;
+    public Collider[] miniRovColliders;
+
+    [Header("Optional Tether Bridge")]
+    public MIMISKDroneCoreTetherManager tetherManager;
+    public MIMISKMiniROVTetherVisualBridge tetherVisualBridge;
+
+    [Header("Final MiniROV Components")]
+    public Behaviour unityVirtualESP32;
+    public Behaviour controlManager;
+    public Behaviour mimiskWaterInteraction;
+    public Behaviour sensorManager;
+    public Behaviour simpleRovBuoyancy;
+
+    [Header("External Stack")]
+    public bool requireExternalSerialBeforeControl = true;
+    public string unityEsp32SerialDevice = "/dev/unity_esp32";
+    public bool externalStackReady;
+    public string externalStackStatus = "not_checked";
+
+    [Header("Physics")]
+    public float miniRovMassKg = 0.60f;
+
+    [Tooltip("For your final test, SimpleROVBuoyancy is enabled, so Unity gravity may stay ON.")]
+    public bool useGravityInControl = true;
+
+    [Tooltip("Use the current working setup. If collider contact causes issues later, turn this OFF.")]
+    public bool enableCollidersDuringControl = true;
+
+    [Header("Ownership Handoff")]
+    public bool disableDroneDeploymentOwnersOnExternalControl = true;
+    public bool detachFromCableRootOnExternalControl = true;
+    public bool configureTetherAsVisualOnlyOnExternalControl = true;
+
+    [Header("Release Orientation")]
+    public bool correctOrientationOnHandoff = true;
+
+    [Tooltip("Natural free-swimming orientation. Scene 13 appears to use 0,0,0. Adjust only if your model forward axis needs it.")]
+    public Vector3 freeSwimWorldEuler = Vector3.zero;
+
+    [Tooltip("If ON, keep the current yaw but reset roll/pitch according to Free Swim World Euler.")]
+    public bool preserveCurrentYaw = false;
+
+    [Tooltip("Keep the ROV_TetherAnchor fixed at the cable endpoint while correcting orientation.")]
+    public bool keepTetherAnchorLockedDuringOrientationFix = true;
+
+    [Header("Final Stack")]
+    public bool enableFinalStackStaged = true;
+    public float serialWarmupSeconds = 0.15f;
+    public float controlWarmupSeconds = 0.10f;
+
+    [Tooltip("Final stack now includes SimpleROVBuoyancy because your test showed this is required for stable depth.")]
+    public bool enableSimpleRovBuoyancyInFinalStack = true;
+
+    [Tooltip("SensorManager is not part of the final stack.")]
+    public bool keepSensorManagerDisabled = true;
+
+    [Header("Keyboard Test")]
+    public bool keyboardTestEnabled = true;
+    public Key passiveKey = Key.P;
+    public Key freeDynamicKey = Key.J;
+    public Key externalControlKey = Key.I;
+    public Key killKey = Key.K;
+
+    [Header("Runtime")]
+    public MiniROVState state = MiniROVState.NotConfigured;
+    public string lastEvent = "not_configured";
+    public string currentParentName = "none";
+    public bool isDetachedFromCableOrDrone;
+    public bool finalStackEnabled;
+    public bool activationInProgress;
+    public bool lastIKeyDetected;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        SetPassiveKinematic();
+    }
+
+    private void Update()
+    {
+        if (!keyboardTestEnabled)
+        {
+            return;
+        }
+
+        if (WasKeyPressed(passiveKey, KeyCode.P))
+        {
+            SetPassiveKinematic();
+        }
+
+        if (WasKeyPressed(freeDynamicKey, KeyCode.J))
+        {
+            ReleaseToWorldPassiveDynamic();
+        }
+
+        if (WasKeyPressed(externalControlKey, KeyCode.I))
+        {
+            lastIKeyDetected = true;
+            EnableExternalControl();
+        }
+
+        if (WasKeyPressed(killKey, KeyCode.K))
+        {
+            SetPassiveKinematic();
+        }
+    }
+
+    private bool WasKeyPressed(Key newInputKey, KeyCode legacyKey)
+    {
+        bool pressed = false;
+
+        if (Keyboard.current != null)
+        {
+            try
+            {
+                pressed |= Keyboard.current[newInputKey].wasPressedThisFrame;
+            }
+            catch
+            {
+            }
+        }
+
+        try
+        {
+            pressed |= Input.GetKeyDown(legacyKey);
+        }
+        catch
+        {
+        }
+
+        return pressed;
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (miniRovRoot == null)
+        {
+            miniRovRoot = transform;
+        }
+
+        if (miniRovRigidbody == null && miniRovRoot != null)
+        {
+            miniRovRigidbody = miniRovRoot.GetComponent<Rigidbody>();
+        }
+
+        if (miniRovRoot != null)
+        {
+            if (rovTetherAnchor == null)
+            {
+                rovTetherAnchor = FindDeepChild(miniRovRoot, "ROV_TetherAnchor");
+            }
+
+            if (rovTetherAnchor == null)
+            {
+                rovTetherAnchor = FindDeepChild(miniRovRoot, "MiniROV_TetherPoint");
+            }
+
+            if (rovTetherAnchor == null)
+            {
+                rovTetherAnchor = FindDeepChild(miniRovRoot, "TetherPoint");
+            }
+
+            if (miniRovColliders == null || miniRovColliders.Length == 0)
+            {
+                miniRovColliders = miniRovRoot.GetComponentsInChildren<Collider>(true);
+            }
+        }
+
+        if (tetherManager == null)
+        {
+            GameObject drone = GameObject.Find("Drone");
+
+            if (drone != null)
+            {
+                tetherManager = drone.GetComponent<MIMISKDroneCoreTetherManager>();
+            }
+        }
+
+        if (tetherVisualBridge == null)
+        {
+            tetherVisualBridge = FindAnyObjectByType<MIMISKMiniROVTetherVisualBridge>();
+        }
+
+        unityVirtualESP32 = FindBehaviourByTypeName("UnityVirtualESP32");
+        controlManager = FindBehaviourByTypeName("ControlManager");
+        mimiskWaterInteraction = FindBehaviourByTypeName("MIMISKWaterInteraction");
+        sensorManager = FindBehaviourByTypeName("SensorManager");
+        simpleRovBuoyancy = FindBehaviourByTypeName("SimpleROVBuoyancy");
+    }
+
+    [ContextMenu("Set Passive Kinematic")]
+    public void SetPassiveKinematic()
+    {
+        AutoFindReferences();
+
+        if (miniRovRoot == null)
+        {
+            state = MiniROVState.Fault;
+            lastEvent = "passive_failed_missing_root";
+            return;
+        }
+
+        if (miniRovRigidbody == null)
+        {
+            miniRovRigidbody = miniRovRoot.gameObject.AddComponent<Rigidbody>();
+        }
+
+        miniRovRigidbody.mass = Mathf.Max(0.05f, miniRovMassKg);
+
+        if (!miniRovRigidbody.isKinematic)
+        {
+            miniRovRigidbody.linearVelocity = Vector3.zero;
+            miniRovRigidbody.angularVelocity = Vector3.zero;
+        }
+
+        miniRovRigidbody.isKinematic = true;
+        miniRovRigidbody.useGravity = false;
+
+        SetFinalStack(false);
+
+        state = MiniROVState.PassiveKinematic;
+        lastEvent = "passive_kinematic_final_stack_off";
+        UpdateParentDebug();
+    }
+
+    public void AttachKinematicToCable(Transform cableFollowRoot)
+    {
+        AutoFindReferences();
+
+        if (miniRovRoot == null || cableFollowRoot == null)
+        {
+            state = MiniROVState.Fault;
+            lastEvent = "attach_to_cable_failed_missing_reference";
+            return;
+        }
+
+        SetPassiveKinematic();
+
+        miniRovRoot.SetParent(cableFollowRoot, false);
+        miniRovRoot.localPosition = Vector3.zero;
+        miniRovRoot.localRotation = Quaternion.identity;
+        miniRovRoot.localScale = Vector3.one;
+
+        state = MiniROVState.CableAttachedKinematic;
+        lastEvent = "attached_kinematic_to_cable_follow_root";
+        UpdateParentDebug();
+    }
+
+    [ContextMenu("Release To World Passive Dynamic")]
+    public void ReleaseToWorldPassiveDynamic()
+    {
+        AutoFindReferences();
+
+        if (miniRovRoot == null || miniRovRigidbody == null)
+        {
+            state = MiniROVState.Fault;
+            lastEvent = "release_failed_missing_root_or_rigidbody";
+            return;
+        }
+
+        DetachMiniRovToSceneRootWithOptionalOrientationFix();
+
+        miniRovRigidbody.isKinematic = false;
+        miniRovRigidbody.useGravity = false;
+        miniRovRigidbody.linearVelocity = Vector3.zero;
+        miniRovRigidbody.angularVelocity = Vector3.zero;
+        miniRovRigidbody.WakeUp();
+
+        SetFinalStack(false);
+
+        state = MiniROVState.FreeDynamicPassive;
+        lastEvent = "released_to_world_dynamic_passive_no_final_stack";
+        UpdateParentDebug();
+
+        Debug.Log("[MIMISK] MiniROV module: free dynamic passive. Start external stack, then press I.");
+    }
+
+    [ContextMenu("Enable External Control")]
+    public void EnableExternalControl()
+    {
+        AutoFindReferences();
+
+        if (miniRovRoot == null || miniRovRigidbody == null)
+        {
+            state = MiniROVState.Fault;
+            lastEvent = "external_control_failed_missing_root_or_rigidbody";
+            Debug.LogError("[MIMISK] MiniROV external control failed: missing root or Rigidbody.");
+            return;
+        }
+
+        if (!CheckExternalStackReady())
+        {
+            lastEvent = "external_control_rejected_" + externalStackStatus;
+
+            Debug.LogWarning(
+                "[MIMISK] MiniROV external control rejected. " +
+                "Start socat/my_app/pc_sender first. Status: " +
+                externalStackStatus
+            );
+
+            return;
+        }
+
+        if (activationInProgress)
+        {
+            Debug.LogWarning("[MIMISK] MiniROV activation already in progress.");
+            return;
+        }
+
+        if (disableDroneDeploymentOwnersOnExternalControl)
+        {
+            DisableDroneDeploymentOwnerScripts();
+        }
+
+        if (detachFromCableRootOnExternalControl)
+        {
+            DetachMiniRovToSceneRootWithOptionalOrientationFix();
+        }
+
+        miniRovRigidbody.isKinematic = false;
+        miniRovRigidbody.useGravity = useGravityInControl;
+        miniRovRigidbody.linearVelocity = Vector3.zero;
+        miniRovRigidbody.angularVelocity = Vector3.zero;
+        miniRovRigidbody.WakeUp();
+
+        SetMiniRovColliders(enableCollidersDuringControl);
+
+        ConfigureControlManagerReferences();
+
+        if (configureTetherAsVisualOnlyOnExternalControl)
+        {
+            ConfigureTetherAsVisualOnly();
+        }
+
+        SetFinalStack(false);
+
+        if (enableFinalStackStaged)
+        {
+            StartCoroutine(EnableFinalStackStagedRoutine());
+        }
+        else
+        {
+            EnableFinalStackNow();
+        }
+    }
+
+    public bool CheckExternalStackReady()
+    {
+        if (!requireExternalSerialBeforeControl)
+        {
+            externalStackReady = true;
+            externalStackStatus = "serial_check_disabled";
+            return true;
+        }
+
+        externalStackReady =
+            !string.IsNullOrEmpty(unityEsp32SerialDevice) &&
+            File.Exists(unityEsp32SerialDevice);
+
+        externalStackStatus =
+            externalStackReady
+                ? "serial_ready_" + unityEsp32SerialDevice
+                : "missing_serial_" + unityEsp32SerialDevice;
+
+        return externalStackReady;
+    }
+
+    private IEnumerator EnableFinalStackStagedRoutine()
+    {
+        activationInProgress = true;
+
+        if (unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.enabled = true;
+        }
+
+        yield return new WaitForSeconds(serialWarmupSeconds);
+
+        if (controlManager != null)
+        {
+            controlManager.enabled = true;
+        }
+
+        yield return new WaitForSeconds(controlWarmupSeconds);
+
+        if (mimiskWaterInteraction != null)
+        {
+            mimiskWaterInteraction.enabled = true;
+        }
+
+        if (simpleRovBuoyancy != null)
+        {
+            simpleRovBuoyancy.enabled = enableSimpleRovBuoyancyInFinalStack;
+        }
+
+        if (sensorManager != null && keepSensorManagerDisabled)
+        {
+            sensorManager.enabled = false;
+        }
+
+        finalStackEnabled = true;
+        state = MiniROVState.ExternalControlActive;
+        lastEvent = "external_control_active_with_simple_buoyancy_and_correct_orientation";
+        activationInProgress = false;
+
+        UpdateParentDebug();
+
+        Debug.Log(
+            "[MIMISK] MiniROV final stack active. Parent=" +
+            currentParentName +
+            ", gravity=" +
+            (miniRovRigidbody != null ? miniRovRigidbody.useGravity.ToString() : "none") +
+            ", WaterInteraction=" +
+            (mimiskWaterInteraction != null && mimiskWaterInteraction.enabled) +
+            ", SimpleBuoyancy=" +
+            (simpleRovBuoyancy != null && simpleRovBuoyancy.enabled) +
+            ", ESP32=" +
+            (unityVirtualESP32 != null && unityVirtualESP32.enabled) +
+            ", ControlManager=" +
+            (controlManager != null && controlManager.enabled)
+        );
+    }
+
+    private void EnableFinalStackNow()
+    {
+        SetFinalStack(true);
+
+        state = MiniROVState.ExternalControlActive;
+        lastEvent = "external_control_active_immediate";
+        UpdateParentDebug();
+    }
+
+    private void DetachMiniRovToSceneRootWithOptionalOrientationFix()
+    {
+        Vector3 anchorWorld =
+            rovTetherAnchor != null ? rovTetherAnchor.position : miniRovRoot.position;
+
+        Vector3 oldWorldPosition = miniRovRoot.position;
+        Quaternion oldWorldRotation = miniRovRoot.rotation;
+        Vector3 oldWorldScale = miniRovRoot.lossyScale;
+
+        Vector3 anchorLocal =
+            rovTetherAnchor != null
+                ? miniRovRoot.InverseTransformPoint(rovTetherAnchor.position)
+                : Vector3.zero;
+
+        miniRovRoot.SetParent(null, true);
+        miniRovRoot.localScale = SafeScale(oldWorldScale);
+
+        Quaternion targetRotation = oldWorldRotation;
+
+        if (correctOrientationOnHandoff)
+        {
+            Vector3 e = freeSwimWorldEuler;
+
+            if (preserveCurrentYaw)
+            {
+                e.y = oldWorldRotation.eulerAngles.y;
+            }
+
+            targetRotation = Quaternion.Euler(e);
+        }
+
+        Vector3 targetPosition = oldWorldPosition;
+
+        if (correctOrientationOnHandoff &&
+            keepTetherAnchorLockedDuringOrientationFix &&
+            rovTetherAnchor != null)
+        {
+            targetPosition = anchorWorld - targetRotation * anchorLocal;
+        }
+
+        miniRovRoot.SetPositionAndRotation(targetPosition, targetRotation);
+
+        if (miniRovRigidbody != null)
+        {
+            miniRovRigidbody.position = targetPosition;
+            miniRovRigidbody.rotation = targetRotation;
+        }
+    }
+
+    private void DisableDroneDeploymentOwnerScripts()
+    {
+        GameObject drone = GameObject.Find("Drone");
+
+        if (drone == null)
+        {
+            return;
+        }
+
+        string[] ownerNames =
+        {
+            "MIMISKStandaloneTetherDeploymentMission",
+            "MIMISKDroneTetherHandoffMission",
+            "MIMISKTetherDeploymentTestMission",
+            "MIMISKMiniROVRealisticDeploymentManager",
+            "MIMISKMiniROVDeploymentManager",
+            "MIMISKMiniROVCableEndAttachmentManager",
+            "MIMISKMiniROVWaterReleaseController"
+        };
+
+        Behaviour[] behaviours =
+            drone.GetComponentsInChildren<Behaviour>(true);
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            Behaviour b = behaviours[i];
+
+            if (b == null)
+            {
+                continue;
+            }
+
+            string typeName = b.GetType().Name;
+
+            for (int j = 0; j < ownerNames.Length; j++)
+            {
+                if (typeName == ownerNames[j])
+                {
+                    b.enabled = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    private void ConfigureTetherAsVisualOnly()
+    {
+        if (tetherManager != null)
+        {
+            tetherManager.useVirtualEndpointWhenNoMiniRov = false;
+            tetherManager.miniRovRigidbody = miniRovRigidbody;
+            tetherManager.miniRovTetherPoint =
+                rovTetherAnchor != null ? rovTetherAnchor : miniRovRoot;
+
+            tetherManager.enableTetherForceWhenMiniRovAttached = false;
+            tetherManager.tetherStiffnessNPerM = 0.0f;
+            tetherManager.tetherDampingNPerMS = 0.0f;
+            tetherManager.maximumSafeTensionN = 999999.0f;
+
+            tetherManager.targetLengthM = tetherManager.deployedLengthM;
+            tetherManager.tetherState = MIMISKDroneCoreTetherManager.TetherState.HoldingDeployed;
+            tetherManager.lastEvent = "visual_tether_follows_rov_tether_anchor";
+        }
+
+        if (tetherVisualBridge != null)
+        {
+            tetherVisualBridge.miniRovRoot = miniRovRoot;
+            tetherVisualBridge.rovTetherAnchor =
+                rovTetherAnchor != null ? rovTetherAnchor : miniRovRoot;
+            tetherVisualBridge.ActivateFreeSwimmingTether();
+        }
+    }
+
+    private void SetFinalStack(bool enabled)
+    {
+        AutoFindReferences();
+
+        if (unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.enabled = enabled;
+        }
+
+        if (controlManager != null)
+        {
+            controlManager.enabled = enabled;
+        }
+
+        if (mimiskWaterInteraction != null)
+        {
+            mimiskWaterInteraction.enabled = enabled;
+        }
+
+        if (simpleRovBuoyancy != null)
+        {
+            simpleRovBuoyancy.enabled = enabled && enableSimpleRovBuoyancyInFinalStack;
+        }
+
+        if (sensorManager != null && keepSensorManagerDisabled)
+        {
+            sensorManager.enabled = false;
+        }
+
+        finalStackEnabled = enabled;
+    }
+
+    private void ConfigureControlManagerReferences()
+    {
+        if (controlManager == null)
+        {
+            return;
+        }
+
+        SetFieldOrProperty(controlManager, "rb", miniRovRigidbody);
+        SetFieldOrProperty(controlManager, "portName", unityEsp32SerialDevice);
+        SetFieldOrProperty(controlManager, "baudRate", 115200);
+        SetFieldOrProperty(controlManager, "autoOpenOnStart", true);
+
+        Transform leftThruster = FindDeepChild(miniRovRoot, "propulseur_gauche");
+        Transform rightThruster = FindDeepChild(miniRovRoot, "propulseur_droite");
+
+        SetFieldOrProperty(controlManager, "leftThruster", leftThruster);
+        SetFieldOrProperty(controlManager, "rightThruster", rightThruster);
+
+        Component floatingObject = FindComponentByTypeName("FloatingObject");
+
+        if (floatingObject != null)
+        {
+            SetFieldOrProperty(controlManager, "floatingObject", floatingObject);
+        }
+    }
+
+    private void SetMiniRovColliders(bool enabled)
+    {
+        if (miniRovColliders == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < miniRovColliders.Length; i++)
+        {
+            if (miniRovColliders[i] != null)
+            {
+                miniRovColliders[i].enabled = enabled;
+            }
+        }
+    }
+
+    private void UpdateParentDebug()
+    {
+        currentParentName =
+            miniRovRoot != null && miniRovRoot.parent != null
+                ? miniRovRoot.parent.name
+                : "scene_root";
+
+        isDetachedFromCableOrDrone =
+            currentParentName == "scene_root";
+    }
+
+    private Behaviour FindBehaviourByTypeName(string typeName)
+    {
+        if (miniRovRoot == null)
+        {
+            return null;
+        }
+
+        Behaviour[] behaviours =
+            miniRovRoot.GetComponentsInChildren<Behaviour>(true);
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            if (behaviours[i] != null &&
+                behaviours[i].GetType().Name == typeName)
+            {
+                return behaviours[i];
+            }
+        }
+
+        return null;
+    }
+
+    private Component FindComponentByTypeName(string typeName)
+    {
+        if (miniRovRoot == null)
+        {
+            return null;
+        }
+
+        Component[] components =
+            miniRovRoot.GetComponentsInChildren<Component>(true);
+
+        for (int i = 0; i < components.Length; i++)
+        {
+            if (components[i] != null &&
+                components[i].GetType().Name == typeName)
+            {
+                return components[i];
+            }
+        }
+
+        return null;
+    }
+
+    private void SetFieldOrProperty(object obj, string name, object value)
+    {
+        if (obj == null)
+        {
+            return;
+        }
+
+        Type t = obj.GetType();
+
+        FieldInfo f =
+            t.GetField(
+                name,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (f != null)
+        {
+            try
+            {
+                f.SetValue(obj, value);
+            }
+            catch
+            {
+            }
+
+            return;
+        }
+
+        PropertyInfo p =
+            t.GetProperty(
+                name,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (p != null && p.CanWrite)
+        {
+            try
+            {
+                p.SetValue(obj, value, null);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private Vector3 SafeScale(Vector3 scale)
+    {
+        if (scale.x <= 0.0001f ||
+            scale.y <= 0.0001f ||
+            scale.z <= 0.0001f)
+        {
+            return Vector3.one;
+        }
+
+        return scale;
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

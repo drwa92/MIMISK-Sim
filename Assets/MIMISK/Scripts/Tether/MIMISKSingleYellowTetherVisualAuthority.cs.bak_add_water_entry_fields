@@ -1,0 +1,1143 @@
+using UnityEngine;
+
+[DefaultExecutionOrder(6000)]
+[DisallowMultipleComponent]
+public class MIMISKSingleYellowTetherVisualAuthority : MonoBehaviour
+{
+    [Header("Managers")]
+    public MIMISKUnifiedTetherManager unifiedTether;
+    public MIMISKDroneCoreTetherManager tetherManager;
+
+    [Header("Single Visible Runtime Cable")]
+    public string primaryLineName = "MiniROV_ActiveYellowTetherLine";
+    public LineRenderer primaryLine;
+
+    [Header("Yellow Winch Cable Source")]
+    public string fairleadName = "WinchFairlead_for_Unity_LineRenderer_Start";
+    public string yellowCableEndName = "real_mesh_short_yellow_deployment_cable_to_hook";
+    public string hookVisualName = "small_dark_open_deployment_hook_for_miniROV";
+
+    public string winchCableMaterialSource1 = "real_mesh_yellow_cable_layer_3_wrapped_on_integrated_winch";
+    public string winchCableMaterialSource2 = "real_mesh_yellow_cable_layer_2_wrapped_on_integrated_winch";
+    public string winchCableMaterialSource3 = "real_mesh_yellow_cable_layer_1_wrapped_on_integrated_winch";
+
+    public Transform fairlead;
+    public Transform yellowCableEnd;
+    public Transform hookVisual;
+    public Transform winchCableMaterialSource;
+
+    [Header("MiniROV Endpoint")]
+    public string miniRovName = "MiniROV";
+    public string miniRovTetherAnchorName = "ROV_TetherAnchor";
+
+    [Header("MiniROV Rear Attachment Visual")]
+    [Tooltip("Prefer the rear/end tether point for the visible cable. This should normally be MiniROV_TetherPoint.")]
+    public bool preferRearMiniRovTetherPoint = true;
+
+    public string rearMiniRovTetherPointName = "MiniROV_TetherPoint";
+
+    [Tooltip("If ON, the visible cable attaches to the MiniROV tether point in all states, including attached/recovered.")]
+    public bool attachVisibleCableToMiniRovPointWheneverAvailable = true;
+
+    [Tooltip("Small local visual correction on the MiniROV tether point if the cable appears slightly offset.")]
+    public Vector3 miniRovTetherPointLocalVisualOffset = Vector3.zero;
+
+    [Header("Visual Cable Length")]
+    [Tooltip("Only affects visual sag/curvature, not the real winch state. Prevents the cable from looking cut/too short.")]
+    public bool forceVisualCableLengthAtLeastStraightDistance = true;
+
+    public float visualMinimumSlackM = 0.35f;
+
+    public Transform miniRovRoot;
+    public Transform miniRovTetherAnchor;
+
+    [Header("Authority")]
+    public bool visualAuthorityEnabled = true;
+    public bool disableDuplicateVisualComponents = true;
+    public bool deactivateDuplicateCableObjects = true;
+
+    // Backward-compatible alias for older editor setup scripts.
+    public bool hideDuplicateCableObjects
+    {
+        get { return deactivateDuplicateCableObjects; }
+        set { deactivateDuplicateCableObjects = value; }
+    }
+
+    // Kept for backward compatibility. The final visual authority never hides the hook via this flag.
+    public bool keepHookVisible = true;
+    public bool hideOtherTetherLineRenderers = true;
+
+    [Tooltip("Hide the static short yellow mesh renderer, but still use its transform as the cable endpoint.")]
+    public bool hideShortYellowCableMeshRenderer = true;
+
+    [Header("Yellow Material Authority")]
+    public bool forceValidYellowMaterial = true;
+    public string preferredYellowMaterialName = "yellow_winch_cable_rope";
+    public Color fallbackYellowCableColor = new Color(1.0f, 0.78f, 0.05f, 1.0f);
+
+    [Header("Cable Shape")]
+    public int lineSegments = 52;
+    public float lineWidthM = 0.014f;
+
+    public float minimumSagM = 0.015f;
+    public float slackSagGain = 0.35f;
+    public float maxSagM = 0.55f;
+
+    [Tooltip("Adds visible curve when the ROV is almost directly below the drone.")]
+    public float minimumDynamicSideCurveM = 0.09f;
+
+    public bool enableCurrentDeflection = true;
+    public Vector3 currentDirectionWorld = new Vector3(1.0f, 0.0f, 0.20f);
+    public float currentDeflectionGain = 0.10f;
+    public float maxCurrentDeflectionM = 0.35f;
+
+    public bool enableSmallWaveMotion = true;
+    public float waveAmplitudeM = 0.010f;
+    public float waveSpatialFrequency = 1.8f;
+    public float waveTemporalFrequency = 0.45f;
+
+    [Header("Continuous Water-Entry Cable Shape")]
+    [Tooltip("When the ROV is underwater, draw one continuous cable from fairlead to water-entry point to ROV anchor.")]
+    public bool useContinuousWaterEntryCableShape = true;
+
+    [Tooltip("Fallback water surface height if UnifiedTether is missing.")]
+    public float fallbackWaterSurfaceY = 0.0f;
+
+    [Tooltip("Move the water-entry point slightly toward the ROV horizontally, instead of exactly below the fairlead.")]
+    [Range(0.0f, 0.5f)]
+    public float surfaceEntryTowardRovFraction = 0.12f;
+
+    [Tooltip("Small depth below the surface to avoid z-fighting with the water plane.")]
+    public float waterEntryBelowSurfaceM = 0.02f;
+
+    [Tooltip("Extra underwater sag gain. This makes the underwater part look like a cable, not a vertical cut line.")]
+    public float underwaterSagGain = 0.28f;
+
+    public float underwaterMaxSagM = 0.60f;
+
+    [Tooltip("Extra underwater side curvature even when the ROV is close to the drone.")]
+    public float underwaterMinimumSideCurveM = 0.12f;
+
+    [Header("Continuous Cable Runtime")]
+    public Vector3 waterEntryWorld;
+    public float airSegmentFraction;
+    public float underwaterSegmentLengthM;
+
+    [Header("Runtime")]
+    public string cableMode = "unknown";
+    public Vector3 startWorld;
+    public Vector3 endWorld;
+    public float deployedLengthM;
+    public float straightDistanceM;
+    public float slackM;
+    public float stretchM;
+    public float sagAmplitudeM;
+    public float sideCurveM;
+    public int duplicateObjectsDeactivated;
+    public int duplicateComponentsDisabled;
+    public int lineRenderersDisabled;
+
+    private Vector3[] points;
+    private Material ropeMaterial;
+
+    private readonly string[] duplicateComponentTypeNames =
+    {
+        "MIMISKWinchRopeSingleVisual",
+        "MIMISKTetherCableModel",
+        "MIMISKFinalTetherEndpointRig",
+        "MIMISKFinalTetherLineSynchronizer",
+        "MIMISKMiniROVTetherVisualBridge",
+        "MIMISKFinalContinuousTetherVisual",
+        "MIMISKFinalTetherVisualBridge"
+    };
+
+    private readonly string[] duplicateObjectNames =
+    {
+        "MIMISK_RealisticTetherCableMesh",
+        "MIMISK_FinalActiveYellowTether",
+        "MIMISK_Final_ActiveYellowTether",
+        "MIMISK_Final_ContinuousYellowTether",
+        "MIMISK_Final_ActiveYellowTetherLine",
+        "MIMISK_Final_ContinuousYellowTetherLine",
+        "MIMISK_Final_TetherCable",
+        "MIMISK_FinalCable",
+        "MIMISK_ContinuousYellowTether",
+        "MIMISK_FinalDeploymentPoint"
+    };
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        ConfigureSingleCableVisual();
+    }
+
+    private void Start()
+    {
+        AutoFindReferences();
+        ConfigureSingleCableVisual();
+    }
+
+    private void LateUpdate()
+    {
+        if (!visualAuthorityEnabled)
+        {
+            return;
+        }
+
+        AutoFindReferences();
+
+        if (disableDuplicateVisualComponents)
+        {
+            DisableDuplicateVisualComponents();
+        }
+
+        if (deactivateDuplicateCableObjects)
+        {
+            DeactivateDuplicateCableObjects();
+        }
+
+        ConfigureLowLevelTetherVisualContract();
+
+        if (hideShortYellowCableMeshRenderer)
+        {
+            HideRenderersOnly(yellowCableEnd);
+        }
+
+        startWorld = ResolveStartWorld();
+        endWorld = ResolveEndWorld();
+
+        BuildCableCurve();
+        DrawPrimaryLine();
+
+        if (hideOtherTetherLineRenderers)
+        {
+            DisableOtherLineRenderers();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (unifiedTether == null)
+        {
+            unifiedTether = GetComponent<MIMISKUnifiedTetherManager>();
+        }
+
+        if (tetherManager == null)
+        {
+            tetherManager = GetComponent<MIMISKDroneCoreTetherManager>();
+        }
+
+        if (fairlead == null)
+        {
+            fairlead = FindDeepChild(transform, fairleadName);
+        }
+
+        if (yellowCableEnd == null)
+        {
+            yellowCableEnd = FindDeepChild(transform, yellowCableEndName);
+        }
+
+        if (hookVisual == null)
+        {
+            hookVisual = FindDeepChild(transform, hookVisualName);
+        }
+
+        if (primaryLine == null)
+        {
+            Transform lineTransform = FindDeepChild(transform, primaryLineName);
+
+            if (lineTransform == null)
+            {
+                GameObject go = new GameObject(primaryLineName);
+                go.transform.SetParent(transform, false);
+                lineTransform = go.transform;
+            }
+
+            primaryLine = lineTransform.GetComponent<LineRenderer>();
+
+            if (primaryLine == null)
+            {
+                primaryLine = lineTransform.gameObject.AddComponent<LineRenderer>();
+            }
+        }
+
+        if (winchCableMaterialSource == null)
+        {
+            winchCableMaterialSource = FindDeepChild(transform, winchCableMaterialSource1);
+        }
+
+        if (winchCableMaterialSource == null)
+        {
+            winchCableMaterialSource = FindDeepChild(transform, winchCableMaterialSource2);
+        }
+
+        if (winchCableMaterialSource == null)
+        {
+            winchCableMaterialSource = FindDeepChild(transform, winchCableMaterialSource3);
+        }
+
+        if (miniRovRoot == null)
+        {
+            if (unifiedTether != null && unifiedTether.miniRovRoot != null)
+            {
+                miniRovRoot = unifiedTether.miniRovRoot;
+            }
+            else
+            {
+                GameObject rov = GameObject.Find(miniRovName);
+
+                if (rov != null)
+                {
+                    miniRovRoot = rov.transform;
+                }
+            }
+        }
+
+        if (miniRovRoot != null)
+        {
+            Transform preferred = null;
+
+            if (preferRearMiniRovTetherPoint)
+            {
+                preferred = FindDeepChild(miniRovRoot, rearMiniRovTetherPointName);
+            }
+
+            if (preferred == null)
+            {
+                preferred = FindDeepChild(miniRovRoot, miniRovTetherAnchorName);
+            }
+
+            if (preferred == null)
+            {
+                preferred = FindDeepChild(miniRovRoot, "MiniROV_TetherPoint");
+            }
+
+            if (preferred == null)
+            {
+                preferred = FindDeepChild(miniRovRoot, "ROV_TetherAnchor");
+            }
+
+            if (preferred == null)
+            {
+                preferred = FindDeepChild(miniRovRoot, "TetherPoint");
+            }
+
+            if (preferred != null)
+            {
+                miniRovTetherAnchor = preferred;
+            }
+        }
+    }
+
+    [ContextMenu("Configure Single Cable Visual")]
+    public void ConfigureSingleCableVisual()
+    {
+        AutoFindReferences();
+
+        if (primaryLine != null)
+        {
+            primaryLine.gameObject.SetActive(true);
+            primaryLine.enabled = true;
+            primaryLine.useWorldSpace = true;
+            primaryLine.widthMultiplier = lineWidthM;
+            primaryLine.positionCount = Mathf.Max(2, lineSegments);
+
+            primaryLine.startColor = new Color(1.0f, 0.83f, 0.05f, 1.0f);
+            primaryLine.endColor = new Color(1.0f, 0.83f, 0.05f, 1.0f);
+        }
+
+        CopyWinchCableMaterialToPrimaryLine();
+        ConfigureLowLevelTetherVisualContract();
+        DisableDuplicateVisualComponents();
+        DeactivateDuplicateCableObjects();
+    }
+
+    private void ConfigureLowLevelTetherVisualContract()
+    {
+        if (tetherManager == null)
+        {
+            return;
+        }
+
+        if (fairlead != null)
+        {
+            tetherManager.fairleadLineStart = fairlead;
+        }
+
+        if (primaryLine != null)
+        {
+            tetherManager.tetherLineRenderer = primaryLine;
+        }
+
+        if (yellowCableEnd != null)
+        {
+            tetherManager.movingTetherEndVisual = yellowCableEnd;
+        }
+        else if (hookVisual != null)
+        {
+            tetherManager.movingTetherEndVisual = hookVisual;
+        }
+
+        tetherManager.hideStaticShortCableMeshWhenDynamic = false;
+        tetherManager.staticShortDeploymentCableMesh = null;
+    }
+
+    private Vector3 ResolveStartWorld()
+    {
+        if (fairlead != null)
+        {
+            return fairlead.position;
+        }
+
+        if (tetherManager != null)
+        {
+            return tetherManager.tetherStartWorld;
+        }
+
+        return transform.position;
+    }
+
+    private Vector3 ResolveEndWorld()
+    {
+        if (attachVisibleCableToMiniRovPointWheneverAvailable &&
+            miniRovTetherAnchor != null)
+        {
+            cableMode = "single_yellow_winch_rope_to_minirov_rear_tether_point";
+
+            return
+                miniRovTetherAnchor.TransformPoint(
+                    miniRovTetherPointLocalVisualOffset
+                );
+        }
+
+        if (IsDynamicRovCableMode())
+        {
+            cableMode = "single_yellow_winch_rope_to_minirov_anchor";
+
+            if (miniRovTetherAnchor != null)
+            {
+                return
+                    miniRovTetherAnchor.TransformPoint(
+                        miniRovTetherPointLocalVisualOffset
+                    );
+            }
+
+            if (miniRovRoot != null)
+            {
+                return miniRovRoot.position;
+            }
+        }
+
+        cableMode = "single_yellow_winch_rope_to_yellow_cable_endpoint";
+
+        if (yellowCableEnd != null)
+        {
+            return yellowCableEnd.position;
+        }
+
+        if (hookVisual != null)
+        {
+            return hookVisual.position;
+        }
+
+        if (tetherManager != null)
+        {
+            return tetherManager.tetherEndWorld;
+        }
+
+        return transform.position;
+    }
+
+    private bool IsDynamicRovCableMode()
+    {
+        if (unifiedTether == null)
+        {
+            return false;
+        }
+
+        return
+            unifiedTether.tetherState == MIMISKUnifiedTetherManager.TetherMissionState.DynamicStabilizing ||
+            unifiedTether.tetherState == MIMISKUnifiedTetherManager.TetherMissionState.ReadyForRovControl ||
+            unifiedTether.tetherState == MIMISKUnifiedTetherManager.TetherMissionState.RovControlActive ||
+            unifiedTether.tetherState == MIMISKUnifiedTetherManager.TetherMissionState.WaitingForRovRecoveryReady;
+    }
+
+    private float GetWaterSurfaceY()
+    {
+        if (unifiedTether != null)
+        {
+            return unifiedTether.waterSurfaceY;
+        }
+
+        return fallbackWaterSurfaceY;
+    }
+
+    private bool ShouldUseContinuousWaterEntryShape()
+    {
+        if (!useContinuousWaterEntryCableShape)
+        {
+            return false;
+        }
+
+        if (!IsDynamicRovCableMode())
+        {
+            return false;
+        }
+
+        float surfaceY =
+            GetWaterSurfaceY();
+
+        return
+            startWorld.y > surfaceY + 0.02f &&
+            endWorld.y < surfaceY - 0.02f;
+    }
+
+    private Vector3 ComputeWaterEntryPoint()
+    {
+        float surfaceY =
+            GetWaterSurfaceY() - Mathf.Abs(waterEntryBelowSurfaceM);
+
+        Vector3 startXZ =
+            new Vector3(startWorld.x, surfaceY, startWorld.z);
+
+        Vector3 endXZ =
+            new Vector3(endWorld.x, surfaceY, endWorld.z);
+
+        return
+            Vector3.Lerp(
+                startXZ,
+                endXZ,
+                Mathf.Clamp01(surfaceEntryTowardRovFraction)
+            );
+    }
+
+    private void BuildCableCurve()
+    {
+        int n = Mathf.Max(2, lineSegments);
+
+        if (points == null || points.Length != n)
+        {
+            points = new Vector3[n];
+        }
+
+        deployedLengthM =
+            tetherManager != null
+                ? tetherManager.deployedLengthM
+                : Vector3.Distance(startWorld, endWorld);
+
+        straightDistanceM =
+            Mathf.Max(0.001f, Vector3.Distance(startWorld, endWorld));
+
+        if (forceVisualCableLengthAtLeastStraightDistance)
+        {
+            deployedLengthM =
+                Mathf.Max(
+                    deployedLengthM,
+                    straightDistanceM + Mathf.Max(0.0f, visualMinimumSlackM)
+                );
+        }
+
+        slackM =
+            tetherManager != null
+                ? Mathf.Max(tetherManager.slackM, deployedLengthM - straightDistanceM)
+                : Mathf.Max(0.0f, deployedLengthM - straightDistanceM);
+
+        stretchM =
+            tetherManager != null
+                ? tetherManager.stretchM
+                : Mathf.Max(0.0f, straightDistanceM - deployedLengthM);
+
+        sagAmplitudeM =
+            Mathf.Clamp(
+                minimumSagM + slackM * slackSagGain,
+                0.0f,
+                maxSagM
+            );
+
+        Vector3 chord = endWorld - startWorld;
+        Vector3 horizontal = new Vector3(chord.x, 0.0f, chord.z);
+
+        Vector3 side =
+            horizontal.sqrMagnitude > 0.0001f
+                ? Vector3.Cross(Vector3.up, horizontal.normalized).normalized
+                : Vector3.right;
+
+        Vector3 currentDir = currentDirectionWorld;
+        currentDir.y = 0.0f;
+
+        if (currentDir.sqrMagnitude > 0.0001f)
+        {
+            currentDir.Normalize();
+        }
+        else
+        {
+            currentDir = side;
+        }
+
+        sideCurveM = 0.0f;
+
+        if (enableCurrentDeflection)
+        {
+            sideCurveM =
+                Mathf.Clamp(
+                    slackM * currentDeflectionGain,
+                    0.0f,
+                    maxCurrentDeflectionM
+                );
+
+            if (IsDynamicRovCableMode())
+            {
+                sideCurveM =
+                    Mathf.Max(sideCurveM, minimumDynamicSideCurveM);
+            }
+        }
+
+        float t =
+            Application.isPlaying
+                ? Time.time
+                : 0.0f;
+
+        if (ShouldUseContinuousWaterEntryShape())
+        {
+            waterEntryWorld =
+                ComputeWaterEntryPoint();
+
+            float airLength =
+                Vector3.Distance(startWorld, waterEntryWorld);
+
+            underwaterSegmentLengthM =
+                Vector3.Distance(waterEntryWorld, endWorld);
+
+            float totalShapeLength =
+                Mathf.Max(0.001f, airLength + underwaterSegmentLengthM);
+
+            airSegmentFraction =
+                Mathf.Clamp(
+                    airLength / totalShapeLength,
+                    0.12f,
+                    0.65f
+                );
+
+            float underwaterSlack =
+                Mathf.Max(
+                    0.0f,
+                    deployedLengthM - totalShapeLength
+                );
+
+            float underwaterSag =
+                Mathf.Clamp(
+                    minimumSagM + underwaterSlack * underwaterSagGain,
+                    0.0f,
+                    underwaterMaxSagM
+                );
+
+            float underwaterSide =
+                enableCurrentDeflection
+                    ? Mathf.Max(
+                        underwaterMinimumSideCurveM,
+                        Mathf.Clamp(
+                            underwaterSlack * currentDeflectionGain,
+                            0.0f,
+                            maxCurrentDeflectionM
+                        )
+                      )
+                    : 0.0f;
+
+            for (int i = 0; i < n; i++)
+            {
+                float u =
+                    (float)i / (float)(n - 1);
+
+                Vector3 p;
+
+                if (u <= airSegmentFraction)
+                {
+                    float ua =
+                        airSegmentFraction <= 0.001f
+                            ? 1.0f
+                            : u / airSegmentFraction;
+
+                    p =
+                        Vector3.Lerp(startWorld, waterEntryWorld, ua);
+
+                    // Very slight above-water sag only; it should look like it exits the winch/fairlead.
+                    float shape =
+                        Mathf.Sin(Mathf.PI * ua);
+
+                    p +=
+                        Vector3.down *
+                        minimumSagM *
+                        0.35f *
+                        shape;
+                }
+                else
+                {
+                    float uw =
+                        (u - airSegmentFraction) /
+                        Mathf.Max(0.001f, 1.0f - airSegmentFraction);
+
+                    p =
+                        Vector3.Lerp(waterEntryWorld, endWorld, uw);
+
+                    float shape =
+                        Mathf.Sin(Mathf.PI * uw);
+
+                    // Underwater catenary-like sag.
+                    p +=
+                        Vector3.down *
+                        underwaterSag *
+                        shape;
+
+                    // Underwater current / hydrodynamic side curve.
+                    p +=
+                        currentDir *
+                        underwaterSide *
+                        shape;
+
+                    if (enableSmallWaveMotion)
+                    {
+                        float wave =
+                            Mathf.Sin(
+                                2.0f * Mathf.PI *
+                                (uw * waveSpatialFrequency + t * waveTemporalFrequency)
+                            );
+
+                        p +=
+                            side *
+                            wave *
+                            waveAmplitudeM *
+                            shape *
+                            Mathf.Clamp01(0.25f + slackM * 3.0f);
+                    }
+                }
+
+                points[i] = p;
+            }
+
+            return;
+        }
+
+        // Default single-span cable shape for deployment/recovery or non-underwater cases.
+        for (int i = 0; i < n; i++)
+        {
+            float u = (float)i / (float)(n - 1);
+            float shape = Mathf.Sin(Mathf.PI * u);
+
+            Vector3 p = Vector3.Lerp(startWorld, endWorld, u);
+
+            p += Vector3.down * sagAmplitudeM * shape;
+            p += currentDir * sideCurveM * shape;
+
+            if (enableSmallWaveMotion)
+            {
+                float wave =
+                    Mathf.Sin(
+                        2.0f * Mathf.PI *
+                        (u * waveSpatialFrequency + t * waveTemporalFrequency)
+                    );
+
+                p +=
+                    side *
+                    wave *
+                    waveAmplitudeM *
+                    shape *
+                    Mathf.Clamp01(0.25f + slackM * 3.0f);
+            }
+
+            points[i] = p;
+        }
+    }
+
+    private void DrawPrimaryLine()
+    {
+        if (primaryLine == null || points == null)
+        {
+            return;
+        }
+
+        primaryLine.gameObject.SetActive(true);
+        primaryLine.enabled = true;
+        primaryLine.useWorldSpace = true;
+        primaryLine.widthMultiplier = lineWidthM;
+        primaryLine.positionCount = points.Length;
+
+        if (forceValidYellowMaterial)
+        {
+            CopyWinchCableMaterialToPrimaryLine();
+        }
+        else if (ropeMaterial != null)
+        {
+            primaryLine.sharedMaterial = ropeMaterial;
+        }
+
+        for (int i = 0; i < points.Length; i++)
+        {
+            primaryLine.SetPosition(i, points[i]);
+        }
+    }
+
+    private void CopyWinchCableMaterialToPrimaryLine()
+    {
+        if (primaryLine == null)
+        {
+            return;
+        }
+
+        Material selected =
+            FindValidYellowWinchCableMaterial();
+
+        if (selected == null)
+        {
+            selected =
+                CreateFallbackYellowLineMaterial();
+        }
+
+        ropeMaterial =
+            selected;
+
+        primaryLine.sharedMaterial =
+            ropeMaterial;
+
+        primaryLine.startColor =
+            fallbackYellowCableColor;
+
+        primaryLine.endColor =
+            fallbackYellowCableColor;
+
+        primaryLine.widthMultiplier =
+            lineWidthM;
+    }
+
+    private Material FindValidYellowWinchCableMaterial()
+    {
+        // 1. Prefer explicit winch cable source object.
+        Material m =
+            GetMaterialFromTransform(winchCableMaterialSource);
+
+        if (IsValidCableMaterial(m))
+        {
+            return m;
+        }
+
+        // 2. Search all scene renderers for the real winch rope material name.
+        Renderer[] renderers =
+            Object.FindObjectsByType<Renderer>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None
+            );
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer r =
+                renderers[i];
+
+            if (r == null)
+            {
+                continue;
+            }
+
+            string objectName =
+                r.gameObject.name;
+
+            bool likelyWinchCable =
+                Contains(objectName, "real_mesh_yellow_cable_layer") ||
+                Contains(objectName, "wrapped_on_integrated_winch") ||
+                Contains(objectName, "winch_cable") ||
+                Contains(objectName, "yellow_cable");
+
+            if (!likelyWinchCable)
+            {
+                continue;
+            }
+
+            Material candidate =
+                r.sharedMaterial;
+
+            if (IsValidCableMaterial(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        // 3. Search by material name.
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer r =
+                renderers[i];
+
+            if (r == null || r.sharedMaterial == null)
+            {
+                continue;
+            }
+
+            Material candidate =
+                r.sharedMaterial;
+
+            if (Contains(candidate.name, preferredYellowMaterialName) &&
+                IsValidCableMaterial(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private Material GetMaterialFromTransform(Transform source)
+    {
+        if (source == null)
+        {
+            return null;
+        }
+
+        Renderer r =
+            source.GetComponent<Renderer>();
+
+        if (r == null)
+        {
+            r =
+                source.GetComponentInChildren<Renderer>(true);
+        }
+
+        if (r == null)
+        {
+            return null;
+        }
+
+        return r.sharedMaterial;
+    }
+
+    private bool IsValidCableMaterial(Material material)
+    {
+        if (material == null)
+        {
+            return false;
+        }
+
+        string materialName =
+            material.name;
+
+        string shaderName =
+            material.shader != null
+                ? material.shader.name
+                : "";
+
+        // Do not reuse the old generated magenta material.
+        if (Contains(materialName, "MIMISK_RealisticTetherCable"))
+        {
+            return false;
+        }
+
+        // Standard often renders magenta in HDRP scenes.
+        if (shaderName == "Standard")
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private Material CreateFallbackYellowLineMaterial()
+    {
+        Shader shader =
+            Shader.Find("HDRP/Unlit");
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("HDRP/Lit");
+        }
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("Universal Render Pipeline/Unlit");
+        }
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("Universal Render Pipeline/Lit");
+        }
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("Sprites/Default");
+        }
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("Unlit/Color");
+        }
+
+        if (shader == null)
+        {
+            shader =
+                Shader.Find("Standard");
+        }
+
+        Material mat =
+            new Material(shader);
+
+        mat.name =
+            "MIMISK_Runtime_Yellow_Winch_Tether_Line";
+
+        if (mat.HasProperty("_BaseColor"))
+        {
+            mat.SetColor("_BaseColor", fallbackYellowCableColor);
+        }
+
+        if (mat.HasProperty("_Color"))
+        {
+            mat.SetColor("_Color", fallbackYellowCableColor);
+        }
+
+        return mat;
+    }
+
+    private void DisableDuplicateVisualComponents()
+    {
+        duplicateComponentsDisabled = 0;
+
+        MonoBehaviour[] behaviours = GetComponents<MonoBehaviour>();
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b = behaviours[i];
+
+            if (b == null || b == this)
+            {
+                continue;
+            }
+
+            string typeName = b.GetType().Name;
+
+            for (int j = 0; j < duplicateComponentTypeNames.Length; j++)
+            {
+                if (typeName == duplicateComponentTypeNames[j])
+                {
+                    if (b.enabled)
+                    {
+                        b.enabled = false;
+                        duplicateComponentsDisabled++;
+                    }
+                }
+            }
+        }
+    }
+
+    private void DeactivateDuplicateCableObjects()
+    {
+        duplicateObjectsDeactivated = 0;
+
+        for (int i = 0; i < duplicateObjectNames.Length; i++)
+        {
+            Transform t = FindDeepChild(transform, duplicateObjectNames[i]);
+
+            if (t == null)
+            {
+                continue;
+            }
+
+            if (primaryLine != null && t == primaryLine.transform)
+            {
+                continue;
+            }
+
+            t.gameObject.SetActive(false);
+            duplicateObjectsDeactivated++;
+        }
+    }
+
+    private void DisableOtherLineRenderers()
+    {
+        lineRenderersDisabled = 0;
+
+        LineRenderer[] lines = GetComponentsInChildren<LineRenderer>(true);
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            LineRenderer lr = lines[i];
+
+            if (lr == null || lr == primaryLine)
+            {
+                continue;
+            }
+
+            string n = lr.gameObject.name;
+
+            bool looksLikeTether =
+                Contains(n, "Tether") ||
+                Contains(n, "Cable") ||
+                Contains(n, "Rope") ||
+                Contains(n, "Yellow") ||
+                Contains(n, "Line");
+
+            if (looksLikeTether)
+            {
+                lr.enabled = false;
+                lineRenderersDisabled++;
+            }
+        }
+    }
+
+    private void HideRenderersOnly(Transform root)
+    {
+        if (root == null)
+        {
+            return;
+        }
+
+        Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            renderers[i].enabled = false;
+        }
+
+        LineRenderer[] lines = root.GetComponentsInChildren<LineRenderer>(true);
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i] != primaryLine)
+            {
+                lines[i].enabled = false;
+            }
+        }
+    }
+
+    private bool Contains(string value, string token)
+    {
+        return
+            value != null &&
+            value.IndexOf(token, System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null || string.IsNullOrEmpty(childName))
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found = FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

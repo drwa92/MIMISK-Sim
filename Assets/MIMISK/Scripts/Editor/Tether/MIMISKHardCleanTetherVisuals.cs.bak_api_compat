@@ -1,0 +1,242 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKHardCleanTetherVisuals
+{
+    [MenuItem("MIMISK/Tether/Hard Clean Duplicate Tether Visuals")]
+    public static void HardCleanDuplicateTetherVisuals()
+    {
+        string[] duplicateObjectNames =
+        {
+            "MIMISK_RealisticTetherCableMesh",
+            "MIMISK_FinalActiveYellowTether",
+            "MIMISK_Final_ActiveYellowTether",
+            "MIMISK_Final_ContinuousYellowTether",
+            "MIMISK_Final_ActiveYellowTetherLine",
+            "MIMISK_Final_ContinuousYellowTetherLine",
+            "MIMISK_Final_TetherCable",
+            "MIMISK_FinalCable",
+            "MIMISK_ContinuousYellowTether",
+            "MIMISK_FinalDeploymentPoint",
+            "MIMISK_Final_DeploymentCableVisual"
+        };
+
+        string[] duplicateComponentTypeNames =
+        {
+            "MIMISKWinchRopeSingleVisual",
+            "MIMISKTetherCableModel",
+            "MIMISKFinalTetherEndpointRig",
+            "MIMISKFinalTetherLineSynchronizer",
+            "MIMISKMiniROVTetherVisualBridge",
+            "MIMISKFinalContinuousTetherVisual",
+            "MIMISKFinalTetherVisualBridge"
+        };
+
+        int destroyedObjects = 0;
+        int disabledComponents = 0;
+        int disabledLineRenderers = 0;
+
+        // 1. Destroy old generated visual objects.
+        GameObject[] allObjects =
+            Object.FindObjectsByType<GameObject>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None
+            );
+
+        for (int i = allObjects.Length - 1; i >= 0; i--)
+        {
+            GameObject go =
+                allObjects[i];
+
+            if (go == null)
+            {
+                continue;
+            }
+
+            for (int j = 0; j < duplicateObjectNames.Length; j++)
+            {
+                if (go.name == duplicateObjectNames[j])
+                {
+                    Undo.DestroyObjectImmediate(go);
+                    destroyedObjects++;
+                    break;
+                }
+            }
+        }
+
+        // 2. Disable old visual writer components so they cannot recreate duplicates.
+        MonoBehaviour[] behaviours =
+            Object.FindObjectsByType<MonoBehaviour>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None
+            );
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b =
+                behaviours[i];
+
+            if (b == null)
+            {
+                continue;
+            }
+
+            string typeName =
+                b.GetType().Name;
+
+            for (int j = 0; j < duplicateComponentTypeNames.Length; j++)
+            {
+                if (typeName == duplicateComponentTypeNames[j])
+                {
+                    b.enabled = false;
+                    EditorUtility.SetDirty(b);
+                    disabledComponents++;
+                    break;
+                }
+            }
+        }
+
+        // 3. Find the active tether manager/root.
+        MIMISKDroneCoreTetherManager tether =
+            Object.FindFirstObjectByType<MIMISKDroneCoreTetherManager>();
+
+        if (tether == null)
+        {
+            Debug.LogWarning("[MIMISK] No MIMISKDroneCoreTetherManager found. Deleted duplicate visuals only.");
+            SaveScene(destroyedObjects, disabledComponents, disabledLineRenderers);
+            return;
+        }
+
+        GameObject root =
+            tether.gameObject;
+
+        // 4. Ensure the single visual authority exists and is active.
+        MIMISKSingleYellowTetherVisualAuthority authority =
+            root.GetComponent<MIMISKSingleYellowTetherVisualAuthority>();
+
+        if (authority == null)
+        {
+            authority =
+                root.AddComponent<MIMISKSingleYellowTetherVisualAuthority>();
+        }
+
+        authority.visualAuthorityEnabled = true;
+        authority.disableDuplicateVisualComponents = true;
+        authority.hideDuplicateCableObjects = true;
+        authority.hideOtherTetherLineRenderers = true;
+        authority.hideShortYellowCableMeshRenderer = true;
+        authority.keepHookVisible = true;
+
+        authority.unifiedTether =
+            root.GetComponent<MIMISKUnifiedTetherManager>();
+
+        authority.tetherManager =
+            tether;
+
+        authority.AutoFindReferences();
+        authority.ConfigureSingleCableVisual();
+
+        // 5. Force the low-level tether manager to use only the primary yellow line.
+        if (authority.primaryLine != null)
+        {
+            tether.tetherLineRenderer =
+                authority.primaryLine;
+
+            authority.primaryLine.enabled = true;
+            authority.primaryLine.gameObject.SetActive(true);
+        }
+
+        if (authority.fairlead != null)
+        {
+            tether.fairleadLineStart =
+                authority.fairlead;
+        }
+
+        if (authority.yellowCableEnd != null)
+        {
+            tether.movingTetherEndVisual =
+                authority.yellowCableEnd;
+        }
+
+        tether.hideStaticShortCableMeshWhenDynamic = false;
+        tether.staticShortDeploymentCableMesh = null;
+
+        EditorUtility.SetDirty(tether);
+        EditorUtility.SetDirty(authority);
+
+        // 6. Disable every other tether/cable LineRenderer in the scene.
+        LineRenderer[] lines =
+            Object.FindObjectsByType<LineRenderer>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None
+            );
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            LineRenderer lr =
+                lines[i];
+
+            if (lr == null)
+            {
+                continue;
+            }
+
+            if (authority.primaryLine != null &&
+                lr == authority.primaryLine)
+            {
+                lr.enabled = true;
+                continue;
+            }
+
+            string n =
+                lr.gameObject.name;
+
+            bool looksLikeTether =
+                Contains(n, "Tether") ||
+                Contains(n, "Cable") ||
+                Contains(n, "Rope") ||
+                Contains(n, "Yellow") ||
+                Contains(n, "Line");
+
+            if (looksLikeTether)
+            {
+                lr.enabled = false;
+                EditorUtility.SetDirty(lr);
+                disabledLineRenderers++;
+            }
+        }
+
+        SaveScene(destroyedObjects, disabledComponents, disabledLineRenderers);
+    }
+
+    private static void SaveScene(
+        int destroyedObjects,
+        int disabledComponents,
+        int disabledLineRenderers)
+    {
+        EditorSceneManager.MarkSceneDirty(
+            EditorSceneManager.GetActiveScene()
+        );
+
+        AssetDatabase.SaveAssets();
+
+        Debug.Log(
+            "[MIMISK] Hard-cleaned tether visuals. " +
+            "Destroyed duplicate objects=" + destroyedObjects +
+            ", disabled duplicate visual components=" + disabledComponents +
+            ", disabled duplicate line renderers=" + disabledLineRenderers +
+            ". Final visible tether should be MiniROV_ActiveYellowTetherLine only."
+        );
+    }
+
+    private static bool Contains(string value, string token)
+    {
+        return
+            value != null &&
+            value.IndexOf(
+                token,
+                System.StringComparison.OrdinalIgnoreCase
+            ) >= 0;
+    }
+}

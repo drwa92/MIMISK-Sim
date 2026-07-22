@@ -1,0 +1,476 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVUDPGamepadReceiver : MonoBehaviour
+{
+    [Serializable]
+    public class MiniROVGamepadPacket
+    {
+        public float lx;
+        public float ly;
+        public float rx;
+        public float ry;
+        public float lt;
+        public float rt;
+        public int hatx;
+        public int haty;
+
+        public float surge;
+        public float yaw;
+        public float depth;
+
+        public bool hold;
+        public bool return_home;
+        public bool stop;
+
+        public int btn_south;
+        public int btn_east;
+        public int btn_west;
+        public int btn_north;
+        public int btn_tl;
+        public int btn_tr;
+        public int btn_start;
+        public int btn_select;
+    }
+
+    [Header("References")]
+    public MIMISKMiniROVCoreController coreController;
+    public MIMISKMiniROVMissionManager missionManager;
+
+    [Header("UDP")]
+    public bool receiverEnabled = true;
+    public string listenAddress = "127.0.0.1";
+    public int listenPort = 54331;
+    public float inputTimeoutS = 0.35f;
+
+    [Header("Activation Safety")]
+    public bool requireMiniROVGamepadMissionState = true;
+    public bool forceCoreGamepadModeWhenActive = true;
+
+    [Tooltip("Recommended ON. Prevents this receiver fighting ESP/Raspberry HIL mode.")]
+    public bool requireUnityNativeBackend = true;
+
+    [Header("Command Mapping")]
+    public bool useDirectCommandFields = true;
+
+    [Tooltip("Used when packet does not contain direct surge/yaw/depth command fields.")]
+    public bool deriveFromRawAxes = true;
+
+    public bool invertSurge = false;
+    public bool invertYaw = false;
+    public float surgeScale = 1.0f;
+    public float yawScale = 1.0f;
+    public float depthScale = 1.0f;
+
+    [Header("Runtime")]
+    public bool udpThreadRunning;
+    public bool packetFresh;
+    public bool sendingToCore;
+    public double lastPacketUnityTime;
+    public int packetsReceived;
+    public int packetsApplied;
+    public string lastPacketJson = "";
+    public string lastEvent = "idle";
+
+    public float surge;
+    public float yaw;
+    public float depth;
+
+    private UdpClient udpClient;
+    private Thread receiveThread;
+    private readonly object packetLock = new object();
+    private MiniROVGamepadPacket latestPacket = new MiniROVGamepadPacket();
+    private bool hasPacket;
+    private bool shutdownRequested;
+
+    private bool previousReturnHome;
+    private bool previousStop;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void OnEnable()
+    {
+        StartReceiver();
+    }
+
+    private void OnDisable()
+    {
+        StopReceiver();
+    }
+
+    private void OnDestroy()
+    {
+        StopReceiver();
+    }
+
+    private void Update()
+    {
+        if (!receiverEnabled)
+        {
+            sendingToCore = false;
+            return;
+        }
+
+        AutoFindReferences();
+
+        MiniROVGamepadPacket packet = null;
+
+        lock (packetLock)
+        {
+            if (hasPacket)
+            {
+                packet = latestPacket;
+            }
+        }
+
+        packetFresh =
+            hasPacket &&
+            Time.timeAsDouble - lastPacketUnityTime <= inputTimeoutS;
+
+        if (!packetFresh)
+        {
+            ApplyZeroCommand("udp_timeout_or_no_packet");
+            return;
+        }
+
+        if (!IsMissionAllowedToReceiveManualInput())
+        {
+            ApplyZeroCommand("waiting_for_minirov_gamepad_mission_state");
+            return;
+        }
+
+        if (coreController == null)
+        {
+            lastEvent = "missing_core_controller";
+            sendingToCore = false;
+            return;
+        }
+
+        if (requireUnityNativeBackend &&
+            coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+        {
+            lastEvent = "blocked_backend_not_unity_native";
+            sendingToCore = false;
+            return;
+        }
+
+        if (forceCoreGamepadModeWhenActive)
+        {
+            if (coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+            {
+                coreController.ActivateUnityNativeBackend();
+            }
+
+            if (coreController.controlMode != MIMISKMiniROVCoreController.ControlMode.GamepadManual)
+            {
+                coreController.SetControlMode(MIMISKMiniROVCoreController.ControlMode.GamepadManual);
+            }
+        }
+
+        DecodePacket(packet);
+
+        bool hold =
+            packet.hold ||
+            packet.btn_south != 0;
+
+        if (hold)
+        {
+            surge = 0.0f;
+            yaw = 0.0f;
+            depth = 0.0f;
+        }
+
+        coreController.SetManualCommand(
+            surge,
+            yaw,
+            depth
+        );
+
+        packetsApplied++;
+        sendingToCore = true;
+        lastEvent =
+            "applied_udp_surge_" +
+            surge.ToString("F2") +
+            "_yaw_" +
+            yaw.ToString("F2") +
+            "_depth_" +
+            depth.ToString("F2");
+
+        bool returnHomePressed =
+            packet.return_home ||
+            packet.btn_north != 0;
+
+        bool stopPressed =
+            packet.stop ||
+            packet.btn_east != 0;
+
+        if (returnHomePressed && !previousReturnHome)
+        {
+            if (missionManager != null)
+            {
+                missionManager.RequestReturnToRecovery();
+                lastEvent = "udp_requested_return_home";
+            }
+        }
+
+        if (stopPressed && !previousStop)
+        {
+            if (missionManager != null)
+            {
+                missionManager.StopMissionAndSetRecoveryReady();
+                lastEvent = "udp_requested_stop_recovery_ready";
+            }
+        }
+
+        previousReturnHome = returnHomePressed;
+        previousStop = stopPressed;
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (coreController == null)
+        {
+            coreController = GetComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (missionManager == null)
+        {
+            missionManager = GetComponent<MIMISKMiniROVMissionManager>();
+        }
+    }
+
+    [ContextMenu("Start Receiver")]
+    public void StartReceiver()
+    {
+        if (udpThreadRunning)
+        {
+            return;
+        }
+
+        shutdownRequested = false;
+
+        try
+        {
+            IPAddress bindAddress =
+                string.IsNullOrEmpty(listenAddress) ||
+                listenAddress == "0.0.0.0"
+                    ? IPAddress.Any
+                    : IPAddress.Parse(listenAddress);
+
+            udpClient =
+                new UdpClient(
+                    new IPEndPoint(
+                        bindAddress,
+                        listenPort
+                    )
+                );
+
+            udpClient.Client.ReceiveTimeout = 100;
+
+            receiveThread =
+                new Thread(ReceiveLoop);
+
+            receiveThread.IsBackground = true;
+            receiveThread.Start();
+
+            udpThreadRunning = true;
+            lastEvent = "udp_receiver_started_" + listenAddress + ":" + listenPort;
+        }
+        catch (Exception ex)
+        {
+            udpThreadRunning = false;
+            lastEvent = "udp_receiver_start_failed_" + ex.Message;
+            Debug.LogError("[MIMISK MiniROV UDP] " + lastEvent);
+        }
+    }
+
+    [ContextMenu("Stop Receiver")]
+    public void StopReceiver()
+    {
+        shutdownRequested = true;
+        udpThreadRunning = false;
+
+        try
+        {
+            if (udpClient != null)
+            {
+                udpClient.Close();
+                udpClient = null;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (receiveThread != null &&
+                receiveThread.IsAlive)
+            {
+                receiveThread.Join(150);
+            }
+        }
+        catch
+        {
+        }
+
+        receiveThread = null;
+    }
+
+    private void ReceiveLoop()
+    {
+        IPEndPoint remote =
+            new IPEndPoint(IPAddress.Any, 0);
+
+        while (!shutdownRequested)
+        {
+            try
+            {
+                if (udpClient == null)
+                {
+                    break;
+                }
+
+                byte[] bytes =
+                    udpClient.Receive(ref remote);
+
+                string json =
+                    Encoding.UTF8.GetString(bytes);
+
+                MiniROVGamepadPacket packet =
+                    JsonUtility.FromJson<MiniROVGamepadPacket>(json);
+
+                if (packet == null)
+                {
+                    continue;
+                }
+
+                lock (packetLock)
+                {
+                    latestPacket = packet;
+                    hasPacket = true;
+                }
+
+                packetsReceived++;
+                lastPacketJson = json;
+                lastPacketUnityTime = Time.timeAsDouble;
+            }
+            catch (SocketException)
+            {
+                // Timeout is normal.
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                lastEvent = "udp_receive_error_" + ex.Message;
+            }
+        }
+
+        udpThreadRunning = false;
+    }
+
+    private bool IsMissionAllowedToReceiveManualInput()
+    {
+        if (!requireMiniROVGamepadMissionState)
+        {
+            return true;
+        }
+
+        if (missionManager == null)
+        {
+            return false;
+        }
+
+        return
+            missionManager.missionActive &&
+            missionManager.missionState ==
+                MIMISKMiniROVMissionManager.MiniROVMissionState.RunningGamepadTest;
+    }
+
+    private void DecodePacket(MiniROVGamepadPacket packet)
+    {
+        if (useDirectCommandFields)
+        {
+            surge = packet.surge;
+            yaw = packet.yaw;
+            depth = packet.depth;
+
+            if (deriveFromRawAxes &&
+                Mathf.Abs(surge) < 0.0001f &&
+                Mathf.Abs(yaw) < 0.0001f &&
+                Mathf.Abs(depth) < 0.0001f)
+            {
+                DecodeFromRawAxes(packet);
+            }
+        }
+        else
+        {
+            DecodeFromRawAxes(packet);
+        }
+
+        if (invertSurge)
+        {
+            surge = -surge;
+        }
+
+        if (invertYaw)
+        {
+            yaw = -yaw;
+        }
+
+        surge =
+            Mathf.Clamp(
+                surge * surgeScale,
+                -1.0f,
+                1.0f
+            );
+
+        yaw =
+            Mathf.Clamp(
+                yaw * yawScale,
+                -1.0f,
+                1.0f
+            );
+
+        depth =
+            Mathf.Clamp(
+                depth * depthScale,
+                -1.0f,
+                1.0f
+            );
+    }
+
+    private void DecodeFromRawAxes(MiniROVGamepadPacket packet)
+    {
+        surge = packet.ly;
+        yaw = packet.rx;
+        depth = packet.rt - packet.lt;
+    }
+
+    private void ApplyZeroCommand(string reason)
+    {
+        surge = 0.0f;
+        yaw = 0.0f;
+        depth = 0.0f;
+
+        if (coreController != null)
+        {
+            coreController.SetManualCommand(0.0f, 0.0f, 0.0f);
+        }
+
+        sendingToCore = false;
+        lastEvent = reason;
+    }
+}

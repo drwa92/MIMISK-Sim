@@ -1,0 +1,444 @@
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVMissionManager : MonoBehaviour
+{
+    public enum MiniROVMissionState
+    {
+        Idle,
+        ManualDirect,
+
+        // Compatibility with older MiniROV UDP/gamepad receiver scripts.
+        RunningGamepadTest,
+
+        StationHolding,
+        ExecutingMission,
+        ReturningHome,
+        RecoveryReady,
+        Fault
+    }
+
+    [Header("References")]
+    public MIMISKMiniROVPathPlanner pathPlanner;
+    public MIMISKMiniROVPlantBasedController controller;
+    public MIMISKMiniROVDirectRaspberryBypassInput directBypassInput;
+    public Rigidbody rb;
+
+    [Header("Mission")]
+    public MiniROVMissionState missionState =
+        MiniROVMissionState.Idle;
+
+    public bool missionManagerEnabled = true;
+
+    // Compatibility field expected by older scripts.
+    public bool missionActive;
+
+    // Compatibility alias used by some older setup/bridge scripts.
+    public bool missionEnabled = true;
+
+    [Header("Manual / Legacy Compatibility")]
+    public bool allowStandaloneKeyboard = false;
+
+    [Header("Recovery")]
+    public float recoveryReadyRadiusM = 0.25f;
+    public float recoveryReadySpeedMS = 0.05f;
+
+    // Compatibility field expected by older scripts.
+    public bool recoveryReady;
+
+    [Header("Runtime")]
+    public string lastEvent = "idle";
+    public float distanceToHomeM;
+    public float currentSpeedMS;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        RefreshMissionActiveFlag();
+    }
+
+    private void Update()
+    {
+        if (!missionManagerEnabled || !missionEnabled)
+        {
+            return;
+        }
+
+        AutoFindReferences();
+        RefreshState();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (pathPlanner == null)
+        {
+            pathPlanner =
+                GetComponent<MIMISKMiniROVPathPlanner>();
+        }
+
+        if (controller == null)
+        {
+            controller =
+                GetComponent<MIMISKMiniROVPlantBasedController>();
+        }
+
+        if (directBypassInput == null)
+        {
+            directBypassInput =
+                GetComponent<MIMISKMiniROVDirectRaspberryBypassInput>();
+        }
+
+        if (rb == null)
+        {
+            rb =
+                GetComponent<Rigidbody>();
+        }
+    }
+
+    [ContextMenu("Set Home Here")]
+    public void SetHomeHere()
+    {
+        AutoFindReferences();
+
+        if (pathPlanner != null)
+        {
+            pathPlanner.SetHomeToCurrentPose();
+        }
+
+        lastEvent = "home_set";
+    }
+
+    [ContextMenu("Start Selected Mission")]
+    public void StartSelectedMission()
+    {
+        AutoFindReferences();
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "start_failed_missing_path_planner"
+            );
+
+            return;
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        pathPlanner.StartSelectedPlan();
+
+        if (pathPlanner.selectedPathType ==
+            MIMISKMiniROVPathPlanner.MiniROVPathType.StationHold)
+        {
+            SetState(
+                MiniROVMissionState.StationHolding,
+                "station_hold_started"
+            );
+        }
+        else if (pathPlanner.selectedPathType ==
+            MIMISKMiniROVPathPlanner.MiniROVPathType.ReturnHome)
+        {
+            SetState(
+                MiniROVMissionState.ReturningHome,
+                "return_home_started"
+            );
+        }
+        else
+        {
+            SetState(
+                MiniROVMissionState.ExecutingMission,
+                "selected_mission_started_" +
+                pathPlanner.selectedPathType.ToString()
+            );
+        }
+
+        recoveryReady = false;
+    }
+
+    [ContextMenu("Hold Current Pose")]
+    public void HoldCurrentPose()
+    {
+        AutoFindReferences();
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        if (controller != null)
+        {
+            controller.StartHoldCurrentPose();
+        }
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.StationHolding,
+            "hold_current_pose"
+        );
+    }
+
+    [ContextMenu("Return Home")]
+    public void ReturnHome()
+    {
+        AutoFindReferences();
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "return_home_failed_missing_path_planner"
+            );
+
+            return;
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        pathPlanner.StartReturnHomePlan();
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.ReturningHome,
+            "return_home_started"
+        );
+    }
+
+    [ContextMenu("Abort To Hold")]
+    public void AbortToHold()
+    {
+        HoldCurrentPose();
+        lastEvent = "abort_to_station_hold";
+    }
+
+    [ContextMenu("Stop Controller")]
+    public void StopController()
+    {
+        AutoFindReferences();
+
+        if (controller != null)
+        {
+            controller.StopController();
+        }
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.Idle,
+            "controller_stopped"
+        );
+    }
+
+    [ContextMenu("Enable Manual Direct Mode")]
+    public void EnableManualDirectMode()
+    {
+        AutoFindReferences();
+
+        if (controller != null)
+        {
+            controller.StopController();
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = true;
+            directBypassInput.receiverEnabled = true;
+        }
+
+        recoveryReady = false;
+
+        // Use RunningGamepadTest for compatibility with older UDP receivers.
+        SetState(
+            MiniROVMissionState.RunningGamepadTest,
+            "manual_direct_mode_enabled"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Compatibility API for older UDP/manual receiver scripts.
+    // ------------------------------------------------------------------
+
+    public bool CanStartMission()
+    {
+        if (!missionManagerEnabled || !missionEnabled)
+        {
+            lastEvent = "can_start_false_manager_disabled";
+            return false;
+        }
+
+        if (missionState == MiniROVMissionState.Fault)
+        {
+            lastEvent = "can_start_false_fault";
+            return false;
+        }
+
+        if (missionState == MiniROVMissionState.ReturningHome)
+        {
+            lastEvent = "can_start_false_returning_home";
+            return false;
+        }
+
+        return true;
+    }
+
+    public void StartGamepadManualTest()
+    {
+        EnableManualDirectMode();
+        lastEvent = "running_gamepad_test_started";
+    }
+
+    public void RequestReturnToRecovery()
+    {
+        ReturnHome();
+        lastEvent = "legacy_request_return_to_recovery";
+    }
+
+    public void StopMissionAndSetRecoveryReady()
+    {
+        AutoFindReferences();
+
+        if (controller != null)
+        {
+            controller.StartHoldCurrentPose();
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.receiverEnabled = false;
+            directBypassInput.enabled = false;
+        }
+
+        recoveryReady = true;
+
+        SetState(
+            MiniROVMissionState.RecoveryReady,
+            "legacy_stop_mission_recovery_ready"
+        );
+    }
+
+    public void PrepareForRecovery()
+    {
+        StopMissionAndSetRecoveryReady();
+    }
+
+    public void StartMissionFromBridge(Vector3 recoveryPointWorld)
+    {
+        AutoFindReferences();
+
+        if (pathPlanner != null)
+        {
+            pathPlanner.homeWorld = recoveryPointWorld;
+            pathPlanner.homeDepthM =
+                controller != null
+                    ? controller.depthM
+                    : pathPlanner.homeDepthM;
+
+            pathPlanner.homeSet = true;
+        }
+
+        StartSelectedMission();
+
+        lastEvent = "mission_started_from_bridge";
+    }
+
+    // ------------------------------------------------------------------
+
+    private void RefreshState()
+    {
+        if (pathPlanner != null && pathPlanner.homeSet && rb != null)
+        {
+            Vector3 p =
+                rb.position;
+
+            float dx =
+                pathPlanner.homeWorld.x - p.x;
+
+            float dz =
+                pathPlanner.homeWorld.z - p.z;
+
+            float depth =
+                controller != null
+                    ? controller.depthM
+                    : 0.0f;
+
+            float dd =
+                pathPlanner.homeDepthM - depth;
+
+            distanceToHomeM =
+                Mathf.Sqrt(
+                    dx * dx +
+                    dz * dz +
+                    dd * dd
+                );
+        }
+
+        currentSpeedMS =
+            rb != null
+                ? rb.linearVelocity.magnitude
+                : 0.0f;
+
+        if (missionState == MiniROVMissionState.ReturningHome)
+        {
+            if (distanceToHomeM <= recoveryReadyRadiusM &&
+                currentSpeedMS <= recoveryReadySpeedMS)
+            {
+                recoveryReady = true;
+
+                SetState(
+                    MiniROVMissionState.RecoveryReady,
+                    "recovery_ready"
+                );
+            }
+        }
+
+        if (controller != null &&
+            controller.missionCompleted &&
+            missionState == MiniROVMissionState.ExecutingMission)
+        {
+            SetState(
+                MiniROVMissionState.StationHolding,
+                "mission_completed_" +
+                controller.completionReason
+            );
+        }
+
+        RefreshMissionActiveFlag();
+    }
+
+    private void SetState(
+        MiniROVMissionState newState,
+        string eventText)
+    {
+        missionState =
+            newState;
+
+        lastEvent =
+            eventText;
+
+        RefreshMissionActiveFlag();
+    }
+
+    private void RefreshMissionActiveFlag()
+    {
+        missionActive =
+            missionState != MiniROVMissionState.Idle &&
+            missionState != MiniROVMissionState.Fault &&
+            missionState != MiniROVMissionState.RecoveryReady;
+
+        if (missionState == MiniROVMissionState.RecoveryReady)
+        {
+            recoveryReady = true;
+        }
+    }
+}

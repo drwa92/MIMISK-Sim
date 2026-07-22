@@ -1,0 +1,703 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[RequireComponent(typeof(Rigidbody))]
+public class MIMISKDroneModelController : MonoBehaviour
+{
+    public enum DroneMode
+    {
+        Disarmed,
+        ArmedIdle,
+        Takeoff,
+        AltitudeHold,
+        ManualAttitude,
+        LandingOnWater,
+        SurfaceStable,
+        Failsafe
+    }
+
+    [Header("Mode")]
+    public DroneMode mode = DroneMode.Disarmed;
+
+    [Header("Rotor Transforms - Order FL, FR, RL, RR")]
+    public Transform rotorFL;
+    public Transform rotorFR;
+    public Transform rotorRL;
+    public Transform rotorRR;
+
+    [Header("Identified Physical Model")]
+    public float massKg = 1.5f;
+    public Vector3 inertiaKgM2 = new Vector3(0.1783796f, 0.41364064f, 0.23955822f);
+    public Vector3 angularDampingNmPerRadSec = new Vector3(0.02453234f, 0.03374142f, 0.02581342f);
+    public float motorTimeConstantS = 0.0550339f;
+    public float maxMotorThrustN = 8.2743609375f;
+    public float yawMomentCoeffM = 0.035f;
+    public float maxTotalThrustN = 27.21345375f;
+
+    [Header("Rotor Geometry Used By Allocator")]
+    public float rotorArmXM = 0.58f;
+    public float rotorArmZM = 0.50f;
+    public Vector4 rotorSpinSignsFL_FR_RL_RR = new Vector4(1f, -1f, -1f, 1f);
+
+    [Header("Controller Gains")]
+    public Vector3 attitudeKpRadS2 = new Vector3(11.439608f, 5.448721f, 11.439608f);
+    public Vector3 rateKdRadS = new Vector3(5.982596f, 5.167017f, 5.982596f);
+
+    public float altitudeKpS2 = 6.102603f;
+    public float altitudeKdS = 5.097711f;
+    public float altitudeKiS3 = 1.3175f;
+    public float altitudeIntegralLimitMS = 1.25f;
+
+    public Vector3 torqueLimitsNm = new Vector3(2.8f, 0.36f, 2.8f);
+
+    [Header("Command Limits")]
+    public float takeoffAltitudeM = 2.5f;
+    public float surfaceStableHeightM = 0.35f;
+    public float waterSurfaceY = 0.0f;
+
+    public float maxTiltDeg = 6.0f;
+    public float maxYawRateDegS = 35.0f;
+    public float manualAltitudeRateMS = 0.6f;
+
+    [Header("Safety")]
+    public bool disableTiltCommandsNearWater = true;
+    public float minimumAirborneControlHeightM = 1.2f;
+    public bool useTiltCompensation = true;
+    public float minVerticalThrustFactor = 0.55f;
+
+    [Header("Input")]
+    public bool enableKeyboardInput = true;
+    public bool invertPitchCommand = false;
+    public bool invertRollCommand = false;
+    public bool invertYawCommand = false;
+
+    [Header("Motor Visualization")]
+    public float idleRpm = 500.0f;
+    public float maxRpm = 5200.0f;
+    public Vector3 propellerSpinAxisLocal = Vector3.forward;
+
+    [Header("Diagnostics")]
+    public float targetAltitudeM;
+    public float targetYawDeg;
+    public float currentYawDeg;
+    public Vector3 eulerDeg;
+    public Vector3 bodyRatesRadS;
+    public Vector3 targetEulerDeg;
+    public Vector3 angleErrorRad;
+    public Vector3 desiredTorqueNm;
+    public Vector3 limitedTorqueNm;
+    public float desiredTotalThrustN;
+    public float altitudeErrorM;
+    public float altitudeIntegralMS;
+    public Vector4 targetMotorThrustsFL_FR_RL_RR;
+    public Vector4 actualMotorThrustsFL_FR_RL_RR;
+    public Vector4 motorFractionsFL_FR_RL_RR;
+    public float allocationTorqueScale = 1.0f;
+    public bool motorsSaturated;
+    public Vector4 keyboardCommandsForwardRightYawAlt;
+
+    private Rigidbody rb;
+
+    private readonly float[] targetThrust = new float[4];
+    private readonly float[] actualThrust = new float[4];
+
+    private Vector3 holdPosition;
+    private Quaternion holdRotation;
+
+    private Matrix4x4 allocationMatrix;
+    private Matrix4x4 inverseAllocationMatrix;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+        BuildAllocationMatrix();
+        ApplyModelToRigidbody();
+    }
+
+    private void Start()
+    {
+        targetAltitudeM = Mathf.Max(transform.position.y, waterSurfaceY + takeoffAltitudeM);
+        targetYawDeg = GetYawDeg();
+        SetMode(mode);
+    }
+
+    private void Update()
+    {
+        if (enableKeyboardInput)
+        {
+            ReadKeyboardInput();
+        }
+
+        AnimatePropellers();
+    }
+
+    private void FixedUpdate()
+    {
+        UpdateStateDiagnostics();
+
+        switch (mode)
+        {
+            case DroneMode.Disarmed:
+                SetAllMotorTargets(0.0f);
+                UpdateMotorDynamics();
+                MaintainHold();
+                return;
+
+            case DroneMode.ArmedIdle:
+                SetAllMotorTargets(0.08f * maxMotorThrustN);
+                UpdateMotorDynamics();
+                MaintainHold();
+                return;
+
+            case DroneMode.SurfaceStable:
+                SetAllMotorTargets(0.0f);
+                UpdateMotorDynamics();
+                EnsureDynamicSurfaceFloat();
+                return;
+
+            case DroneMode.Failsafe:
+                RunFailsafeLanding();
+                return;
+
+            case DroneMode.Takeoff:
+            case DroneMode.AltitudeHold:
+            case DroneMode.ManualAttitude:
+            case DroneMode.LandingOnWater:
+                EnsureDynamicFlight();
+
+                if (mode == DroneMode.Takeoff)
+                {
+                    targetAltitudeM = waterSurfaceY + takeoffAltitudeM;
+                }
+
+                if (mode == DroneMode.LandingOnWater)
+                {
+                    targetAltitudeM = waterSurfaceY + surfaceStableHeightM;
+                }
+
+                RunModelController();
+                UpdateMotorDynamics();
+                ApplyMotorForces();
+
+                if (mode == DroneMode.Takeoff &&
+                    Mathf.Abs(transform.position.y - targetAltitudeM) < 0.12f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.20f)
+                {
+                    SetMode(DroneMode.AltitudeHold);
+                }
+
+                if (mode == DroneMode.LandingOnWater &&
+                    transform.position.y <= waterSurfaceY + surfaceStableHeightM + 0.10f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.25f)
+                {
+                    SetMode(DroneMode.SurfaceStable);
+                }
+
+                return;
+        }
+    }
+
+    public void SetMode(DroneMode newMode)
+    {
+        mode = newMode;
+
+        if (mode == DroneMode.Disarmed || mode == DroneMode.ArmedIdle)
+        {
+            EnterHold();
+        }
+        else if (mode == DroneMode.SurfaceStable)
+        {
+            EnsureDynamicSurfaceFloat();
+        }
+        else
+        {
+            EnsureDynamicFlight();
+        }
+
+        if (mode == DroneMode.Takeoff)
+        {
+            targetAltitudeM = waterSurfaceY + takeoffAltitudeM;
+            targetYawDeg = GetYawDeg();
+            altitudeIntegralMS = 0.0f;
+        }
+
+        if (mode == DroneMode.AltitudeHold)
+        {
+            targetAltitudeM = transform.position.y;
+            targetYawDeg = GetYawDeg();
+        }
+
+        if (mode == DroneMode.ManualAttitude)
+        {
+            targetAltitudeM = transform.position.y;
+            targetYawDeg = GetYawDeg();
+        }
+
+        if (mode == DroneMode.LandingOnWater)
+        {
+            targetAltitudeM = waterSurfaceY + surfaceStableHeightM;
+            targetYawDeg = GetYawDeg();
+        }
+    }
+
+    private void ApplyModelToRigidbody()
+    {
+        rb.mass = massKg;
+        rb.inertiaTensor = inertiaKgM2;
+        rb.inertiaTensorRotation = Quaternion.identity;
+
+        if (mode == DroneMode.Disarmed || mode == DroneMode.ArmedIdle)
+        {
+            rb.useGravity = false;
+            rb.isKinematic = true;
+        }
+
+        rb.linearDamping = 0.05f;
+        rb.angularDamping = 0.02f;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+        rb.constraints = RigidbodyConstraints.None;
+    }
+
+    private void BuildAllocationMatrix()
+    {
+        allocationMatrix = Matrix4x4.zero;
+
+        // Columns = FL, FR, RL, RR
+        allocationMatrix.m00 = 1f;
+        allocationMatrix.m01 = 1f;
+        allocationMatrix.m02 = 1f;
+        allocationMatrix.m03 = 1f;
+
+        // Torque about body X. Front rotors are z = -0.5, rear rotors z = +0.5.
+        allocationMatrix.m10 = rotorArmZM;
+        allocationMatrix.m11 = rotorArmZM;
+        allocationMatrix.m12 = -rotorArmZM;
+        allocationMatrix.m13 = -rotorArmZM;
+
+        // Torque about body Y from propeller reaction.
+        allocationMatrix.m20 = rotorSpinSignsFL_FR_RL_RR.x * yawMomentCoeffM;
+        allocationMatrix.m21 = rotorSpinSignsFL_FR_RL_RR.y * yawMomentCoeffM;
+        allocationMatrix.m22 = rotorSpinSignsFL_FR_RL_RR.z * yawMomentCoeffM;
+        allocationMatrix.m23 = rotorSpinSignsFL_FR_RL_RR.w * yawMomentCoeffM;
+
+        // Torque about body Z from left/right arm.
+        allocationMatrix.m30 = -rotorArmXM;
+        allocationMatrix.m31 = rotorArmXM;
+        allocationMatrix.m32 = -rotorArmXM;
+        allocationMatrix.m33 = rotorArmXM;
+
+        inverseAllocationMatrix = allocationMatrix.inverse;
+    }
+
+    private void ReadKeyboardInput()
+    {
+        Keyboard keyboard = Keyboard.current;
+
+        if (keyboard == null)
+        {
+            return;
+        }
+
+        if (keyboard.digit0Key.wasPressedThisFrame) SetMode(DroneMode.Disarmed);
+        if (keyboard.digit1Key.wasPressedThisFrame) SetMode(DroneMode.ArmedIdle);
+        if (keyboard.digit2Key.wasPressedThisFrame) SetMode(DroneMode.Takeoff);
+        if (keyboard.digit3Key.wasPressedThisFrame) SetMode(DroneMode.LandingOnWater);
+        if (keyboard.digit4Key.wasPressedThisFrame) SetMode(DroneMode.AltitudeHold);
+        if (keyboard.digit5Key.wasPressedThisFrame) SetMode(DroneMode.ManualAttitude);
+        if (keyboard.digit9Key.wasPressedThisFrame) SetMode(DroneMode.Failsafe);
+
+        float forward = 0.0f;
+        float right = 0.0f;
+        float yaw = 0.0f;
+        float altitude = 0.0f;
+
+        if (keyboard.wKey.isPressed) forward += 1.0f;
+        if (keyboard.sKey.isPressed) forward -= 1.0f;
+        if (keyboard.dKey.isPressed) right += 1.0f;
+        if (keyboard.aKey.isPressed) right -= 1.0f;
+        if (keyboard.eKey.isPressed) yaw += 1.0f;
+        if (keyboard.qKey.isPressed) yaw -= 1.0f;
+        if (keyboard.rKey.isPressed) altitude += 1.0f;
+        if (keyboard.fKey.isPressed) altitude -= 1.0f;
+
+        keyboardCommandsForwardRightYawAlt = new Vector4(forward, right, yaw, altitude);
+
+        bool manualInput =
+            Mathf.Abs(forward) > 0.01f ||
+            Mathf.Abs(right) > 0.01f ||
+            Mathf.Abs(yaw) > 0.01f ||
+            Mathf.Abs(altitude) > 0.01f;
+
+        if (manualInput &&
+            (mode == DroneMode.Takeoff || mode == DroneMode.AltitudeHold))
+        {
+            SetMode(DroneMode.ManualAttitude);
+        }
+
+        if (mode == DroneMode.ManualAttitude)
+        {
+            targetAltitudeM += altitude * manualAltitudeRateMS * Time.deltaTime;
+            targetAltitudeM = Mathf.Max(targetAltitudeM, waterSurfaceY + surfaceStableHeightM + 0.20f);
+
+            float yawSign = invertYawCommand ? -1.0f : 1.0f;
+            targetYawDeg += yaw * yawSign * maxYawRateDegS * Time.deltaTime;
+            targetYawDeg = Wrap360(targetYawDeg);
+        }
+    }
+
+    private void RunModelController()
+    {
+        float forward = keyboardCommandsForwardRightYawAlt.x;
+        float right = keyboardCommandsForwardRightYawAlt.y;
+
+        if (mode != DroneMode.ManualAttitude)
+        {
+            forward = 0.0f;
+            right = 0.0f;
+        }
+
+        if (disableTiltCommandsNearWater &&
+            transform.position.y < waterSurfaceY + minimumAirborneControlHeightM)
+        {
+            forward = 0.0f;
+            right = 0.0f;
+        }
+
+        float pitchSign = invertPitchCommand ? -1.0f : 1.0f;
+        float rollSign = invertRollCommand ? -1.0f : 1.0f;
+
+        float targetPitchRad = -forward * pitchSign * maxTiltDeg * Mathf.Deg2Rad;
+        float targetRollRad = -right * rollSign * maxTiltDeg * Mathf.Deg2Rad;
+
+        float currentPitchRad = NormalizeAngleDeg(transform.eulerAngles.x) * Mathf.Deg2Rad;
+        float currentRollRad = NormalizeAngleDeg(transform.eulerAngles.z) * Mathf.Deg2Rad;
+        float currentYawRad = currentYawDeg * Mathf.Deg2Rad;
+        float targetYawRad = targetYawDeg * Mathf.Deg2Rad;
+
+        Vector3 omegaBody = transform.InverseTransformDirection(rb.angularVelocity);
+
+        angleErrorRad.x = Mathf.DeltaAngle(currentPitchRad * Mathf.Rad2Deg, targetPitchRad * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+        angleErrorRad.z = Mathf.DeltaAngle(currentRollRad * Mathf.Rad2Deg, targetRollRad * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+        angleErrorRad.y = Mathf.DeltaAngle(currentYawRad * Mathf.Rad2Deg, targetYawRad * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+
+        targetEulerDeg = new Vector3(
+            targetPitchRad * Mathf.Rad2Deg,
+            targetYawDeg,
+            targetRollRad * Mathf.Rad2Deg
+        );
+
+        // Controller gains are rad/s^2 and rad/s, so multiply by inertia to get torque.
+        desiredTorqueNm.x =
+            inertiaKgM2.x *
+            (attitudeKpRadS2.x * angleErrorRad.x - rateKdRadS.x * omegaBody.x);
+
+        desiredTorqueNm.y =
+            inertiaKgM2.y *
+            (attitudeKpRadS2.y * angleErrorRad.y - rateKdRadS.y * omegaBody.y);
+
+        desiredTorqueNm.z =
+            inertiaKgM2.z *
+            (attitudeKpRadS2.z * angleErrorRad.z - rateKdRadS.z * omegaBody.z);
+
+        limitedTorqueNm.x = Mathf.Clamp(desiredTorqueNm.x, -torqueLimitsNm.x, torqueLimitsNm.x);
+        limitedTorqueNm.y = Mathf.Clamp(desiredTorqueNm.y, -torqueLimitsNm.y, torqueLimitsNm.y);
+        limitedTorqueNm.z = Mathf.Clamp(desiredTorqueNm.z, -torqueLimitsNm.z, torqueLimitsNm.z);
+
+        altitudeErrorM = targetAltitudeM - transform.position.y;
+
+        altitudeIntegralMS += altitudeErrorM * Time.fixedDeltaTime;
+        altitudeIntegralMS = Mathf.Clamp(
+            altitudeIntegralMS,
+            -altitudeIntegralLimitMS,
+            altitudeIntegralLimitMS
+        );
+
+        float verticalVelocity = rb.linearVelocity.y;
+
+        float verticalAccelerationCommand =
+            altitudeKpS2 * altitudeErrorM
+            - altitudeKdS * verticalVelocity
+            + altitudeKiS3 * altitudeIntegralMS;
+
+        desiredTotalThrustN =
+            massKg * (9.80665f + verticalAccelerationCommand);
+
+        if (useTiltCompensation)
+        {
+            float verticalFactor = Vector3.Dot(transform.up, Vector3.up);
+            verticalFactor = Mathf.Clamp(verticalFactor, minVerticalThrustFactor, 1.0f);
+            desiredTotalThrustN /= verticalFactor;
+        }
+
+        desiredTotalThrustN = Mathf.Clamp(desiredTotalThrustN, 0.0f, maxTotalThrustN);
+
+        AllocateMotors(desiredTotalThrustN, limitedTorqueNm);
+    }
+
+    private void AllocateMotors(float totalThrust, Vector3 torqueNm)
+    {
+        Vector4 request = new Vector4(totalThrust, torqueNm.x, torqueNm.y, torqueNm.z);
+
+        Vector4 raw = inverseAllocationMatrix * request;
+
+        if (MotorsWithinLimits(raw))
+        {
+            allocationTorqueScale = 1.0f;
+            motorsSaturated = false;
+            SetTargetThrustVector(raw);
+            return;
+        }
+
+        motorsSaturated = true;
+
+        float lo = 0.0f;
+        float hi = 1.0f;
+
+        for (int i = 0; i < 24; i++)
+        {
+            float mid = 0.5f * (lo + hi);
+            Vector4 scaledRequest = new Vector4(
+                totalThrust,
+                torqueNm.x * mid,
+                torqueNm.y * mid,
+                torqueNm.z * mid
+            );
+
+            Vector4 candidate = inverseAllocationMatrix * scaledRequest;
+
+            if (MotorsWithinLimits(candidate))
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+
+        allocationTorqueScale = lo;
+
+        Vector4 finalRequest = new Vector4(
+            totalThrust,
+            torqueNm.x * allocationTorqueScale,
+            torqueNm.y * allocationTorqueScale,
+            torqueNm.z * allocationTorqueScale
+        );
+
+        Vector4 finalMotorThrusts = inverseAllocationMatrix * finalRequest;
+
+        SetTargetThrustVector(finalMotorThrusts);
+    }
+
+    private bool MotorsWithinLimits(Vector4 f)
+    {
+        return
+            f.x >= 0.0f && f.x <= maxMotorThrustN &&
+            f.y >= 0.0f && f.y <= maxMotorThrustN &&
+            f.z >= 0.0f && f.z <= maxMotorThrustN &&
+            f.w >= 0.0f && f.w <= maxMotorThrustN;
+    }
+
+    private void SetTargetThrustVector(Vector4 f)
+    {
+        targetThrust[0] = Mathf.Clamp(f.x, 0.0f, maxMotorThrustN);
+        targetThrust[1] = Mathf.Clamp(f.y, 0.0f, maxMotorThrustN);
+        targetThrust[2] = Mathf.Clamp(f.z, 0.0f, maxMotorThrustN);
+        targetThrust[3] = Mathf.Clamp(f.w, 0.0f, maxMotorThrustN);
+
+        targetMotorThrustsFL_FR_RL_RR = new Vector4(
+            targetThrust[0],
+            targetThrust[1],
+            targetThrust[2],
+            targetThrust[3]
+        );
+    }
+
+    private void UpdateMotorDynamics()
+    {
+        float alpha = 1.0f - Mathf.Exp(-Time.fixedDeltaTime / Mathf.Max(0.001f, motorTimeConstantS));
+
+        for (int i = 0; i < 4; i++)
+        {
+            actualThrust[i] = Mathf.Lerp(actualThrust[i], targetThrust[i], alpha);
+        }
+
+        actualMotorThrustsFL_FR_RL_RR = new Vector4(
+            actualThrust[0],
+            actualThrust[1],
+            actualThrust[2],
+            actualThrust[3]
+        );
+
+        motorFractionsFL_FR_RL_RR = actualMotorThrustsFL_FR_RL_RR / maxMotorThrustN;
+    }
+
+    private void ApplyMotorForces()
+    {
+        ApplySingleRotorForce(rotorFL, actualThrust[0], rotorSpinSignsFL_FR_RL_RR.x);
+        ApplySingleRotorForce(rotorFR, actualThrust[1], rotorSpinSignsFL_FR_RL_RR.y);
+        ApplySingleRotorForce(rotorRL, actualThrust[2], rotorSpinSignsFL_FR_RL_RR.z);
+        ApplySingleRotorForce(rotorRR, actualThrust[3], rotorSpinSignsFL_FR_RL_RR.w);
+    }
+
+    private void ApplySingleRotorForce(Transform rotor, float thrustN, float spinSign)
+    {
+        if (rotor == null)
+        {
+            return;
+        }
+
+        rb.AddForceAtPosition(transform.up * thrustN, rotor.position, ForceMode.Force);
+        rb.AddTorque(transform.up * spinSign * yawMomentCoeffM * thrustN, ForceMode.Force);
+    }
+
+    private void RunFailsafeLanding()
+    {
+        EnsureDynamicFlight();
+
+        targetAltitudeM = Mathf.Max(
+            waterSurfaceY + surfaceStableHeightM,
+            targetAltitudeM - 0.25f * Time.fixedDeltaTime
+        );
+
+        keyboardCommandsForwardRightYawAlt = Vector4.zero;
+
+        RunModelController();
+        UpdateMotorDynamics();
+        ApplyMotorForces();
+    }
+
+    private void EnterHold()
+    {
+        holdPosition = transform.position;
+        holdRotation = transform.rotation;
+
+        if (rb.isKinematic)
+        {
+            rb.isKinematic = false;
+        }
+
+        rb.linearVelocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        rb.useGravity = false;
+        rb.isKinematic = true;
+    }
+
+    private void MaintainHold()
+    {
+        if (!rb.isKinematic)
+        {
+            EnterHold();
+        }
+
+        transform.position = holdPosition;
+        transform.rotation = holdRotation;
+    }
+
+    private void EnsureDynamicFlight()
+    {
+        if (rb.isKinematic)
+        {
+            rb.isKinematic = false;
+        }
+
+        rb.useGravity = true;
+        rb.mass = massKg;
+        rb.inertiaTensor = inertiaKgM2;
+        rb.inertiaTensorRotation = Quaternion.identity;
+        rb.WakeUp();
+    }
+
+    private void EnsureDynamicSurfaceFloat()
+    {
+        if (rb.isKinematic)
+        {
+            rb.isKinematic = false;
+        }
+
+        rb.useGravity = true;
+        rb.mass = massKg;
+        SetAllMotorTargets(0.0f);
+        rb.WakeUp();
+    }
+
+    private void SetAllMotorTargets(float thrustN)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            targetThrust[i] = Mathf.Clamp(thrustN, 0.0f, maxMotorThrustN);
+        }
+
+        targetMotorThrustsFL_FR_RL_RR = new Vector4(
+            targetThrust[0],
+            targetThrust[1],
+            targetThrust[2],
+            targetThrust[3]
+        );
+    }
+
+    private void AnimatePropellers()
+    {
+        AnimateSingleProp(rotorFL, actualThrust[0], rotorSpinSignsFL_FR_RL_RR.x);
+        AnimateSingleProp(rotorFR, actualThrust[1], rotorSpinSignsFL_FR_RL_RR.y);
+        AnimateSingleProp(rotorRL, actualThrust[2], rotorSpinSignsFL_FR_RL_RR.z);
+        AnimateSingleProp(rotorRR, actualThrust[3], rotorSpinSignsFL_FR_RL_RR.w);
+    }
+
+    private void AnimateSingleProp(Transform rotor, float thrustN, float spinSign)
+    {
+        if (rotor == null)
+        {
+            return;
+        }
+
+        float fraction = Mathf.Clamp01(thrustN / maxMotorThrustN);
+        float rpm = Mathf.Lerp(0.0f, maxRpm, fraction);
+
+        if (fraction > 0.01f)
+        {
+            rpm = Mathf.Max(rpm, idleRpm);
+        }
+
+        float degPerSec = rpm * 360.0f / 60.0f;
+
+        Vector3 axis = propellerSpinAxisLocal.sqrMagnitude > 0.0001f
+            ? propellerSpinAxisLocal.normalized
+            : Vector3.forward;
+
+        rotor.Rotate(axis, degPerSec * spinSign * Time.deltaTime, Space.Self);
+    }
+
+    private void UpdateStateDiagnostics()
+    {
+        currentYawDeg = GetYawDeg();
+        eulerDeg = new Vector3(
+            NormalizeAngleDeg(transform.eulerAngles.x),
+            currentYawDeg,
+            NormalizeAngleDeg(transform.eulerAngles.z)
+        );
+
+        bodyRatesRadS = transform.InverseTransformDirection(rb.angularVelocity);
+    }
+
+    private float GetYawDeg()
+    {
+        float yaw = Mathf.Atan2(transform.forward.x, transform.forward.z) * Mathf.Rad2Deg;
+        return Wrap360(yaw);
+    }
+
+    private float NormalizeAngleDeg(float angle)
+    {
+        while (angle > 180.0f) angle -= 360.0f;
+        while (angle < -180.0f) angle += 360.0f;
+        return angle;
+    }
+
+    private float Wrap360(float angle)
+    {
+        while (angle >= 360.0f) angle -= 360.0f;
+        while (angle < 0.0f) angle += 360.0f;
+        return angle;
+    }
+}

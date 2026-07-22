@@ -1,0 +1,77 @@
+{
+  "config_name": "minirov_unity_controller_config_v0_1",
+  "description": "Candidate MiniROV plant/controller config exported from Python validation.",
+  "plant_params_source": "/home/waseem/mimisk_minirov_unity/mimisk_minirov_v1/external/minirov_plant/params/minirov_plant_params_selected_02.json",
+  "plant_model": {
+    "surge": {
+      "a_cmd": 5.105634213956993,
+      "b_linear": 1.7043056630646345,
+      "b_quadratic": 2.5476297662242855,
+      "bias": -4.0741923002074465e-05
+    },
+    "yaw": {
+      "a_cmd": -5.6,
+      "b_linear": 54.4,
+      "b_quadratic": 120.17836751894005,
+      "bias": 0.0
+    },
+    "vertical": {
+      "a_cmd": -0.305435951991052,
+      "b_linear": 10.493716703638471,
+      "b_quadratic": 194.2654237712733,
+      "bias": -0.001436158406860788
+    },
+    "yaw_command_inverted": true,
+    "vertical_params_are_gazebo_z_positive_up": true
+  },
+  "controller": {
+    "controller_type": "MiniROVPlantBasedController",
+    "gains": {
+      "surge_speed_kp": 2.1977135098601854,
+      "surge_speed_ki": 0.37673977926401914,
+      "surge_speed_kd": 0.0,
+      "surge_cmd_limit": 0.9615798114832861,
+      "surge_integral_limit": 0.7164195973902254,
+      "yaw_angle_kp": 4.338847462433407,
+      "yaw_rate_kd": 4.350205245630921,
+      "yaw_cmd_limit": 0.8509039404088401,
+      "depth_kp": 3.9683058612710065,
+      "depth_ki": 0.09690687019827218,
+      "depth_kd": 14.296236411323754,
+      "depth_cmd_limit": 0.8969560813721913,
+      "depth_integral_limit": 0.6040191213128251,
+      "waypoint_distance_kp": 0.3118971455147087,
+      "waypoint_max_speed_m_s": 0.19113874524054314,
+      "waypoint_slow_radius_m": 1.5708637728021677,
+      "yaw_alignment_slowdown_deg": 41.80879106553283,
+      "min_speed_alignment_scale": 0.003580435078436717,
+      "max_left_right_cmd": 1.0,
+      "max_ballast_cmd": 1.0
+    },
+    "control_structure": {
+      "surge": "PI speed loop: u_ref -> surge_cmd",
+      "yaw": "PD yaw hold: yaw_ref, yaw_rate -> yaw_cmd",
+      "depth": "PID-style depth loop: depth_ref, depth_rate -> ballast_cmd",
+      "mixing": {
+        "left_thruster": "surge_cmd + yaw_cmd",
+        "right_thruster": "surge_cmd - yaw_cmd",
+        "dc_port": "ballast_cmd",
+        "dc_starboard": "ballast_cmd"
+      }
+    }
+  },
+  "manual_mapping": {
+    "lx": "yaw",
+    "ly": "throttle/surge",
+    "rt_minus_lt": "ballast/depth",
+    "left_thruster": "surge_cmd + yaw_cmd",
+    "right_thruster": "surge_cmd - yaw_cmd",
+    "dc_port": "ballast_cmd",
+    "dc_starboard": "ballast_cmd"
+  },
+  "unity_backend": {
+    "actuator_backend": "ControlManager.InjectMotorFrame(left,right,dc_port,dc_starboard)",
+    "recommended_direct_udp_port": 54341,
+    "keep_control_manager_unmodified": true
+  }
+}

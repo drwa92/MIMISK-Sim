@@ -1,0 +1,274 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneAquaLocResearchProfile
+{
+    [MenuItem("MIMISK/Drone/Localization/Apply AquaLoc Low-Cost Smooth M10 Profile")]
+    public static void ApplyLowCostSmoothM10Profile()
+    {
+        GameObject drone = FindDrone();
+        if (drone == null) return;
+
+        MIMISKDroneGnssDevice gnss = drone.GetComponentInChildren<MIMISKDroneGnssDevice>();
+        if (gnss != null)
+        {
+            gnss.gnssModel = MIMISKDroneGnssDevice.GnssModel.UBloxM10;
+            gnss.ConfigureModelDefaults();
+
+            // Realistic low-cost GNSS. Do not make this unrealistically clean.
+            gnss.horizontalPositionNoiseM = 0.8f;
+            gnss.verticalPositionNoiseM = 1.2f;
+            gnss.velocityNoiseMS = 0.08f;
+            gnss.horizontalAccuracyM = 1.5f;
+            gnss.verticalAccuracyM = 2.5f;
+            gnss.velocityAccuracyMS = 0.15f;
+            gnss.sampleRateHz = 10.0f;
+
+            EditorUtility.SetDirty(gnss);
+        }
+
+        ApplyEstimatorCommonProfile(drone);
+
+        MIMISKDroneAquaLocEstimator estimator =
+            drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+
+        SerializedObject so = new SerializedObject(estimator);
+
+        // M10 profile: smoother, but still honest about meter-class GNSS.
+        SetFloat(so, "gnssHorizontalSigmaM", 1.8f);
+        SetFloat(so, "gnssVerticalSigmaM", 2.5f);
+        SetFloat(so, "gnssVelocitySigmaMS", 0.25f);
+
+        SetFloat(so, "gnssPositionFilterQ", 0.006f);
+        SetFloat(so, "gnssVelocityFilterQ", 0.006f);
+
+        SetFloat(so, "qHorizontalPosition", 0.006f);
+        SetFloat(so, "qHorizontalVelocity", 0.020f);
+
+        SetFloat(so, "outputPositionResponseHz", 5.0f);
+        SetFloat(so, "outputVelocityResponseHz", 8.0f);
+        SetFloat(so, "outputYawResponseHz", 10.0f);
+
+        so.ApplyModifiedProperties();
+        Finish(drone, "Applied AquaLoc Low-Cost Smooth M10 profile.");
+    }
+
+    [MenuItem("MIMISK/Drone/Localization/Apply AquaLoc RTK High-Accuracy Profile")]
+    public static void ApplyRtkHighAccuracyProfile()
+    {
+        GameObject drone = FindDrone();
+        if (drone == null) return;
+
+        MIMISKDroneGnssDevice gnss = drone.GetComponentInChildren<MIMISKDroneGnssDevice>();
+        if (gnss != null)
+        {
+            gnss.gnssModel = MIMISKDroneGnssDevice.GnssModel.ZedF9pRtkFixed;
+            gnss.ConfigureModelDefaults();
+
+            // Realistic high-accuracy RTK GNSS profile.
+            gnss.horizontalPositionNoiseM = 0.03f;
+            gnss.verticalPositionNoiseM = 0.06f;
+            gnss.velocityNoiseMS = 0.015f;
+            gnss.horizontalAccuracyM = 0.05f;
+            gnss.verticalAccuracyM = 0.10f;
+            gnss.velocityAccuracyMS = 0.03f;
+            gnss.sampleRateHz = 10.0f;
+
+            EditorUtility.SetDirty(gnss);
+        }
+        else
+        {
+            Debug.LogWarning("[MIMISK] No GNSS device found. Add u-blox/ZED-F9P GNSS first.");
+        }
+
+        ApplyEstimatorCommonProfile(drone);
+
+        MIMISKDroneAquaLocEstimator estimator =
+            drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+
+        SerializedObject so = new SerializedObject(estimator);
+
+        // RTK profile: close to ground truth, still a real sensor model.
+        SetFloat(so, "gnssHorizontalSigmaM", 0.08f);
+        SetFloat(so, "gnssVerticalSigmaM", 0.15f);
+        SetFloat(so, "gnssVelocitySigmaMS", 0.04f);
+
+        SetFloat(so, "gnssPositionFilterQ", 0.002f);
+        SetFloat(so, "gnssVelocityFilterQ", 0.002f);
+
+        SetFloat(so, "qHorizontalPosition", 0.003f);
+        SetFloat(so, "qHorizontalVelocity", 0.012f);
+
+        SetFloat(so, "outputPositionResponseHz", 10.0f);
+        SetFloat(so, "outputVelocityResponseHz", 12.0f);
+        SetFloat(so, "outputYawResponseHz", 12.0f);
+
+        so.ApplyModifiedProperties();
+        Finish(drone, "Applied AquaLoc RTK high-accuracy profile.");
+    }
+
+    private static void ApplyEstimatorCommonProfile(GameObject drone)
+    {
+        MIMISKDroneAquaLocEstimator estimator =
+            drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+
+        if (estimator == null)
+        {
+            estimator = drone.AddComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        SerializedObject so = new SerializedObject(estimator);
+
+        SetObject(so, "imu", drone.GetComponentInChildren<MIMISKDroneImuDevice>());
+        SetObject(so, "barometer", drone.GetComponentInChildren<MIMISKDroneBarometerDevice>());
+        SetObject(so, "magnetometer", drone.GetComponentInChildren<MIMISKDroneMagnetometerDevice>());
+        SetObject(so, "gnss", drone.GetComponentInChildren<MIMISKDroneGnssDevice>());
+        SetObject(so, "rangefinder", drone.GetComponentInChildren<MIMISKDroneRangefinderDevice>());
+        SetObject(so, "surfaceBuoyancy", drone.GetComponent<MIMISKDroneSurfaceBuoyancy>());
+        SetObject(so, "batteryPower", drone.GetComponentInChildren<MIMISKDroneBatteryPowerDevice>());
+
+        SetBool(so, "estimatorEnabled", true);
+        SetBool(so, "resetOnStart", true);
+
+        SetBool(so, "initializeFromUnityPose", true);
+        SetFloat(so, "initializationDelaySeconds", 0.25f);
+        SetBool(so, "useGnssLocalWorldAnchor", true);
+        SetBool(so, "calibrateGnssOriginAtStartup", true);
+        SetBool(so, "requireGnssOriginReadyForFusion", true);
+        SetFloat(so, "gnssOriginCalibrationSeconds", 2.0f);
+        SetBool(so, "freezeOutputDuringGnssOriginCalibration", true);
+
+        SetFloat(so, "landingApproachRangeM", 3.0f);
+        SetInt(so, "waterContactMinBuoyancyPoints", 1);
+        SetInt(so, "surfaceFloatMinBuoyancyPoints", 3);
+
+        // 1D Kalman denoising.
+        SetFloat(so, "gyroNoiseQ", 1.0e-6f);
+        SetFloat(so, "gyroNoiseR", 2.5e-5f);
+        SetFloat(so, "accelNoiseQ", 2.0e-4f);
+        SetFloat(so, "accelNoiseR", 2.0e-3f);
+        SetFloat(so, "magYawNoiseQ", 0.08f);
+        SetFloat(so, "magYawNoiseR", 2.0f);
+
+        SetBool(so, "enableGnssPrefilter", true);
+        SetBool(so, "enableAltitudePrefilter", true);
+        SetFloat(so, "barometerFilterQ", 0.01f);
+        SetFloat(so, "rangefinderFilterQ", 0.006f);
+
+        // Complementary attitude filter.
+        SetFloat(so, "rollPitchGyroAlpha", 0.985f);
+        SetFloat(so, "yawCorrectionGain", 6.0f);
+        SetFloat(so, "yawGyroSign", 1.0f);
+        SetFloat(so, "pitchGyroSign", 1.0f);
+        SetFloat(so, "rollGyroSign", 1.0f);
+        SetFloat(so, "magYawOffsetDeg", 0.0f);
+        SetFloat(so, "accelTiltGateMS2", 2.5f);
+
+        // Magnetometer robust trust.
+        SetFloat(so, "magnetometerYawSigmaDeg", 12.0f);
+        SetBool(so, "reduceMagTrustDuringHighCurrent", true);
+        SetFloat(so, "highCurrentThresholdA", 15.0f);
+        SetFloat(so, "highCurrentMagTrustScale", 0.85f);
+        SetBool(so, "useMagneticFieldNormQuality", true);
+        SetFloat(so, "magneticFieldNormTolerance", 0.20f);
+        SetFloat(so, "minimumMagneticFieldTrust", 0.25f);
+
+        // Position/velocity prediction.
+        SetFloat(so, "horizontalAccelPredictionScale", 0.12f);
+        SetFloat(so, "verticalAccelPredictionScale", 0.05f);
+        SetFloat(so, "qVerticalPosition", 0.006f);
+        SetFloat(so, "qVerticalVelocity", 0.025f);
+
+        // Robust gating.
+        SetBool(so, "enableRobustGating", true);
+        SetFloat(so, "softGate", 3.0f);
+        SetFloat(so, "hardGate", 9.0f);
+
+        // Water logic.
+        SetBool(so, "enableSurfaceConstraint", true);
+        SetFloat(so, "waterSurfaceY", 0.0f);
+        SetFloat(so, "surfaceFloatRootHeightM", 0.0f);
+        SetBool(so, "disableOpticalRangefinderWhenWet", true);
+        SetFloat(so, "rangefinderMaxFusionRangeM", 6.0f);
+
+        SetBool(so, "enableOutputSmoothing", true);
+
+        // Barometer/range values are already validated from your logs.
+        SetFloat(so, "barometerSigmaM", 0.35f);
+        SetFloat(so, "rangefinderSigmaM", 0.12f);
+
+        so.ApplyModifiedProperties();
+
+        estimator.enabled = true;
+        EditorUtility.SetDirty(estimator);
+
+        MIMISKDroneAquaLocLogger logger =
+            drone.GetComponent<MIMISKDroneAquaLocLogger>();
+
+        if (logger == null)
+        {
+            logger = drone.AddComponent<MIMISKDroneAquaLocLogger>();
+        }
+
+        logger.estimator = estimator;
+        logger.enableLogging = true;
+        logger.logHz = 50.0f;
+        logger.flushEveryLine = false;
+        logger.enabled = true;
+
+        EditorUtility.SetDirty(logger);
+    }
+
+    private static GameObject FindDrone()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+        }
+
+        return drone;
+    }
+
+    private static void Finish(GameObject drone, string message)
+    {
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+        Debug.Log("[MIMISK] " + message);
+    }
+
+    private static void SetFloat(SerializedObject so, string name, float value)
+    {
+        SerializedProperty p = so.FindProperty(name);
+        if (p != null) p.floatValue = value;
+        else Debug.LogWarning("[AquaLoc Profile] Missing float: " + name);
+    }
+
+    private static void SetInt(SerializedObject so, string name, int value)
+    {
+        SerializedProperty p = so.FindProperty(name);
+        if (p != null) p.intValue = value;
+        else Debug.LogWarning("[AquaLoc Profile] Missing int: " + name);
+    }
+
+    private static void SetBool(SerializedObject so, string name, bool value)
+    {
+        SerializedProperty p = so.FindProperty(name);
+        if (p != null) p.boolValue = value;
+        else Debug.LogWarning("[AquaLoc Profile] Missing bool: " + name);
+    }
+
+    private static void SetObject(SerializedObject so, string name, Object value)
+    {
+        SerializedProperty p = so.FindProperty(name);
+        if (p != null) p.objectReferenceValue = value;
+        else Debug.LogWarning("[AquaLoc Profile] Missing object: " + name);
+    }
+}

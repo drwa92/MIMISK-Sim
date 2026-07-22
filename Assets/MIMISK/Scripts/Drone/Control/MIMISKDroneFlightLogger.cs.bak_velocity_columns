@@ -1,0 +1,293 @@
+using System;
+using System.Globalization;
+using System.IO;
+using UnityEngine;
+
+[RequireComponent(typeof(Rigidbody))]
+public class MIMISKDroneFlightLogger : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKDroneModelController controller;
+    public MIMISKDroneSurfaceBuoyancy surfaceBuoyancy;
+
+    [Header("Logging")]
+    public bool enableLogging = true;
+    public float logHz = 50.0f;
+    public bool flushEveryLine = false;
+
+    [Header("Runtime")]
+    public string currentLogPath;
+    public int linesWritten;
+
+    private Rigidbody rb;
+    private StreamWriter writer;
+    private float timer;
+
+    private static readonly CultureInfo Culture = CultureInfo.InvariantCulture;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+
+        if (controller == null)
+        {
+            controller = GetComponent<MIMISKDroneModelController>();
+        }
+
+        if (surfaceBuoyancy == null)
+        {
+            surfaceBuoyancy = GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (enableLogging)
+        {
+            OpenLog();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!enableLogging)
+        {
+            return;
+        }
+
+        if (writer == null)
+        {
+            OpenLog();
+        }
+
+        timer += Time.fixedDeltaTime;
+
+        float period = 1.0f / Mathf.Max(1.0f, logHz);
+
+        if (timer >= period)
+        {
+            timer -= period;
+            WriteLine();
+        }
+    }
+
+    private void OnDisable()
+    {
+        CloseLog();
+    }
+
+    private void OnApplicationQuit()
+    {
+        CloseLog();
+    }
+
+    private void OpenLog()
+    {
+        string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+        string logDir = Path.Combine(projectRoot, "Logs", "MIMISKDrone");
+
+        Directory.CreateDirectory(logDir);
+
+        string fileName = "drone_flight_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv";
+        currentLogPath = Path.Combine(logDir, fileName);
+
+        writer = new StreamWriter(currentLogPath);
+        linesWritten = 0;
+
+        writer.WriteLine(
+            "time,mode,cmd_fwd,cmd_right,cmd_yaw,cmd_alt,eff_fwd,eff_right,eff_yaw,eff_alt,tilt_blocked,pos_x,pos_y,pos_z,vel_x,vel_y,vel_z," +
+            "pitch_deg,yaw_deg,roll_deg,rate_x,rate_y,rate_z," +
+            "target_alt,alt_error,alt_integral,target_pitch,target_yaw,target_roll," +
+            "err_x_rad,err_y_rad,err_z_rad,tau_x,tau_y,tau_z,thrust_total," +
+            "motor_FL_N,motor_FR_N,motor_RL_N,motor_RR_N," +
+            "motor_FL_frac,motor_FR_frac,motor_RL_frac,motor_RR_frac," +
+            "allocation_scale,motor_saturation," +
+            "touching_water,active_buoy_points,total_buoyancy_N"
+        );
+
+        writer.Flush();
+
+        Debug.Log("[MIMISKDroneFlightLogger] Logging to: " + currentLogPath);
+    }
+
+    private void WriteLine()
+    {
+        if (writer == null || controller == null)
+        {
+            return;
+        }
+
+        Vector3 p = transform.position;
+        Vector3 v = rb.linearVelocity;
+        Vector3 e = controller.eulerDeg;
+        Vector3 w = controller.bodyRatesRadS;
+
+        Vector4 motorN = controller.actualMotorThrustsFL_FR_RL_RR;
+        Vector4 motorFrac = controller.motorFractionsFL_FR_RL_RR;
+
+        bool touching = false;
+        int activePoints = 0;
+        float totalBuoyancy = 0.0f;
+
+        if (surfaceBuoyancy != null)
+        {
+            touching = GetBoolField(surfaceBuoyancy, "isTouchingWater",
+                       GetBoolField(surfaceBuoyancy, "isNearWater", false));
+
+            activePoints = GetIntField(surfaceBuoyancy, "activePointCount", 0);
+            totalBuoyancy = GetFloatField(surfaceBuoyancy, "totalBuoyancyForceN", 0.0f);
+        }
+
+        string line = string.Join(",",
+            F(Time.time),
+            controller.mode.ToString(),
+
+            F(controller.keyboardCommandsForwardRightYawAlt.x),
+            F(controller.keyboardCommandsForwardRightYawAlt.y),
+            F(controller.keyboardCommandsForwardRightYawAlt.z),
+            F(controller.keyboardCommandsForwardRightYawAlt.w),
+
+            F(controller.effectiveCommandsForwardRightYawAlt.x),
+            F(controller.effectiveCommandsForwardRightYawAlt.y),
+            F(controller.effectiveCommandsForwardRightYawAlt.z),
+            F(controller.effectiveCommandsForwardRightYawAlt.w),
+
+            controller.tiltCommandBlockedByWaterGuard ? "1" : "0",
+
+            F(p.x), F(p.y), F(p.z),
+            F(v.x), F(v.y), F(v.z),
+
+            F(e.x), F(e.y), F(e.z),
+            F(w.x), F(w.y), F(w.z),
+
+            F(controller.targetAltitudeM),
+            F(controller.altitudeErrorM),
+            F(controller.altitudeIntegralMS),
+
+            F(controller.targetEulerDeg.x),
+            F(controller.targetEulerDeg.y),
+            F(controller.targetEulerDeg.z),
+
+            F(controller.angleErrorRad.x),
+            F(controller.angleErrorRad.y),
+            F(controller.angleErrorRad.z),
+
+            F(controller.limitedTorqueNm.x),
+            F(controller.limitedTorqueNm.y),
+            F(controller.limitedTorqueNm.z),
+
+            F(controller.desiredTotalThrustN),
+
+            F(motorN.x), F(motorN.y), F(motorN.z), F(motorN.w),
+            F(motorFrac.x), F(motorFrac.y), F(motorFrac.z), F(motorFrac.w),
+
+            F(controller.allocationTorqueScale),
+            controller.motorsSaturated ? "1" : "0",
+
+            touching ? "1" : "0",
+            activePoints.ToString(Culture),
+            F(totalBuoyancy)
+        );
+
+        writer.WriteLine(line);
+        linesWritten++;
+
+        if (flushEveryLine)
+        {
+            writer.Flush();
+        }
+    }
+
+
+    private bool GetBoolField(object obj, string fieldName, bool defaultValue)
+    {
+        if (obj == null)
+        {
+            return defaultValue;
+        }
+
+        var field = obj.GetType().GetField(fieldName);
+
+        if (field == null)
+        {
+            return defaultValue;
+        }
+
+        object value = field.GetValue(obj);
+
+        if (value is bool b)
+        {
+            return b;
+        }
+
+        return defaultValue;
+    }
+
+    private int GetIntField(object obj, string fieldName, int defaultValue)
+    {
+        if (obj == null)
+        {
+            return defaultValue;
+        }
+
+        var field = obj.GetType().GetField(fieldName);
+
+        if (field == null)
+        {
+            return defaultValue;
+        }
+
+        object value = field.GetValue(obj);
+
+        if (value is int i)
+        {
+            return i;
+        }
+
+        return defaultValue;
+    }
+
+    private float GetFloatField(object obj, string fieldName, float defaultValue)
+    {
+        if (obj == null)
+        {
+            return defaultValue;
+        }
+
+        var field = obj.GetType().GetField(fieldName);
+
+        if (field == null)
+        {
+            return defaultValue;
+        }
+
+        object value = field.GetValue(obj);
+
+        if (value is float f)
+        {
+            return f;
+        }
+
+        return defaultValue;
+    }
+
+    private string F(float value)
+    {
+        return value.ToString("G9", Culture);
+    }
+
+    private void CloseLog()
+    {
+        if (writer == null)
+        {
+            return;
+        }
+
+        writer.Flush();
+        writer.Close();
+        writer.Dispose();
+        writer = null;
+
+        Debug.Log("[MIMISKDroneFlightLogger] Closed log: " + currentLogPath);
+    }
+}

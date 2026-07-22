@@ -1,0 +1,240 @@
+using UnityEditor;
+using UnityEngine;
+
+public static class MIMISKDroneModelProfileApplier
+{
+    [MenuItem("MIMISK/Drone/Apply Model-Based Drone Controller From Final Package")]
+    public static void ApplyProfile()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root. Select MIMISK_AerialAquaticSystem/Drone and run again.");
+            return;
+        }
+
+        Rigidbody rb = drone.GetComponent<Rigidbody>();
+
+        if (rb == null)
+        {
+            rb = drone.AddComponent<Rigidbody>();
+        }
+
+        ApplyRigidbody(rb);
+        MIMISKDroneModelController controller = ApplyController(drone);
+        ApplySurfaceBuoyancy(drone);
+        ApplyLogger(drone, controller);
+        DisableOldControllers(drone);
+
+        EditorUtility.SetDirty(drone);
+        UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(
+            UnityEditor.SceneManagement.EditorSceneManager.GetActiveScene()
+        );
+
+        Debug.Log("[MIMISK] Applied model-based drone controller using final quad package values.");
+    }
+
+    private static void ApplyRigidbody(Rigidbody rb)
+    {
+        rb.mass = 1.5f;
+        rb.inertiaTensor = new Vector3(0.1783796f, 0.41364064f, 0.23955822f);
+        rb.inertiaTensorRotation = Quaternion.identity;
+
+        rb.useGravity = false;
+        rb.isKinematic = true;
+
+        rb.linearDamping = 0.05f;
+        rb.angularDamping = 0.02f;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+        rb.constraints = RigidbodyConstraints.None;
+
+        EditorUtility.SetDirty(rb);
+    }
+
+    private static MIMISKDroneModelController ApplyController(GameObject drone)
+    {
+        MIMISKDroneModelController controller =
+            drone.GetComponent<MIMISKDroneModelController>();
+
+        if (controller == null)
+        {
+            controller = drone.AddComponent<MIMISKDroneModelController>();
+        }
+
+        controller.mode = MIMISKDroneModelController.DroneMode.Disarmed;
+
+        controller.massKg = 1.5f;
+        controller.inertiaKgM2 = new Vector3(0.1783796f, 0.41364064f, 0.23955822f);
+        controller.angularDampingNmPerRadSec = new Vector3(0.02453234f, 0.03374142f, 0.02581342f);
+
+        controller.motorTimeConstantS = 0.0550339f;
+        controller.maxMotorThrustN = 8.2743609375f;
+        controller.yawMomentCoeffM = 0.035f;
+        controller.maxTotalThrustN = 27.21345375f;
+
+        controller.rotorArmXM = 0.58f;
+        controller.rotorArmZM = 0.50f;
+        controller.rotorSpinSignsFL_FR_RL_RR = new Vector4(1f, -1f, -1f, 1f);
+
+        controller.attitudeKpRadS2 = new Vector3(11.439608f, 5.448721f, 11.439608f);
+        controller.rateKdRadS = new Vector3(5.982596f, 5.167017f, 5.982596f);
+
+        controller.altitudeKpS2 = 6.102603f;
+        controller.altitudeKdS = 5.097711f;
+        controller.altitudeKiS3 = 1.3175f;
+        controller.altitudeIntegralLimitMS = 1.25f;
+
+        controller.torqueLimitsNm = new Vector3(2.8f, 0.36f, 2.8f);
+
+        controller.takeoffAltitudeM = 2.5f;
+        controller.surfaceStableHeightM = 0.35f;
+        controller.waterSurfaceY = 0.0f;
+
+        controller.maxTiltDeg = 6.0f;
+        controller.maxYawRateDegS = 35.0f;
+        controller.manualAltitudeRateMS = 0.6f;
+
+        controller.disableTiltCommandsNearWater = true;
+        controller.minimumAirborneControlHeightM = 1.2f;
+        controller.useTiltCompensation = true;
+        controller.minVerticalThrustFactor = 0.55f;
+
+        controller.enableKeyboardInput = true;
+
+        controller.invertPitchCommand = false;
+        controller.invertRollCommand = false;
+        controller.invertYawCommand = false;
+
+        controller.idleRpm = 500.0f;
+        controller.maxRpm = 5200.0f;
+        controller.propellerSpinAxisLocal = Vector3.forward;
+
+        controller.rotorFL = FindDeepChild(drone.transform, "Rotor_FL_spin_pivot_Unity_rotate_local_Z");
+        controller.rotorFR = FindDeepChild(drone.transform, "Rotor_FR_spin_pivot_Unity_rotate_local_Z");
+        controller.rotorRL = FindDeepChild(drone.transform, "Rotor_RL_spin_pivot_Unity_rotate_local_Z");
+        controller.rotorRR = FindDeepChild(drone.transform, "Rotor_RR_spin_pivot_Unity_rotate_local_Z");
+
+        if (controller.rotorFL == null) Debug.LogWarning("[MIMISK] Missing rotor FL.");
+        if (controller.rotorFR == null) Debug.LogWarning("[MIMISK] Missing rotor FR.");
+        if (controller.rotorRL == null) Debug.LogWarning("[MIMISK] Missing rotor RL.");
+        if (controller.rotorRR == null) Debug.LogWarning("[MIMISK] Missing rotor RR.");
+
+        controller.enabled = true;
+        EditorUtility.SetDirty(controller);
+
+        return controller;
+    }
+
+    private static void ApplySurfaceBuoyancy(GameObject drone)
+    {
+        MIMISKDroneSurfaceBuoyancy buoyancy =
+            drone.GetComponent<MIMISKDroneSurfaceBuoyancy>();
+
+        if (buoyancy == null)
+        {
+            buoyancy = drone.AddComponent<MIMISKDroneSurfaceBuoyancy>();
+        }
+
+        buoyancy.waterLevel = 0.0f;
+        buoyancy.autoFindBuoyancyPoints = false;
+        buoyancy.floatRadius = 0.35f;
+
+        buoyancy.autoComputeForceFromMass = true;
+        buoyancy.buoyancyMargin = 2.2f;
+        buoyancy.pointVerticalDamping = 18.0f;
+
+        buoyancy.stabilizeRollPitchOnWater = true;
+        buoyancy.surfaceLevelKp = 18.0f;
+        buoyancy.surfaceLevelKd = 8.0f;
+        buoyancy.maxSurfaceLevelTorque = 60.0f;
+
+        buoyancy.waterLinearDrag = 4.0f;
+        buoyancy.waterAngularDrag = 5.0f;
+
+        buoyancy.enableEmergencyRecovery = true;
+        buoyancy.maxAllowedRootSinkBelowWater = 0.75f;
+        buoyancy.emergencyRecoveryForceN = 200.0f;
+
+        // Keep your existing buoyancy points. Do not overwrite the ring setup.
+        buoyancy.enabled = true;
+        EditorUtility.SetDirty(buoyancy);
+    }
+
+    private static void ApplyLogger(GameObject drone, MIMISKDroneModelController controller)
+    {
+        MIMISKDroneFlightLogger logger =
+            drone.GetComponent<MIMISKDroneFlightLogger>();
+
+        if (logger == null)
+        {
+            logger = drone.AddComponent<MIMISKDroneFlightLogger>();
+        }
+
+        logger.controller = controller;
+        logger.surfaceBuoyancy = drone.GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        logger.enableLogging = true;
+        logger.logHz = 50.0f;
+        logger.flushEveryLine = false;
+
+        logger.enabled = true;
+        EditorUtility.SetDirty(logger);
+    }
+
+    private static void DisableOldControllers(GameObject drone)
+    {
+        DisableIfPresent(drone, "MIMISKDroneAutopilot");
+        DisableIfPresent(drone, "MIMISKDroneRotorModel");
+        DisableIfPresent(drone, "MIMISKDroneFlightController");
+        DisableIfPresent(drone, "MIMISKDroneGPSAutopilot");
+        DisableIfPresent(drone, "MIMISKDroneKeyboardInput");
+        DisableIfPresent(drone, "MIMISKDroneGamepadInput");
+        DisableIfPresent(drone, "MIMISKDronePropellerAnimator");
+        DisableIfPresent(drone, "MIMISKDroneParameterEstimator");
+    }
+
+    private static void DisableIfPresent(GameObject obj, string componentName)
+    {
+        Component c = obj.GetComponent(componentName);
+
+        if (c == null)
+        {
+            return;
+        }
+
+        Behaviour b = c as Behaviour;
+
+        if (b != null)
+        {
+            b.enabled = false;
+            EditorUtility.SetDirty(b);
+            Debug.Log("[MIMISK] Disabled old drone component: " + componentName);
+        }
+    }
+
+    private static Transform FindDeepChild(Transform parent, string name)
+    {
+        if (parent.name == name)
+        {
+            return parent;
+        }
+
+        foreach (Transform child in parent)
+        {
+            Transform result = FindDeepChild(child, name);
+
+            if (result != null)
+            {
+                return result;
+            }
+        }
+
+        return null;
+    }
+}

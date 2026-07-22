@@ -1,0 +1,226 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKMiniROVMissionSetup
+{
+    [MenuItem("MIMISK/MiniROV/Setup MiniROV Autonomous Mission Stack")]
+    public static void SetupMiniROVAutonomousMissionStack()
+    {
+        GameObject miniRov =
+            GameObject.Find("MiniROV");
+
+        if (miniRov == null)
+        {
+            Debug.LogError("[MIMISK] Could not find MiniROV.");
+            return;
+        }
+
+        Rigidbody rb =
+            miniRov.GetComponent<Rigidbody>();
+
+        if (rb == null)
+        {
+            rb = miniRov.AddComponent<Rigidbody>();
+        }
+
+        MIMISKMiniROVModule module =
+            miniRov.GetComponent<MIMISKMiniROVModule>();
+
+        if (module == null)
+        {
+            module = miniRov.AddComponent<MIMISKMiniROVModule>();
+        }
+
+        MIMISKMiniROVTrajectoryPlanner planner =
+            miniRov.GetComponent<MIMISKMiniROVTrajectoryPlanner>();
+
+        if (planner == null)
+        {
+            planner = miniRov.AddComponent<MIMISKMiniROVTrajectoryPlanner>();
+        }
+
+        EnsureDefaultTrajectoryFile();
+
+        TextAsset traj =
+            AssetDatabase.LoadAssetAtPath<TextAsset>(
+                "Assets/MIMISK/Missions/Trajectories/minirov_kelp_inspection_demo.csv"
+            );
+
+        planner.trajectoryFile = traj;
+        planner.trajectoryMode =
+            MIMISKMiniROVTrajectoryPlanner.TrajectoryMode.TextAssetTrajectory;
+        planner.trajectoryZIsUnityVerticalY = true;
+        planner.trajectoryRelativeToMissionOrigin = true;
+        planner.LoadTrajectory();
+
+        EditorUtility.SetDirty(planner);
+
+        MIMISKMiniROVCoreController controller =
+            miniRov.GetComponent<MIMISKMiniROVCoreController>();
+
+        if (controller == null)
+        {
+            controller = miniRov.AddComponent<MIMISKMiniROVCoreController>();
+        }
+
+        controller.rb = rb;
+        controller.controlManager =
+            miniRov.GetComponent<ControlManager>();
+        controller.ballastDepthController =
+            FindBehaviourByTypeName(miniRov, "BallastDepthController");
+        controller.unityVirtualESP32 =
+            FindBehaviourByTypeName(miniRov, "UnityVirtualESP32");
+        controller.mimiskWaterInteraction =
+            FindBehaviourByTypeName(miniRov, "MIMISKWaterInteraction");
+        controller.simpleRovBuoyancy =
+            FindBehaviourByTypeName(miniRov, "SimpleROVBuoyancy");
+        controller.sensorManager =
+            FindBehaviourByTypeName(miniRov, "SensorManager");
+
+        controller.backendMode =
+            MIMISKMiniROVCoreController.BackendMode.UnityNative;
+        controller.controllerEnabled = true;
+        controller.injectMotorFramesToControlManager = true;
+        controller.disableESPBridgeInUnityNative = true;
+        controller.disableControlManagerSerialReaderInUnityNative = true;
+
+        controller.surgeKp = 0.85f;
+        controller.surgeKd = 1.15f;
+        controller.maxSurgeCommand = 0.70f;
+        controller.yawKp = 0.018f;
+        controller.yawKd = 0.010f;
+        controller.maxYawCommand = 0.55f;
+        controller.maxThrusterPwm = 170;
+
+        controller.useBallastDepthController = true;
+        controller.defaultWaterLevel = 0.0f;
+
+        EditorUtility.SetDirty(controller);
+
+        MIMISKMiniROVMissionManager mission =
+            miniRov.GetComponent<MIMISKMiniROVMissionManager>();
+
+        if (mission == null)
+        {
+            mission = miniRov.AddComponent<MIMISKMiniROVMissionManager>();
+        }
+
+        mission.miniRovModule = module;
+        mission.trajectoryPlanner = planner;
+        mission.coreController = controller;
+        mission.miniRovRigidbody = rb;
+        mission.miniRovRoot = miniRov.transform;
+        mission.rovTetherAnchor =
+            FindDeepChild(miniRov.transform, "ROV_TetherAnchor");
+
+        if (mission.rovTetherAnchor == null)
+        {
+            mission.rovTetherAnchor =
+                FindDeepChild(miniRov.transform, "MiniROV_TetherPoint");
+        }
+
+        if (mission.rovTetherAnchor == null)
+        {
+            mission.rovTetherAnchor =
+                FindDeepChild(miniRov.transform, "TetherPoint");
+        }
+
+        mission.missionEnabled = true;
+        mission.allowStandaloneKeyboard = false;
+        mission.releaseToWorldOnStart = true;
+        mission.useRecoveryPointAsMissionOrigin = true;
+
+        mission.pathCompleteRadiusM = 0.35f;
+        mission.recoveryRadiusM = 0.45f;
+        mission.lowSpeedThresholdMS = 0.20f;
+        mission.holdAtRecoverySeconds = 1.0f;
+
+        mission.AutoFindReferences();
+        mission.LoadTrajectory();
+
+        EditorUtility.SetDirty(mission);
+
+        MIMISKCommunicationBridge bridge =
+            UnityEngine.Object.FindAnyObjectByType<MIMISKCommunicationBridge>();
+
+        if (bridge != null)
+        {
+            bridge.miniRovMission = mission;
+            bridge.startMiniRovMissionKey = UnityEngine.InputSystem.Key.M;
+            bridge.requireRovNearRecoveryPointWhenControlActive = true;
+            EditorUtility.SetDirty(bridge);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] MiniROV autonomous mission stack configured: MissionManager -> TrajectoryPlanner -> CoreController -> ControlManager/Ballast.");
+    }
+
+    private static Behaviour FindBehaviourByTypeName(GameObject root, string typeName)
+    {
+        Behaviour[] behaviours =
+            root.GetComponentsInChildren<Behaviour>(true);
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            if (behaviours[i] != null &&
+                behaviours[i].GetType().Name == typeName)
+            {
+                return behaviours[i];
+            }
+        }
+
+        return null;
+    }
+
+    private static void EnsureDefaultTrajectoryFile()
+    {
+        System.IO.Directory.CreateDirectory("Assets/MIMISK/Missions/Trajectories");
+
+        string path =
+            "Assets/MIMISK/Missions/Trajectories/minirov_kelp_inspection_demo.csv";
+
+        if (!System.IO.File.Exists(path))
+        {
+            System.IO.File.WriteAllText(
+                path,
+                "# time,x,y,z\n" +
+                "0,0,0,-0.6\n" +
+                "4,1.0,0.0,-0.8\n" +
+                "8,1.0,1.0,-0.8\n" +
+                "12,0.0,1.0,-0.7\n" +
+                "16,0.0,0.0,-0.6\n"
+            );
+
+            AssetDatabase.Refresh();
+        }
+    }
+
+    private static Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

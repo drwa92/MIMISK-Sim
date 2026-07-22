@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package mimisk.bridge;
+
+option csharp_namespace = "MIMISK.Grpc";
+
+message Header {
+  double sim_time_sec = 1;
+  uint64 seq = 2;
+  string frame_id = 3;
+}
+
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message DroneState {
+  Header header = 1;
+  Vec3 position = 2;
+  Vec3 velocity = 3;
+  double yaw_deg = 4;
+  string flight_mode = 5;
+  string mission_state = 6;
+  string control_mode = 7;
+}
+
+message MiniROVState {
+  Header header = 1;
+  Vec3 position = 2;
+  Vec3 velocity = 3;
+  double yaw_deg = 4;
+  double depth_m = 5;
+  string mission_state = 6;
+  string path_type = 7;
+  string control_mode = 8;
+  double distance_to_home_m = 9;
+}
+
+message TetherState {
+  Header header = 1;
+  string unified_state = 2;
+  string low_level_state = 3;
+
+  double deployed_length_m = 4;
+  double target_length_m = 5;
+  double winch_rate_m_s = 6;
+  double straight_distance_m = 7;
+  double slack_m = 8;
+  double stretch_m = 9;
+  double tension_n = 10;
+
+  Vec3 tether_start = 11;
+  Vec3 tether_end = 12;
+
+  bool drone_motion_allowed = 13;
+  bool safe_to_deploy = 14;
+}
+
+message MIMISKTelemetryFrame {
+  Header header = 1;
+  DroneState drone = 2;
+  MiniROVState minirov = 3;
+  TetherState tether = 4;
+}
+
+message MIMISKCommand {
+  Header header = 1;
+  string target_agent = 2;
+  string verb = 3;
+  string string_arg = 4;
+  double numeric_arg = 5;
+}
+
+message PingRequest {
+  string client_name = 1;
+}
+
+message PingReply {
+  bool ok = 1;
+  string message = 2;
+}
+
+message TelemetryAck {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message CommandBatchRequest {
+  string sim_id = 1;
+}
+
+message CommandBatch {
+  repeated MIMISKCommand commands = 1;
+}
+
+message ManualControlCommand {
+  Header header = 1;
+  string target_agent = 2;  // drone or minirov
+  bool enabled = 3;
+
+  double lx = 4;
+  double ly = 5;
+  double rx = 6;
+  double ry = 7;
+  double lt = 8;
+  double rt = 9;
+
+  int32 hat_x = 10;
+  int32 hat_y = 11;
+
+  bool button_a = 12;
+  bool button_b = 13;
+  bool button_x = 14;
+  bool button_y = 15;
+  bool button_lb = 16;
+  bool button_rb = 17;
+  bool button_back = 18;
+  bool button_start = 19;
+}
+
+message ManualControlRequest {
+  string sim_id = 1;
+}
+
+message ManualControlBatch {
+  repeated ManualControlCommand commands = 1;
+}
+
+
+message CommandExecutionResult {
+  Header header = 1;
+  uint64 command_seq = 2;
+  string target_agent = 3;
+  string verb = 4;
+  string string_arg = 5;
+  double numeric_arg = 6;
+  bool executed = 7;
+  string result = 8;
+}
+
+
+message CameraFrame {
+  Header header = 1;
+  string camera_name = 2;
+  string frame_id = 3;
+  string encoding = 4;   // jpeg
+  uint32 width = 5;
+  uint32 height = 6;
+  bytes data = 7;
+  double fov_y_deg = 8;
+}
+
+
+message ExternalReferenceCommand {
+  Header header = 1;
+  string target_agent = 2;
+  bool enabled = 3;
+
+  bool position_valid = 4;
+  bool velocity_valid = 5;
+  bool acceleration_valid = 6;
+  bool yaw_valid = 7;
+  bool depth_valid = 8;
+
+  Vec3 position = 9;
+  Vec3 velocity = 10;
+  Vec3 acceleration = 11;
+
+  double yaw_deg = 12;
+  double depth_m = 13;
+  double target_length_m = 14;
+  double max_speed_m_s = 15;
+  string mode = 16;
+}
+
+message ExternalReferenceRequest {
+  string sim_id = 1;
+}
+
+message ExternalReferenceBatch {
+  repeated ExternalReferenceCommand references = 1;
+}
+
+
+service MIMISKBridge {
+  rpc Ping(PingRequest) returns (PingReply);
+  rpc SendTelemetry(MIMISKTelemetryFrame) returns (TelemetryAck);
+  rpc SendCameraFrame(CameraFrame) returns (TelemetryAck);
+  rpc GetPendingCommands(CommandBatchRequest) returns (CommandBatch);
+  rpc GetManualControls(ManualControlRequest) returns (ManualControlBatch);
+  rpc GetExternalReferences(ExternalReferenceRequest) returns (ExternalReferenceBatch);
+  rpc ReportCommandResult(CommandExecutionResult) returns (TelemetryAck);
+}

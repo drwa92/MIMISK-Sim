@@ -1,0 +1,280 @@
+using System;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneCleanCoreFlightStackSetup
+{
+    [MenuItem("MIMISK/Drone/Core Control/Setup Clean Core Flight Stack/Ground Truth")]
+    public static void SetupGroundTruth()
+    {
+        Setup(MIMISKDroneCoreRotorController.StateSource.GroundTruth);
+    }
+
+    [MenuItem("MIMISK/Drone/Core Control/Setup Clean Core Flight Stack/AquaLoc")]
+    public static void SetupAquaLoc()
+    {
+        Setup(MIMISKDroneCoreRotorController.StateSource.AquaLoc);
+    }
+
+    private static void Setup(MIMISKDroneCoreRotorController.StateSource stateSource)
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+            return;
+        }
+
+        DisableOldComponents(drone);
+
+        Rigidbody rb = drone.GetComponent<Rigidbody>();
+
+        MIMISKDroneCoreRotorController core =
+            drone.GetComponent<MIMISKDroneCoreRotorController>();
+
+        if (core == null)
+        {
+            core = drone.AddComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        core.rb = rb;
+        core.aquaLoc = drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+        core.legacyModelController = drone.GetComponent<MIMISKDroneModelController>();
+        core.udpReceiver = null;
+
+        core.controllerEnabled = true;
+        core.acceptKeyboardShortcuts = false;
+        core.controlMode = MIMISKDroneCoreRotorController.ControlMode.ExternalReference;
+        core.stateSource = stateSource;
+
+        core.disableLegacyModelController = true;
+        core.keepUdpReceiverEnabled = false;
+
+        core.kpXZ = 1.25f;
+        core.kdXZ = 2.15f;
+        core.kiXZ = 0.04f;
+
+        core.kpY = 1.8f;
+        core.kdY = 1.7f;
+        core.kiY = 0.15f;
+
+        core.integralLimitXYZ = new Vector3(0.8f, 0.6f, 0.8f);
+        core.maxTiltDeg = 22.0f;
+
+        core.attitudeKpNmPerRad = new Vector3(8.0f, 2.2f, 8.0f);
+        core.rateKdNmPerRadS = new Vector3(4.6f, 3.1f, 4.6f);
+        core.torqueLimitNm = new Vector3(8.0f, 0.36f, 8.0f);
+
+        core.useRigidbodyMass = true;
+        core.massKg = rb != null ? rb.mass : 4.0f;
+        core.gravity = 9.80665f;
+        core.armX_M = 0.58f;
+        core.armZ_M = 0.50f;
+        core.maxThrustPerRotorN = 18.0f;
+        core.motorTimeConstantS = 0.12f;
+        core.yawTorqueCoeffNmPerN = 0.010f;
+        core.rotorSpinSigns = new Vector4(1.0f, -1.0f, -1.0f, 1.0f);
+
+        core.enableLogging = true;
+        core.logHz = 50.0f;
+        core.flushEveryLine = false;
+
+        EditorUtility.SetDirty(core);
+
+        MIMISKDroneCoreGamepadReceiver coreGamepad =
+            drone.GetComponent<MIMISKDroneCoreGamepadReceiver>();
+
+        if (coreGamepad == null)
+        {
+            coreGamepad = drone.AddComponent<MIMISKDroneCoreGamepadReceiver>();
+        }
+
+        coreGamepad.receiverEnabled = true;
+        coreGamepad.listenPort = 54331;
+        coreGamepad.preferSemanticFields = true;
+        coreGamepad.invertLeftYForForward = true;
+        coreGamepad.invertRightYForAltitude = true;
+        coreGamepad.deadzone = 0.05f;
+
+        EditorUtility.SetDirty(coreGamepad);
+
+        MIMISKDroneCoreFlightModeManager manager =
+            drone.GetComponent<MIMISKDroneCoreFlightModeManager>();
+
+        if (manager == null)
+        {
+            manager = drone.AddComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        manager.core = core;
+        core.modeManager = manager;
+        manager.gamepad = coreGamepad;
+        core.coreGamepadReceiver = coreGamepad;
+        manager.rb = rb;
+
+        manager.managerEnabled = true;
+        manager.flightMode = MIMISKDroneCoreFlightModeManager.FlightMode.Gamepad;
+
+        manager.waterSurfaceY = 0.0f;
+        manager.takeoffAltitudeAboveSurfaceM = 2.0f;
+        manager.takeoffVerticalSpeedMS = 0.55f;
+        manager.landingDescentSpeedMS = 0.35f;
+        manager.surfaceHoldHeightM = 0.20f;
+
+        manager.manualMaxHorizontalSpeedMS = 0.75f;
+        manager.manualAltitudeRateMS = 0.45f;
+        manager.manualYawRateDegS = 35.0f;
+        manager.manualReferenceResponseHz = 5.0f;
+
+        manager.pathKind = MIMISKDroneCoreFlightModeManager.PathKind.Circle;
+        manager.pathRampTimeS = 2.0f;
+        manager.circleRadiusM = 1.4f;
+        manager.circleOmegaRadS = 0.23f;
+        manager.squareSideM = 2.4f;
+        manager.squareSpeedMS = 0.32f;
+        manager.spiralOmegaRadS = 0.28f;
+        manager.spiralInitialRadiusM = 0.25f;
+        manager.spiralFinalRadiusM = 1.25f;
+        manager.spiralDurationS = 36.0f;
+        manager.spiralAltitudeRiseM = 0.35f;
+        manager.missionDurationS = 40.0f;
+
+        EditorUtility.SetDirty(manager);
+
+        MIMISKDroneCoreRotorAnimator anim =
+            drone.GetComponent<MIMISKDroneCoreRotorAnimator>();
+
+        if (anim == null)
+        {
+            anim = drone.AddComponent<MIMISKDroneCoreRotorAnimator>();
+        }
+
+        anim.core = core;
+        anim.modeManager = manager;
+        anim.legacyRotorModel = drone.GetComponent<MIMISKDroneRotorModel>();
+        anim.animate = true;
+        anim.localSpinAxis = Vector3.forward;
+        anim.idleRpm = 900.0f;
+        anim.maxRpm = 6500.0f;
+        anim.rpmResponseHz = 14.0f;
+        anim.AutoBindRotorVisuals();
+
+        EditorUtility.SetDirty(anim);
+
+        if (rb != null)
+        {
+            rb.useGravity = true;
+            rb.isKinematic = false;
+            EditorUtility.SetDirty(rb);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] Clean Core Flight Stack configured for " + stateSource + ". Old control scripts disabled.");
+    }
+
+    private static void DisableOldComponents(GameObject drone)
+    {
+        string[] oldTypes =
+        {
+            "MIMISKDroneModelController",
+            "MIMISKDroneRotorModel",
+            "MIMISKDroneModelGamepadInput",
+            "MIMISKDroneModelKeyboardInput",
+            "MIMISKDroneModelManualInput",
+            "MIMISKDroneGamepadInput",
+            "MIMISKDroneUdpGamepadReceiver",
+
+            "MIMISKDroneAquaLocPositionHold",
+            "MIMISKDroneKeyboardStationKeeping",
+            "MIMISKDroneAquaLocWaypointNavigator",
+            "MIMISKDroneAquaLocWaypointNavigatorLogger",
+            "MIMISKDroneAquaTrackPathFollower",
+            "MIMISKDroneAquaTrackPathFollowerLogger",
+            "MIMISKDroneAquaSplinePFPathFollower",
+            "MIMISKDroneAquaSplinePFPathFollowerLogger",
+            "MIMISKDroneAquaDynTrackController",
+            "MIMISKDroneAquaDynTrackLogger",
+            "MIMISKDroneRtkIKDynamicPathTracker",
+            "MIMISKDroneRtkIKDynamicPathTrackerLogger",
+            "MIMISKDroneNominalPathPidRotorController",
+            "MIMISKDroneBaseRotorController",
+            "MIMISKDroneCoreRotorVisualAnimator"
+        };
+
+        for (int i = 0; i < oldTypes.Length; i++)
+        {
+            DisableByClassName(drone, oldTypes[i]);
+        }
+    }
+
+    private static void DisableByClassName(GameObject root, string className)
+    {
+        Type t = FindTypeByName(className);
+
+        if (t == null)
+        {
+            return;
+        }
+
+        Component[] components = root.GetComponentsInChildren(t, true);
+
+        if (components == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < components.Length; i++)
+        {
+            Behaviour b = components[i] as Behaviour;
+
+            if (b != null)
+            {
+                b.enabled = false;
+                EditorUtility.SetDirty(b);
+            }
+        }
+    }
+
+    private static Type FindTypeByName(string className)
+    {
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type t = assembly.GetType(className);
+
+            if (t != null)
+            {
+                return t;
+            }
+
+            Type[] types;
+
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch
+            {
+                continue;
+            }
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                if (types[i].Name == className)
+                {
+                    return types[i];
+                }
+            }
+        }
+
+        return null;
+    }
+}

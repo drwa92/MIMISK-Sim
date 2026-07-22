@@ -1,0 +1,494 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneAquaLocWaypointNavigator : MonoBehaviour
+{
+    public enum NavState
+    {
+        Idle,
+        Navigating,
+        PrecisionApproach,
+        Loitering,
+        Completed,
+        Aborted,
+        LandingAtFinal
+    }
+
+    [Header("References")]
+    public MIMISKDroneAquaLocEstimator aquaLoc;
+    public MIMISKDroneAquaLocPositionHold aquaHold;
+    public MIMISKDroneKeyboardStationKeeping keyboardStationKeeping;
+    public MIMISKDroneUdpGamepadReceiver udpReceiver;
+
+    [Header("Keyboard")]
+    public Key startMissionKey = Key.N;
+    public Key abortMissionKey = Key.B;
+
+    [Header("Mission")]
+    public bool missionActive;
+    public NavState navState = NavState.Idle;
+
+    [Tooltip("Waypoint offsets from the mission start point. X=east/right, Y=altitude change, Z=north/forward.")]
+    public Vector3[] localWaypointOffsets = new Vector3[]
+    {
+        new Vector3(0f, 0f, 3f),
+        new Vector3(2f, 0f, 3f),
+        new Vector3(2f, 0f, 0f),
+        new Vector3(0f, 0f, 0f)
+    };
+
+    public Vector3[] worldWaypoints;
+    public int currentWaypointIndex;
+
+    [Header("Waypoint Acceptance")]
+    public float transitRadiusM = 0.45f;
+    public float precisionRadiusM = 0.24f;
+    public float finalWaypointRadiusM = 0.20f;
+
+    public float waypointSpeedThresholdMS = 0.12f;
+    public float stableArrivalRequiredSeconds = 1.00f;
+    public float waypointLoiterSeconds = 2.0f;
+    public float finalWaypointLoiterSeconds = 3.0f;
+
+    [Header("Precision Behavior")]
+    public bool switchAquaHoldToPrecisionNearWaypoint = true;
+    public bool requireAquaHoldPrecisionState = true;
+    public bool requireAquaHoldTargetReachedIfAvailable = false;
+
+    [Tooltip("If the drone cannot satisfy strict arrival conditions but is near the target for too long, allow progress.")]
+    public bool enableSoftTimeoutProgression = true;
+
+    public float softTimeoutSeconds = 45.0f;
+    public float softTimeoutRadiusM = 0.35f;
+
+    [Header("Mission Behavior")]
+    public bool holdAtEnd = true;
+    public bool landAtFinalWaypoint = false;
+    public bool useCurrentYawForMission = true;
+
+    [Header("Runtime")]
+    public Vector3 missionStartPositionWorld;
+    public float missionYawDeg;
+    public Vector3 currentTargetWorld;
+    public float distanceToCurrentWaypointM;
+    public float horizontalSpeedMS;
+    public float arrivalStableTimerS;
+    public float loiterTimerS;
+    public float waypointTimerS;
+    public bool inPrecisionApproach;
+    public bool arrivalConditionSatisfied;
+    public bool loiterConditionSatisfied;
+    public string lastEvent = "none";
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Update()
+    {
+        AutoFindReferencesIfNeeded();
+
+        if (Keyboard.current != null)
+        {
+            if (Keyboard.current[startMissionKey].wasPressedThisFrame)
+            {
+                StartMissionFromCurrentAquaLocPose();
+            }
+
+            if (Keyboard.current[abortMissionKey].wasPressedThisFrame)
+            {
+                AbortMissionAndReturnManual();
+            }
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!missionActive || aquaLoc == null || aquaHold == null || !aquaLoc.estimatorReady)
+        {
+            return;
+        }
+
+        waypointTimerS += Time.fixedDeltaTime;
+
+        if (navState == NavState.Navigating || navState == NavState.PrecisionApproach)
+        {
+            UpdateNavigation(Time.fixedDeltaTime);
+        }
+        else if (navState == NavState.Loitering)
+        {
+            UpdateLoiter(Time.fixedDeltaTime);
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (aquaLoc == null)
+        {
+            aquaLoc = GetComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        if (aquaHold == null)
+        {
+            aquaHold = GetComponent<MIMISKDroneAquaLocPositionHold>();
+        }
+
+        if (keyboardStationKeeping == null)
+        {
+            keyboardStationKeeping = GetComponent<MIMISKDroneKeyboardStationKeeping>();
+        }
+
+        if (udpReceiver == null)
+        {
+            udpReceiver = GetComponent<MIMISKDroneUdpGamepadReceiver>();
+        }
+    }
+
+    private void AutoFindReferencesIfNeeded()
+    {
+        if (aquaLoc == null || aquaHold == null || keyboardStationKeeping == null || udpReceiver == null)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    [ContextMenu("Start Mission From Current AquaLoc Pose")]
+    public void StartMissionFromCurrentAquaLocPose()
+    {
+        AutoFindReferences();
+
+        if (aquaLoc == null || !aquaLoc.estimatorReady)
+        {
+            lastEvent = "Mission rejected: AquaLoc not ready";
+            Debug.LogWarning("[MIMISK] AquaNav mission rejected: AquaLoc not ready.");
+            return;
+        }
+
+        if (aquaHold == null)
+        {
+            Debug.LogError("[MIMISK] AquaHold missing.");
+            return;
+        }
+
+        missionStartPositionWorld = aquaLoc.estimatedPositionWorld;
+        missionYawDeg = useCurrentYawForMission ? aquaLoc.estimatedYawDeg : 0.0f;
+
+        BuildWorldWaypoints();
+
+        missionActive = true;
+        currentWaypointIndex = 0;
+        arrivalStableTimerS = 0.0f;
+        loiterTimerS = 0.0f;
+        waypointTimerS = 0.0f;
+        inPrecisionApproach = false;
+
+        if (udpReceiver != null)
+        {
+            udpReceiver.enabled = false;
+        }
+
+        if (keyboardStationKeeping != null)
+        {
+            keyboardStationKeeping.stationKeepingActive = true;
+        }
+
+        ActivateWaypoint(currentWaypointIndex);
+
+        lastEvent = "Mission started";
+        Debug.Log("[MIMISK] AquaNav v2 mission started.");
+    }
+
+    private void BuildWorldWaypoints()
+    {
+        if (localWaypointOffsets == null || localWaypointOffsets.Length == 0)
+        {
+            localWaypointOffsets = new Vector3[]
+            {
+                new Vector3(0f, 0f, 3f),
+                new Vector3(2f, 0f, 3f),
+                new Vector3(2f, 0f, 0f),
+                new Vector3(0f, 0f, 0f)
+            };
+        }
+
+        worldWaypoints = new Vector3[localWaypointOffsets.Length];
+
+        Quaternion yawRotation = Quaternion.Euler(0.0f, missionYawDeg, 0.0f);
+
+        for (int i = 0; i < localWaypointOffsets.Length; i++)
+        {
+            worldWaypoints[i] = missionStartPositionWorld + yawRotation * localWaypointOffsets[i];
+        }
+    }
+
+    private void ActivateWaypoint(int index)
+    {
+        if (worldWaypoints == null || index < 0 || index >= worldWaypoints.Length)
+        {
+            CompleteMission();
+            return;
+        }
+
+        currentTargetWorld = worldWaypoints[index];
+
+        aquaHold.takeControlOfDrone = true;
+        aquaHold.SetNavigationTarget(
+            currentTargetWorld,
+            missionYawDeg,
+            MIMISKDroneAquaLocPositionHold.GuidanceMode.GoToTarget
+        );
+
+        navState = NavState.Navigating;
+        arrivalStableTimerS = 0.0f;
+        loiterTimerS = 0.0f;
+        waypointTimerS = 0.0f;
+        inPrecisionApproach = false;
+
+        lastEvent = "Navigating to waypoint " + index;
+        Debug.Log("[MIMISK] AquaNav v2 navigating to waypoint " + index);
+    }
+
+    private void UpdateNavigation(float dt)
+    {
+        Vector3 error = currentTargetWorld - aquaLoc.estimatedPositionWorld;
+        error.y = 0.0f;
+
+        distanceToCurrentWaypointM = error.magnitude;
+
+        Vector3 horizontalVelocity = new Vector3(
+            aquaLoc.estimatedVelocityWorld.x,
+            0.0f,
+            aquaLoc.estimatedVelocityWorld.z
+        );
+
+        horizontalSpeedMS = horizontalVelocity.magnitude;
+
+        float requiredRadius = IsFinalWaypoint()
+            ? finalWaypointRadiusM
+            : precisionRadiusM;
+
+        if (switchAquaHoldToPrecisionNearWaypoint &&
+            !inPrecisionApproach &&
+            distanceToCurrentWaypointM <= transitRadiusM)
+        {
+            aquaHold.SetNavigationTarget(
+                currentTargetWorld,
+                missionYawDeg,
+                MIMISKDroneAquaLocPositionHold.GuidanceMode.HoldTarget
+            );
+
+            inPrecisionApproach = true;
+            navState = NavState.PrecisionApproach;
+            lastEvent = "Precision approach waypoint " + currentWaypointIndex;
+        }
+
+        bool precisionStateOk =
+            !requireAquaHoldPrecisionState ||
+            aquaHold.holdState == MIMISKDroneAquaLocPositionHold.HoldState.PrecisionHold;
+
+        bool holdReachedOk =
+            !requireAquaHoldTargetReachedIfAvailable ||
+            aquaHold.targetReached;
+
+        arrivalConditionSatisfied =
+            distanceToCurrentWaypointM <= requiredRadius &&
+            horizontalSpeedMS <= waypointSpeedThresholdMS &&
+            precisionStateOk &&
+            holdReachedOk;
+
+        if (arrivalConditionSatisfied)
+        {
+            arrivalStableTimerS += dt;
+        }
+        else
+        {
+            arrivalStableTimerS = 0.0f;
+        }
+
+        bool softTimeoutOk =
+            enableSoftTimeoutProgression &&
+            waypointTimerS >= softTimeoutSeconds &&
+            distanceToCurrentWaypointM <= softTimeoutRadiusM;
+
+        if (arrivalStableTimerS >= stableArrivalRequiredSeconds || softTimeoutOk)
+        {
+            navState = NavState.Loitering;
+            loiterTimerS = 0.0f;
+
+            aquaHold.SetNavigationTarget(
+                currentTargetWorld,
+                missionYawDeg,
+                MIMISKDroneAquaLocPositionHold.GuidanceMode.HoldTarget
+            );
+
+            lastEvent = softTimeoutOk
+                ? "Soft-timeout loiter waypoint " + currentWaypointIndex
+                : "Loitering waypoint " + currentWaypointIndex;
+        }
+    }
+
+    private void UpdateLoiter(float dt)
+    {
+        float requiredRadius = IsFinalWaypoint()
+            ? finalWaypointRadiusM
+            : precisionRadiusM;
+
+        Vector3 error = currentTargetWorld - aquaLoc.estimatedPositionWorld;
+        error.y = 0.0f;
+
+        distanceToCurrentWaypointM = error.magnitude;
+
+        Vector3 horizontalVelocity = new Vector3(
+            aquaLoc.estimatedVelocityWorld.x,
+            0.0f,
+            aquaLoc.estimatedVelocityWorld.z
+        );
+
+        horizontalSpeedMS = horizontalVelocity.magnitude;
+
+        loiterConditionSatisfied =
+            distanceToCurrentWaypointM <= requiredRadius * 1.25f &&
+            horizontalSpeedMS <= waypointSpeedThresholdMS * 1.5f;
+
+        if (loiterConditionSatisfied)
+        {
+            loiterTimerS += dt;
+        }
+        else
+        {
+            loiterTimerS = Mathf.Max(0.0f, loiterTimerS - dt * 0.5f);
+        }
+
+        float requiredLoiter = IsFinalWaypoint()
+            ? finalWaypointLoiterSeconds
+            : waypointLoiterSeconds;
+
+        if (loiterTimerS < requiredLoiter)
+        {
+            return;
+        }
+
+        currentWaypointIndex++;
+
+        if (currentWaypointIndex >= worldWaypoints.Length)
+        {
+            if (landAtFinalWaypoint)
+            {
+                navState = NavState.LandingAtFinal;
+
+                aquaHold.SetNavigationTarget(
+                    currentTargetWorld,
+                    missionYawDeg,
+                    MIMISKDroneAquaLocPositionHold.GuidanceMode.LandOnWaterAtTarget
+                );
+
+                lastEvent = "Landing at final waypoint";
+            }
+            else
+            {
+                CompleteMission();
+            }
+
+            return;
+        }
+
+        ActivateWaypoint(currentWaypointIndex);
+    }
+
+    private bool IsFinalWaypoint()
+    {
+        return worldWaypoints != null &&
+               currentWaypointIndex >= worldWaypoints.Length - 1;
+    }
+
+    private void CompleteMission()
+    {
+        missionActive = false;
+        navState = NavState.Completed;
+
+        if (holdAtEnd && aquaHold != null)
+        {
+            aquaHold.SetNavigationTarget(
+                currentTargetWorld,
+                missionYawDeg,
+                MIMISKDroneAquaLocPositionHold.GuidanceMode.HoldTarget
+            );
+        }
+        else
+        {
+            ReleaseToManual();
+        }
+
+        lastEvent = "Mission completed";
+        Debug.Log("[MIMISK] AquaNav v2 mission completed.");
+    }
+
+    [ContextMenu("Abort Mission And Return Manual")]
+    public void AbortMissionAndReturnManual()
+    {
+        missionActive = false;
+        navState = NavState.Aborted;
+        ReleaseToManual();
+
+        lastEvent = "Mission aborted";
+        Debug.Log("[MIMISK] AquaNav mission aborted. Manual gamepad restored.");
+    }
+
+    private void ReleaseToManual()
+    {
+        if (aquaHold != null)
+        {
+            aquaHold.enableGuidance = false;
+            aquaHold.guidanceMode = MIMISKDroneAquaLocPositionHold.GuidanceMode.Disabled;
+            aquaHold.DisableAquaHold();
+        }
+
+        if (keyboardStationKeeping != null)
+        {
+            keyboardStationKeeping.stationKeepingActive = false;
+        }
+
+        if (udpReceiver != null)
+        {
+            udpReceiver.enabled = true;
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (missionActive)
+        {
+            ReleaseToManual();
+        }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        if (worldWaypoints == null)
+        {
+            return;
+        }
+
+        Gizmos.color = Color.blue;
+
+        for (int i = 0; i < worldWaypoints.Length; i++)
+        {
+            float radius = i == worldWaypoints.Length - 1
+                ? finalWaypointRadiusM
+                : precisionRadiusM;
+
+            Gizmos.DrawWireSphere(worldWaypoints[i], radius);
+
+            if (i > 0)
+            {
+                Gizmos.DrawLine(worldWaypoints[i - 1], worldWaypoints[i]);
+            }
+        }
+
+        Gizmos.color = Color.green;
+        Gizmos.DrawWireSphere(currentTargetWorld, precisionRadiusM * 1.4f);
+    }
+}

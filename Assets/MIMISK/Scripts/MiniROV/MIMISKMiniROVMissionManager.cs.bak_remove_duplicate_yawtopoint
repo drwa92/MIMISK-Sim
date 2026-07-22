@@ -1,0 +1,1587 @@
+using System;
+using System.Reflection;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVMissionManager : MonoBehaviour
+{
+    public enum MiniROVMissionState
+    {
+        Idle,
+        ManualDirect,
+
+        // Legacy compatibility for older UDP/gamepad receivers.
+        RunningGamepadTest,
+
+        StationHolding,
+        DwellSettling,
+        Dwelling,
+        ExecutingMission,
+        StopAndLookMoving,
+        StopAndLookSettling,
+        StopAndLookDwelling,
+        StopAndLookComplete,
+        ReturningHome,
+        RecoveryReady,
+        Fault
+    }
+
+    public enum DwellYawPolicy
+    {
+        CurrentYaw,
+        FixedYaw,
+        FacePoint,
+        FaceHome
+    }
+
+    public enum MiniROVMissionAction
+    {
+        None,
+        StationHold,
+        DwellAtCurrentPose,
+        GamepadManualTest,
+        GoToPoint,
+        LineOutAndBack,
+        Square,
+        LawnmowerSurvey,
+        CircleInspection,
+        SpiralSearch,
+        HelixInspection,
+        FigureEight,
+        ReturnHome,
+
+        // Legacy names kept for old editor/setup scripts.
+        FollowTrajectory,
+        FollowSelectedTrajectory,
+        Trajectory,
+        AutonomousTrajectory
+    }
+
+    [Header("New Architecture References")]
+    public MIMISKMiniROVPathPlanner pathPlanner;
+    public MIMISKMiniROVPlantBasedController controller;
+    public MIMISKMiniROVDirectRaspberryBypassInput directBypassInput;
+    public Rigidbody rb;
+
+    [Header("Legacy Compatibility References")]
+    public MIMISKMiniROVModule miniRovModule;
+    public MIMISKMiniROVTrajectoryPlanner trajectoryPlanner;
+    public MIMISKMiniROVCoreController coreController;
+    public Rigidbody miniRovRigidbody;
+    public Transform miniRovRoot;
+    public Transform rovTetherAnchor;
+
+    [Header("Mission")]
+    public MiniROVMissionState missionState = MiniROVMissionState.Idle;
+    public MiniROVMissionAction selectedMissionAction = MiniROVMissionAction.StationHold;
+
+    [Tooltip("When ON, Start Selected Mission uses PathPlanner.SelectedPathType. This is the normal new workflow.")]
+    public bool usePathPlannerSelectedPath = true;
+
+    public bool missionManagerEnabled = true;
+    public bool missionEnabled = true;
+
+    // Legacy field expected by old receivers/bridges.
+    public bool missionActive;
+
+    [Header("Legacy Mission Options")]
+    public bool allowStandaloneKeyboard = false;
+    public bool releaseToWorldOnStart = true;
+    public bool useRecoveryPointAsMissionOrigin = true;
+
+    public bool useUnityNativeAutonomy = true;
+    public bool disableESPAndControlManagerForUnityNative = true;
+    public bool enableWaterInteractionForMission = true;
+    public bool enableSimpleBuoyancyForMission = true;
+
+    public float pathCompleteRadiusM = 0.20f;
+    public float recoveryRadiusM = 0.25f;
+    public float lowSpeedThresholdMS = 0.05f;
+    public float holdAtRecoverySeconds = 1.0f;
+
+    [Header("Recovery")]
+    public float recoveryReadyRadiusM = 0.25f;
+    public float recoveryReadySpeedMS = 0.05f;
+
+    [Tooltip("ReturnHome is RecoveryReady only after the ROV is also aligned to yaw zero.")]
+    public bool recoveryReadyRequiresYawZero = true;
+
+    public float recoveryReadyYawToleranceDeg = 10.0f;
+    public bool recoveryReady;
+
+    [Header("Runtime")]
+    public string lastEvent = "idle";
+    public float distanceToHomeM;
+    public float currentSpeedMS;
+
+    [Header("Independent Dwell Action")]
+    public bool dwellActionActive;
+    public float dwellSeconds = 3.0f;
+    public DwellYawPolicy dwellYawPolicy = DwellYawPolicy.CurrentYaw;
+    public float dwellFixedYawDeg = 0.0f;
+    public Vector3 dwellFacePointWorld;
+
+    public bool dwellRequireSettleBeforeTimer = true;
+    public float dwellStationToleranceM = 0.08f;
+    public float dwellYawToleranceDeg = 15.0f;
+    public float dwellSpeedToleranceMS = 0.05f;
+    public float dwellMaxSettleSeconds = 20.0f;
+
+    public float dwellTimerS;
+    public float dwellSettleTimerS;
+    public float dwellTargetYawDeg;
+    public string dwellPhase = "idle";
+    public string dwellCancelReason = "none";
+
+
+    [Header("Stop-and-Look Runtime")]
+    public bool stopLookActive;
+    public Vector3[] stopLookMissionWaypoints;
+    public int stopLookCurrentIndex;
+    public int stopLookTotalWaypoints;
+    public float stopLookDwellTimerS;
+    public string stopLookPhase = "idle";
+    public float stopLookCurrentTargetYawDeg;
+
+    [Header("Stop-and-Look Settle Gate")]
+    public bool stopLookRequireSettleBeforeDwell = true;
+
+    [Tooltip("Dwell starts only when station error is below this value.")]
+    public float stopLookStationToleranceM = 0.05f;
+
+    [Tooltip("Dwell starts only when yaw error is below this value.")]
+    public float stopLookYawToleranceDeg = 12.0f;
+
+    [Tooltip("Dwell starts only when speed is below this value.")]
+    public float stopLookSpeedToleranceMS = 0.035f;
+
+    [Tooltip("During inspection dwell, use a tighter StationHold deadband.")]
+    public bool stopLookTightenStationHoldDeadband = true;
+
+    public float stopLookInspectionDeadbandM = 0.04f;
+
+    [Tooltip("If settling takes too long, dwell can proceed but the event will record timeout.")]
+    public bool stopLookProceedAfterSettleTimeout = true;
+
+    public float stopLookMaxSettleSeconds = 20.0f;
+
+    public float stopLookSettleTimerS;
+    public bool stopLookReadyToDwell;
+    public string stopLookSettleStatus = "idle";
+
+    [Header("Stop-and-Look Robustness")]
+    [Tooltip("Default OFF: after dwell starts, do not bounce back to settling forever.")]
+    public bool stopLookPauseDwellIfUnsettled = false;
+
+    [Tooltip("If settling fails, skip the waypoint instead of looping forever.")]
+    public bool stopLookSkipUnsettledWaypointOnTimeout = true;
+
+    [Tooltip("Optional limit if dwell pause is enabled.")]
+    public float stopLookMaxDwellPauseSeconds = 8.0f;
+
+    public float stopLookDwellPauseTimerS;
+    public int stopLookSkippedWaypoints;
+    public string stopLookCancelReason = "none";
+
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        RefreshMissionActiveFlag();
+    }
+
+    private void Update()
+    {
+        if (!missionManagerEnabled || !missionEnabled)
+        {
+            return;
+        }
+
+        AutoFindReferences();
+        RefreshState();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (miniRovRoot == null)
+        {
+            miniRovRoot = transform;
+        }
+
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (miniRovRigidbody == null)
+        {
+            miniRovRigidbody = rb != null ? rb : GetComponent<Rigidbody>();
+        }
+
+        if (pathPlanner == null)
+        {
+            pathPlanner = GetComponent<MIMISKMiniROVPathPlanner>();
+        }
+
+        if (controller == null)
+        {
+            controller = GetComponent<MIMISKMiniROVPlantBasedController>();
+        }
+
+        if (directBypassInput == null)
+        {
+            directBypassInput = GetComponent<MIMISKMiniROVDirectRaspberryBypassInput>();
+        }
+
+        if (miniRovModule == null)
+        {
+            miniRovModule = GetComponent<MIMISKMiniROVModule>();
+        }
+
+        if (trajectoryPlanner == null)
+        {
+            trajectoryPlanner = GetComponent<MIMISKMiniROVTrajectoryPlanner>();
+        }
+
+        if (coreController == null)
+        {
+            coreController = GetComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (rovTetherAnchor == null && miniRovRoot != null)
+        {
+            rovTetherAnchor = FindDeepChild(miniRovRoot, "ROV_TetherAnchor");
+
+            if (rovTetherAnchor == null)
+            {
+                rovTetherAnchor = FindDeepChild(miniRovRoot, "MiniROV_TetherPoint");
+            }
+
+            if (rovTetherAnchor == null)
+            {
+                rovTetherAnchor = FindDeepChild(miniRovRoot, "TetherPoint");
+            }
+        }
+    }
+
+    [ContextMenu("Set Home Here")]
+    public void SetHomeHere()
+    {
+        AutoFindReferences();
+
+        if (pathPlanner != null)
+        {
+            pathPlanner.SetHomeToCurrentPose();
+        }
+
+        lastEvent = "home_set";
+    }
+
+    [ContextMenu("Load Trajectory")]
+    public void LoadTrajectory()
+    {
+        AutoFindReferences();
+
+        InvokeIfExists(trajectoryPlanner, "LoadTrajectory");
+        InvokeIfExists(pathPlanner, "BuildPath");
+
+        lastEvent = "load_trajectory_requested_compat";
+    }
+
+    [ContextMenu("Start Selected Mission")]
+    public void StartSelectedMission()
+    {
+        AutoFindReferences();
+
+        if (!Application.isPlaying)
+        {
+            lastEvent = "start_selected_mission_rejected_not_playing";
+            Debug.LogWarning("[MIMISK MiniROV MissionManager] Start Selected Mission must be used in Play Mode.");
+            return;
+        }
+
+        if (!CanStartMission())
+        {
+            Debug.LogWarning("[MIMISK MiniROV MissionManager] Cannot start mission. Last event: " + lastEvent);
+            return;
+        }
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "start_failed_missing_path_planner"
+            );
+
+            Debug.LogError("[MIMISK MiniROV MissionManager] Missing path planner.");
+            return;
+        }
+
+        if (usePathPlannerSelectedPath)
+        {
+            StartPlannerSelectedPath();
+            return;
+        }
+
+        StartMissionAction(selectedMissionAction);
+    }
+
+    [ContextMenu("Hold Current Pose")]
+    public void HoldCurrentPose()
+    {
+        AutoFindReferences();
+
+        CancelDwellAction("hold_current_pose");
+
+        CancelStopAndLookMission("hold_current_pose");
+
+        CancelStopAndLookMission("hold_current_pose");
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        if (controller != null)
+        {
+            controller.StartHoldCurrentPose();
+        }
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.StationHolding,
+            "hold_current_pose"
+        );
+    }
+
+    [ContextMenu("Return Home")]
+    public void ReturnHome()
+    {
+        AutoFindReferences();
+
+        CancelDwellAction("return_home");
+
+        CancelStopAndLookMission("return_home");
+
+        CancelStopAndLookMission("return_home");
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "return_home_failed_missing_path_planner"
+            );
+
+            return;
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        pathPlanner.StartReturnHomePlan();
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.ReturningHome,
+            "return_home_started"
+        );
+    }
+
+    [ContextMenu("Abort To Hold")]
+    public void AbortToHold()
+    {
+        HoldCurrentPose();
+        lastEvent = "abort_to_station_hold";
+    }
+
+    [ContextMenu("Stop Controller")]
+    public void StopController()
+    {
+        AutoFindReferences();
+
+        CancelDwellAction("stop_controller");
+
+        CancelStopAndLookMission("stop_controller");
+
+        CancelStopAndLookMission("stop_controller");
+
+        if (controller != null)
+        {
+            controller.StopController();
+        }
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.Idle,
+            "controller_stopped"
+        );
+    }
+
+    [ContextMenu("Enable Manual Direct Mode")]
+    public void EnableManualDirectMode()
+    {
+        AutoFindReferences();
+
+        CancelDwellAction("manual_direct");
+
+        CancelStopAndLookMission("manual_direct");
+
+        CancelStopAndLookMission("manual_direct");
+
+        if (controller != null)
+        {
+            controller.StopController();
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = true;
+            directBypassInput.receiverEnabled = true;
+        }
+
+        recoveryReady = false;
+
+        SetState(
+            MiniROVMissionState.RunningGamepadTest,
+            "manual_direct_mode_enabled"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy API expected by old UDP/manual receiver/editor scripts.
+    // ------------------------------------------------------------------
+
+    public bool CanStartMission()
+    {
+        if (!missionManagerEnabled || !missionEnabled)
+        {
+            lastEvent = "can_start_false_manager_disabled";
+            return false;
+        }
+
+        if (missionState == MiniROVMissionState.Fault)
+        {
+            lastEvent = "can_start_false_fault";
+            return false;
+        }
+
+        if (missionState == MiniROVMissionState.ReturningHome)
+        {
+            lastEvent = "can_start_false_returning_home";
+            return false;
+        }
+
+        return true;
+    }
+
+    public void StartGamepadManualTest()
+    {
+        EnableManualDirectMode();
+        lastEvent = "running_gamepad_test_started";
+    }
+
+    public void RequestReturnToRecovery()
+    {
+        ReturnHome();
+        lastEvent = "legacy_request_return_to_recovery";
+    }
+
+    public void StopMissionAndSetRecoveryReady()
+    {
+        AutoFindReferences();
+
+        if (controller != null)
+        {
+            controller.StartHoldCurrentPose();
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.receiverEnabled = false;
+            directBypassInput.enabled = false;
+        }
+
+        recoveryReady = true;
+
+        SetState(
+            MiniROVMissionState.RecoveryReady,
+            "legacy_stop_mission_recovery_ready"
+        );
+    }
+
+    public void PrepareForRecovery()
+    {
+        StopMissionAndSetRecoveryReady();
+    }
+
+    public void StartMissionFromBridge(Vector3 recoveryPointWorld)
+    {
+        AutoFindReferences();
+
+        if (pathPlanner != null)
+        {
+            pathPlanner.homeWorld = recoveryPointWorld;
+            pathPlanner.homeDepthM =
+                controller != null
+                    ? controller.depthM
+                    : pathPlanner.homeDepthM;
+
+            pathPlanner.homeSet = true;
+        }
+
+        StartSelectedMission();
+
+        lastEvent = "mission_started_from_bridge";
+    }
+
+    // ------------------------------------------------------------------
+
+    private MIMISKMiniROVPathPlanner.MiniROVPathType ConvertActionToPathType(
+        MiniROVMissionAction action)
+    {
+        if (action == MiniROVMissionAction.GoToPoint)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.GoToPoint;
+        }
+
+        if (action == MiniROVMissionAction.LineOutAndBack ||
+            action == MiniROVMissionAction.FollowTrajectory ||
+            action == MiniROVMissionAction.FollowSelectedTrajectory ||
+            action == MiniROVMissionAction.Trajectory ||
+            action == MiniROVMissionAction.AutonomousTrajectory)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.LineOutAndBack;
+        }
+
+        if (action == MiniROVMissionAction.Square)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.Square;
+        }
+
+        if (action == MiniROVMissionAction.LawnmowerSurvey)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.LawnmowerSurvey;
+        }
+
+        if (action == MiniROVMissionAction.CircleInspection)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.CircleInspection;
+        }
+
+        if (action == MiniROVMissionAction.SpiralSearch)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.SpiralSearch;
+        }
+
+        if (action == MiniROVMissionAction.HelixInspection)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.HelixInspection;
+        }
+
+        if (action == MiniROVMissionAction.FigureEight)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.FigureEight;
+        }
+
+        if (action == MiniROVMissionAction.ReturnHome)
+        {
+            return MIMISKMiniROVPathPlanner.MiniROVPathType.ReturnHome;
+        }
+
+        return MIMISKMiniROVPathPlanner.MiniROVPathType.StationHold;
+    }
+
+
+    public void StartMissionAction(MiniROVMissionAction action)
+    {
+        AutoFindReferences();
+
+        selectedMissionAction = action;
+
+        if (action == MiniROVMissionAction.GamepadManualTest)
+        {
+            EnableManualDirectMode();
+            return;
+        }
+
+        if (action == MiniROVMissionAction.ReturnHome)
+        {
+            ReturnHome();
+            return;
+        }
+
+        if (action == MiniROVMissionAction.StationHold ||
+            action == MiniROVMissionAction.None)
+        {
+            HoldCurrentPose();
+            return;
+        }
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "start_action_failed_missing_path_planner"
+            );
+
+            return;
+        }
+
+        pathPlanner.selectedPathType =
+            ConvertActionToPathType(action);
+
+        StartPlannerSelectedPath();
+    }
+
+    private void StartPlannerSelectedPath()
+    {
+        AutoFindReferences();
+
+        CancelDwellAction("new_planner_mission");
+
+        if (pathPlanner == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "planner_start_failed_missing_path_planner"
+            );
+
+            return;
+        }
+
+        if (pathPlanner.selectedPathType ==
+            MIMISKMiniROVPathPlanner.MiniROVPathType.StationHold)
+        {
+            HoldCurrentPose();
+            lastEvent = "planner_station_hold_started";
+            return;
+        }
+
+        if (pathPlanner.selectedPathType ==
+            MIMISKMiniROVPathPlanner.MiniROVPathType.StopAndLookInspection)
+        {
+            SetState(
+                MiniROVMissionState.StationHolding,
+                "stop_and_look_deprecated_use_path_then_dwell_action"
+            );
+
+            if (controller != null)
+            {
+                controller.StartHoldCurrentPose();
+            }
+
+            Debug.LogWarning("[MIMISK MiniROV MissionManager] StopAndLookInspection is deprecated. Run a normal path mission, then call DwellAtCurrentPose.");
+            return;
+        }
+
+        CancelStopAndLookMission("new_non_stoplook_mission");
+
+        CancelStopAndLookMission("new_non_stoplook_mission");
+
+        if (pathPlanner.selectedPathType ==
+            MIMISKMiniROVPathPlanner.MiniROVPathType.ReturnHome)
+        {
+            ReturnHome();
+            return;
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        recoveryReady = false;
+
+        pathPlanner.StartSelectedPlan();
+
+        if (controller == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "planner_start_failed_missing_controller"
+            );
+
+            return;
+        }
+
+        if (pathPlanner.lastEvent.StartsWith("polyline_failed") ||
+            pathPlanner.lastEvent.StartsWith("circle_failed") ||
+            pathPlanner.lastEvent.StartsWith("go_to_point_failed") ||
+            pathPlanner.lastEvent.StartsWith("return_home_failed"))
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "planner_start_failed_" + pathPlanner.lastEvent
+            );
+
+            Debug.LogError("[MIMISK MiniROV MissionManager] Planner failed: " + pathPlanner.lastEvent);
+            return;
+        }
+
+        SetState(
+            MiniROVMissionState.ExecutingMission,
+            "planner_selected_mission_started_" +
+            pathPlanner.selectedPathType.ToString()
+        );
+
+        Debug.Log("[MIMISK MiniROV MissionManager] Started planner mission: " + pathPlanner.selectedPathType);
+    }
+
+    private bool IsStopAndLookState()
+    {
+        return
+            missionState == MiniROVMissionState.StopAndLookMoving ||
+            missionState == MiniROVMissionState.StopAndLookSettling ||
+            missionState == MiniROVMissionState.StopAndLookDwelling;
+    }
+
+    private void CancelStopAndLookMission(string reason)
+    {
+        if (!stopLookActive &&
+            stopLookPhase != null &&
+            stopLookPhase.StartsWith("cancelled_"))
+        {
+            return;
+        }
+
+        stopLookActive = false;
+        stopLookMissionWaypoints = null;
+        stopLookCurrentIndex = -1;
+        stopLookTotalWaypoints = 0;
+
+        stopLookDwellTimerS = 0.0f;
+        stopLookSettleTimerS = 0.0f;
+        stopLookDwellPauseTimerS = 0.0f;
+        stopLookReadyToDwell = false;
+
+        stopLookPhase = "cancelled_" + reason;
+        stopLookSettleStatus = "cancelled";
+        stopLookCancelReason = reason;
+
+        lastEvent = "stop_look_cancelled_" + reason;
+    }
+
+    private void AdvanceStopLookToNextOrComplete(string reason)
+    {
+        stopLookDwellTimerS = 0.0f;
+        stopLookSettleTimerS = 0.0f;
+        stopLookDwellPauseTimerS = 0.0f;
+        stopLookReadyToDwell = false;
+
+        if (reason.Contains("timeout") || reason.Contains("unsettled"))
+        {
+            stopLookSkippedWaypoints++;
+            stopLookSettleStatus = reason;
+        }
+
+        stopLookCurrentIndex++;
+
+        if (stopLookCurrentIndex >= stopLookTotalWaypoints)
+        {
+            CompleteStopAndLookMission();
+        }
+        else
+        {
+            StartStopLookMoveToCurrentWaypoint();
+        }
+    }
+
+    private void StartStopAndLookMission()
+    {
+        AutoFindReferences();
+
+        CancelStopAndLookMission("restart_stop_look");
+
+        CancelStopAndLookMission("restart_stop_look");
+
+        if (pathPlanner == null || controller == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "stop_look_failed_missing_references"
+            );
+
+            return;
+        }
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        pathPlanner.StartStopAndLookPlan();
+
+        stopLookMissionWaypoints =
+            pathPlanner.stopLookWaypoints;
+
+        stopLookTotalWaypoints =
+            stopLookMissionWaypoints != null
+                ? stopLookMissionWaypoints.Length
+                : 0;
+
+        if (stopLookMissionWaypoints == null ||
+            stopLookMissionWaypoints.Length == 0)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "stop_look_failed_no_waypoints"
+            );
+
+            return;
+        }
+
+        stopLookActive = true;
+        stopLookCurrentIndex = 0;
+        stopLookDwellTimerS = 0.0f;
+        stopLookPhase = "moving";
+
+        recoveryReady = false;
+
+        StartStopLookMoveToCurrentWaypoint();
+
+        SetState(
+            MiniROVMissionState.StopAndLookMoving,
+            "stop_look_started_" +
+            stopLookTotalWaypoints.ToString() +
+            "_waypoints"
+        );
+    }
+
+    private void StartStopLookMoveToCurrentWaypoint()
+    {
+        if (controller == null ||
+            stopLookMissionWaypoints == null ||
+            stopLookCurrentIndex < 0 ||
+            stopLookCurrentIndex >= stopLookMissionWaypoints.Length)
+        {
+            return;
+        }
+
+        Vector3 wp =
+            stopLookMissionWaypoints[stopLookCurrentIndex];
+
+        controller.targetPointWorld =
+            wp;
+
+        controller.targetPointDepthM =
+            DepthFromWorldY(wp.y);
+
+        controller.goToPointStopAtTarget =
+            true;
+
+        controller.allowIndependentYawWhileMoving =
+            false;
+
+        controller.yawReferenceMode =
+            MIMISKMiniROVPlantBasedController.YawReferenceMode.TravelHeading;
+
+        controller.hasFinalYawReference =
+            false;
+
+        controller.StartController(
+            MIMISKMiniROVPlantBasedController.ControlMode.GoToPoint
+        );
+
+        stopLookPhase =
+            "moving_to_" + stopLookCurrentIndex.ToString();
+
+        SetState(
+            MiniROVMissionState.StopAndLookMoving,
+            stopLookPhase
+        );
+    }
+
+    private void UpdateStopAndLookMission()
+    {
+        if (!stopLookActive)
+        {
+            return;
+        }
+
+        // Stop-and-Look should only run while the manager is in one of its own phases.
+        // ReturnHome, Abort, ManualDirect, StopController, etc. must preempt it.
+        if (!IsStopAndLookState())
+        {
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.StopAndLookMoving)
+        {
+            bool arrived =
+                controller != null &&
+                controller.missionCompleted &&
+                controller.controlMode ==
+                    MIMISKMiniROVPlantBasedController.ControlMode.StationHold;
+
+            if (arrived)
+            {
+                StartStopLookDwellAtCurrentWaypoint();
+            }
+
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.StopAndLookSettling)
+        {
+            stopLookSettleTimerS += Time.deltaTime;
+
+            if (IsStopLookSettled())
+            {
+                BeginStopLookDwell();
+                return;
+            }
+
+            if (stopLookSettleTimerS >= Mathf.Max(0.5f, stopLookMaxSettleSeconds))
+            {
+                if (stopLookSkipUnsettledWaypointOnTimeout)
+                {
+                    stopLookSettleStatus = "settle_timeout_skipped";
+                    AdvanceStopLookToNextOrComplete("settle_timeout_skipped");
+                    return;
+                }
+
+                if (stopLookProceedAfterSettleTimeout)
+                {
+                    stopLookSettleStatus = "settle_timeout_accepted";
+                    BeginStopLookDwell();
+                    return;
+                }
+
+                stopLookSettleStatus = "settle_timeout_holding";
+            }
+
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.StopAndLookDwelling)
+        {
+            bool settled =
+                IsStopLookSettled();
+
+            if (stopLookPauseDwellIfUnsettled && !settled)
+            {
+                stopLookDwellPauseTimerS += Time.deltaTime;
+                stopLookSettleStatus = "dwell_paused_not_settled";
+
+                if (stopLookDwellPauseTimerS >= Mathf.Max(0.5f, stopLookMaxDwellPauseSeconds))
+                {
+                    if (stopLookSkipUnsettledWaypointOnTimeout)
+                    {
+                        AdvanceStopLookToNextOrComplete("dwell_unsettled_timeout_skipped");
+                        return;
+                    }
+
+                    stopLookSettleStatus = "dwell_unsettled_timeout_accepted";
+                }
+
+                return;
+            }
+
+            stopLookDwellPauseTimerS = 0.0f;
+            stopLookSettleStatus =
+                settled
+                    ? "dwelling_settled"
+                    : "dwelling_unsettled_allowed";
+
+            stopLookDwellTimerS += Time.deltaTime;
+
+            if (stopLookDwellTimerS >=
+                Mathf.Max(0.1f, pathPlanner.stopLookDwellSeconds))
+            {
+                AdvanceStopLookToNextOrComplete("dwell_complete");
+            }
+        }
+    }
+
+    private void StartStopLookDwellAtCurrentWaypoint()
+    {
+        StartStopLookSettleAtCurrentWaypoint();
+    }
+
+    private void StartStopLookSettleAtCurrentWaypoint()
+    {
+        if (controller == null || pathPlanner == null)
+        {
+            return;
+        }
+
+        stopLookCurrentTargetYawDeg =
+            ComputeStopLookYawDeg();
+
+        if (stopLookTightenStationHoldDeadband)
+        {
+            controller.stationHoldDeadbandM =
+                Mathf.Min(
+                    controller.stationHoldDeadbandM,
+                    stopLookInspectionDeadbandM
+                );
+        }
+
+        controller.StartHoldCurrentPoseWithYaw(
+            stopLookCurrentTargetYawDeg
+        );
+
+        stopLookDwellTimerS = 0.0f;
+        stopLookSettleTimerS = 0.0f;
+        stopLookReadyToDwell = false;
+        stopLookSettleStatus = "settling";
+
+        stopLookPhase =
+            "settling_at_" + stopLookCurrentIndex.ToString();
+
+        if (stopLookRequireSettleBeforeDwell)
+        {
+            SetState(
+                MiniROVMissionState.StopAndLookSettling,
+                stopLookPhase
+            );
+        }
+        else
+        {
+            BeginStopLookDwell();
+        }
+    }
+
+    private void BeginStopLookDwell()
+    {
+        stopLookDwellTimerS = 0.0f;
+        stopLookReadyToDwell = true;
+        stopLookSettleStatus = "ready";
+
+        stopLookPhase =
+            "dwelling_at_" + stopLookCurrentIndex.ToString();
+
+        SetState(
+            MiniROVMissionState.StopAndLookDwelling,
+            stopLookPhase
+        );
+    }
+
+    private bool IsStopLookSettled()
+    {
+        if (controller == null)
+        {
+            return false;
+        }
+
+        bool stationOk =
+            controller.stationHoldErrorM <= stopLookStationToleranceM;
+
+        bool yawOk =
+            Mathf.Abs(controller.yawErrorDeg) <= stopLookYawToleranceDeg;
+
+        bool speedOk =
+            currentSpeedMS <= stopLookSpeedToleranceMS;
+
+        return stationOk && yawOk && speedOk;
+    }
+
+    private void CompleteStopAndLookMission()
+    {
+        stopLookActive =
+            false;
+
+        stopLookPhase =
+            "complete";
+
+        if (controller != null)
+        {
+            controller.missionCompleted = true;
+            controller.completionReason = "stop_and_look_complete";
+            controller.StartHoldCurrentPoseWithCurrentYaw();
+        }
+
+        SetState(
+            MiniROVMissionState.StationHolding,
+            "stop_and_look_complete"
+        );
+    }
+
+    private float ComputeStopLookYawDeg()
+    {
+        if (pathPlanner == null || controller == null)
+        {
+            return 0.0f;
+        }
+
+        if (pathPlanner.stopLookYawPolicy ==
+            MIMISKMiniROVPathPlanner.StopLookYawPolicy.FixedYaw)
+        {
+            return pathPlanner.stopLookFixedYawDeg;
+        }
+
+        if (pathPlanner.stopLookYawPolicy ==
+            MIMISKMiniROVPathPlanner.StopLookYawPolicy.FaceHome)
+        {
+            return YawToPoint(pathPlanner.homeWorld);
+        }
+
+        if (pathPlanner.stopLookYawPolicy ==
+            MIMISKMiniROVPathPlanner.StopLookYawPolicy.FacePoint)
+        {
+            Vector3 facePoint =
+                pathPlanner.stopLookUseHomeAsFacePoint
+                    ? pathPlanner.homeWorld
+                    : pathPlanner.stopLookFacePointWorld;
+
+            return YawToPoint(facePoint);
+        }
+
+        if (pathPlanner.stopLookYawPolicy ==
+            MIMISKMiniROVPathPlanner.StopLookYawPolicy.FacePathCenter)
+        {
+            return YawToPoint(ComputeStopLookPathCenter());
+        }
+
+        return controller.yawDeg;
+    }
+
+    private Vector3 ComputeStopLookPathCenter()
+    {
+        if (stopLookMissionWaypoints == null ||
+            stopLookMissionWaypoints.Length == 0)
+        {
+            return rb != null
+                ? rb.position
+                : transform.position;
+        }
+
+        Vector3 sum =
+            Vector3.zero;
+
+        for (int i = 0; i < stopLookMissionWaypoints.Length; i++)
+        {
+            sum += stopLookMissionWaypoints[i];
+        }
+
+        return sum / stopLookMissionWaypoints.Length;
+    }
+
+    private float YawToPoint(Vector3 point)
+    {
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        float dx =
+            point.x - p.x;
+
+        float dz =
+            point.z - p.z;
+
+        if (Mathf.Sqrt(dx * dx + dz * dz) < 0.01f)
+        {
+            return controller != null
+                ? controller.yawDeg
+                : transform.eulerAngles.y;
+        }
+
+        return Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+    }
+
+    private float DepthFromWorldY(float worldY)
+    {
+        if (controller == null)
+        {
+            return -worldY;
+        }
+
+        return controller.depthPositiveDown
+            ? controller.waterLevelY - worldY
+            : worldY - controller.waterLevelY;
+    }
+
+    [ContextMenu("Start Dwell At Current Pose")]
+    public void StartDwellAtCurrentPose()
+    {
+        AutoFindReferences();
+
+        CancelStopAndLookMissionIfAvailable("dwell_started");
+        CancelDwellAction("restart_dwell");
+
+        if (directBypassInput != null)
+        {
+            directBypassInput.enabled = false;
+            directBypassInput.receiverEnabled = false;
+        }
+
+        if (controller == null)
+        {
+            SetState(
+                MiniROVMissionState.Fault,
+                "dwell_failed_missing_controller"
+            );
+
+            return;
+        }
+
+        dwellTargetYawDeg =
+            ResolveDwellYawDeg();
+
+        controller.StartHoldCurrentPoseWithYaw(
+            dwellTargetYawDeg
+        );
+
+        dwellActionActive = true;
+        dwellTimerS = 0.0f;
+        dwellSettleTimerS = 0.0f;
+        dwellPhase = "settling";
+        dwellCancelReason = "none";
+
+        if (dwellRequireSettleBeforeTimer)
+        {
+            SetState(
+                MiniROVMissionState.DwellSettling,
+                "dwell_settling"
+            );
+        }
+        else
+        {
+            BeginDwellTimer();
+        }
+    }
+
+    public void StartDwellAtCurrentPose(
+        float seconds,
+        DwellYawPolicy yawPolicy)
+    {
+        dwellSeconds = Mathf.Max(0.1f, seconds);
+        dwellYawPolicy = yawPolicy;
+        StartDwellAtCurrentPose();
+    }
+
+    [ContextMenu("Cancel Dwell")]
+    public void CancelDwellFromInspector()
+    {
+        CancelDwellAction("user_cancel");
+        HoldCurrentPose();
+    }
+
+    private void CancelDwellAction(string reason)
+    {
+        dwellActionActive = false;
+        dwellTimerS = 0.0f;
+        dwellSettleTimerS = 0.0f;
+        dwellPhase = "cancelled_" + reason;
+        dwellCancelReason = reason;
+    }
+
+    private void BeginDwellTimer()
+    {
+        dwellTimerS = 0.0f;
+        dwellSettleTimerS = 0.0f;
+        dwellPhase = "dwelling";
+
+        SetState(
+            MiniROVMissionState.Dwelling,
+            "dwell_started"
+        );
+    }
+
+    private void UpdateDwellAction()
+    {
+        if (!dwellActionActive)
+        {
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.DwellSettling)
+        {
+            dwellSettleTimerS += Time.deltaTime;
+
+            if (IsDwellSettled() ||
+                dwellSettleTimerS >= Mathf.Max(0.5f, dwellMaxSettleSeconds))
+            {
+                BeginDwellTimer();
+            }
+
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.Dwelling)
+        {
+            dwellTimerS += Time.deltaTime;
+
+            if (dwellTimerS >= Mathf.Max(0.1f, dwellSeconds))
+            {
+                dwellActionActive = false;
+                dwellPhase = "complete";
+
+                if (controller != null)
+                {
+                    controller.StartHoldCurrentPoseWithYaw(
+                        dwellTargetYawDeg
+                    );
+
+                    controller.missionCompleted = true;
+                    controller.completionReason = "dwell_complete";
+                }
+
+                SetState(
+                    MiniROVMissionState.StationHolding,
+                    "dwell_complete"
+                );
+            }
+        }
+    }
+
+    private bool IsDwellSettled()
+    {
+        if (controller == null)
+        {
+            return false;
+        }
+
+        bool stationOk =
+            controller.stationHoldErrorM <= dwellStationToleranceM;
+
+        bool yawOk =
+            Mathf.Abs(controller.yawErrorDeg) <= dwellYawToleranceDeg;
+
+        bool speedOk =
+            currentSpeedMS <= dwellSpeedToleranceMS;
+
+        return stationOk && yawOk && speedOk;
+    }
+
+    private float ResolveDwellYawDeg()
+    {
+        AutoFindReferences();
+
+        if (controller == null)
+        {
+            return transform.eulerAngles.y;
+        }
+
+        if (dwellYawPolicy == DwellYawPolicy.CurrentYaw)
+        {
+            return controller.yawDeg;
+        }
+
+        if (dwellYawPolicy == DwellYawPolicy.FixedYaw)
+        {
+            return dwellFixedYawDeg;
+        }
+
+        if (dwellYawPolicy == DwellYawPolicy.FaceHome &&
+            pathPlanner != null &&
+            pathPlanner.homeSet)
+        {
+            return YawToPoint(pathPlanner.homeWorld);
+        }
+
+        if (dwellYawPolicy == DwellYawPolicy.FacePoint)
+        {
+            return YawToPoint(dwellFacePointWorld);
+        }
+
+        return controller.yawDeg;
+    }
+
+    private float YawToPoint(Vector3 point)
+    {
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        float dx =
+            point.x - p.x;
+
+        float dz =
+            point.z - p.z;
+
+        if (Mathf.Sqrt(dx * dx + dz * dz) < 0.01f)
+        {
+            return controller != null
+                ? controller.yawDeg
+                : transform.eulerAngles.y;
+        }
+
+        return Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+    }
+
+    private void CancelStopAndLookMissionIfAvailable(string reason)
+    {
+        stopLookActive = false;
+        stopLookMissionWaypoints = null;
+        stopLookCurrentIndex = -1;
+        stopLookTotalWaypoints = 0;
+        stopLookDwellTimerS = 0.0f;
+        stopLookSettleTimerS = 0.0f;
+        stopLookReadyToDwell = false;
+        stopLookPhase = "deprecated_cancelled_" + reason;
+        stopLookCancelReason = reason;
+    }
+
+    private void RefreshState()
+    {
+        if (pathPlanner != null && pathPlanner.homeSet && rb != null)
+        {
+            Vector3 p = rb.position;
+
+            float dx = pathPlanner.homeWorld.x - p.x;
+            float dz = pathPlanner.homeWorld.z - p.z;
+
+            float depth =
+                controller != null
+                    ? controller.depthM
+                    : 0.0f;
+
+            float dd = pathPlanner.homeDepthM - depth;
+
+            distanceToHomeM =
+                Mathf.Sqrt(dx * dx + dz * dz + dd * dd);
+        }
+
+        currentSpeedMS =
+            rb != null
+                ? rb.linearVelocity.magnitude
+                : 0.0f;
+
+        if (missionState == MiniROVMissionState.ReturningHome)
+        {
+            bool controllerCompleted =
+                controller != null &&
+                controller.missionCompleted &&
+                controller.controlMode ==
+                    MIMISKMiniROVPlantBasedController.ControlMode.StationHold;
+
+            bool yawReady =
+                !recoveryReadyRequiresYawZero ||
+                controller == null ||
+                Mathf.Abs(
+                    Mathf.DeltaAngle(
+                        controller.yawDeg,
+                        0.0f
+                    )
+                ) <= recoveryReadyYawToleranceDeg;
+
+            if (controllerCompleted &&
+                distanceToHomeM <= recoveryReadyRadiusM &&
+                currentSpeedMS <= recoveryReadySpeedMS &&
+                yawReady)
+            {
+                recoveryReady = true;
+
+                SetState(
+                    MiniROVMissionState.RecoveryReady,
+                    "recovery_ready_yaw_zero"
+                );
+            }
+        }
+
+        if (dwellActionActive)
+        {
+            UpdateDwellAction();
+        }
+
+        if (stopLookActive)
+        {
+            UpdateStopAndLookMission();
+        }
+
+        if (controller != null &&
+            controller.missionCompleted &&
+            missionState == MiniROVMissionState.ExecutingMission)
+        {
+            SetState(
+                MiniROVMissionState.StationHolding,
+                "mission_completed_" + controller.completionReason
+            );
+        }
+
+        RefreshMissionActiveFlag();
+    }
+
+    private void SetState(
+        MiniROVMissionState newState,
+        string eventText)
+    {
+        missionState = newState;
+        lastEvent = eventText;
+        RefreshMissionActiveFlag();
+    }
+
+    private void RefreshMissionActiveFlag()
+    {
+        missionActive =
+            missionState != MiniROVMissionState.Idle &&
+            missionState != MiniROVMissionState.Fault &&
+            missionState != MiniROVMissionState.RecoveryReady;
+
+        if (missionState == MiniROVMissionState.RecoveryReady)
+        {
+            recoveryReady = true;
+        }
+    }
+
+    private void InvokeIfExists(object target, string methodName)
+    {
+        if (target == null || string.IsNullOrEmpty(methodName))
+        {
+            return;
+        }
+
+        MethodInfo m =
+            target.GetType().GetMethod(
+                methodName,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (m == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (m.GetParameters().Length == 0)
+            {
+                m.Invoke(target, null);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

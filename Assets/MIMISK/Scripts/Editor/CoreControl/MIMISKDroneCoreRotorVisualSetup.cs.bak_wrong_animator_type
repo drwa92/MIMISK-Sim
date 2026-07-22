@@ -1,0 +1,71 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneCoreRotorVisualSetup
+{
+    [MenuItem("MIMISK/Drone/Core Control/Setup Core Rotor Visual Animation")]
+    public static void SetupRotorVisualAnimation()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+            return;
+        }
+
+        MIMISKDroneCoreRotorController core =
+            drone.GetComponent<MIMISKDroneCoreRotorController>();
+
+        if (core == null)
+        {
+            Debug.LogError("[MIMISK] Core Rotor Controller missing. Run Core Control setup first.");
+            return;
+        }
+
+        MIMISKDroneCoreRotorVisualAnimator anim =
+            drone.GetComponent<MIMISKDroneCoreRotorVisualAnimator>();
+
+        if (anim == null)
+        {
+            anim = drone.AddComponent<MIMISKDroneCoreRotorVisualAnimator>();
+        }
+
+        anim.coreController = core;
+        anim.animateRotors = true;
+        SetRotorSpinAxes(anim, Vector3.forward);
+        anim.idleRpm = 900.0f;
+        anim.maxRpm = 6500.0f;
+        anim.visualResponseRate = 10.0f;
+
+        anim.AutoFindPropellerTransforms();
+
+        EditorUtility.SetDirty(anim);
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] Core rotor visual animation configured. If a rotor field is empty, assign the propeller mesh manually.");
+    }
+
+    private static void SetRotorSpinAxes(
+        MIMISKDroneCoreRotorAnimator anim,
+        Vector3 axis)
+    {
+        if (anim == null)
+        {
+            return;
+        }
+
+        if (anim.rotorFL != null) anim.rotorFL.localSpinAxis = axis;
+        if (anim.rotorFR != null) anim.rotorFR.localSpinAxis = axis;
+        if (anim.rotorRL != null) anim.rotorRL.localSpinAxis = axis;
+        if (anim.rotorRR != null) anim.rotorRR.localSpinAxis = axis;
+    }
+
+}

@@ -1,0 +1,1248 @@
+using System;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.EventSystems;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem.UI;
+#endif
+using UnityEngine.UI;
+
+[DisallowMultipleComponent]
+public class MIMISKMissionControlDashboard : MonoBehaviour
+{
+    [Header("Dashboard")]
+    public bool dashboardEnabled = true;
+    public bool buildOnStart = true;
+    public bool autoFindOnStart = true;
+    public bool autoFindPeriodically = true;
+    public float autoFindPeriodS = 2.0f;
+
+    [Header("Agent / Manager References")]
+    public MonoBehaviour droneAgent;
+    public MonoBehaviour tetherAgent;
+    public MonoBehaviour miniRovAgent;
+
+    public MonoBehaviour unifiedTether;
+    public MonoBehaviour lowLevelTether;
+    public MonoBehaviour smartWinch;
+    public MonoBehaviour tetherResearchLogger;
+    public MonoBehaviour tetherVisual;
+
+    public MonoBehaviour droneFlightManager;
+    public MonoBehaviour droneMissionManager;
+    public MonoBehaviour droneCoreController;
+
+    public MonoBehaviour miniRovMissionManager;
+    public MonoBehaviour miniRovPathPlanner;
+    public MonoBehaviour miniRovController;
+
+    public MonoBehaviour cameraSwitcher;
+
+    [Header("Camera Switching")]
+    public Camera droneFollowCamera;
+    public Camera rovFollowCamera;
+    public Camera rovFrontCamera;
+
+    public string droneFollowCameraName = "DroneFollowCamera";
+    public string rovFollowCameraName = "FollowCamera";
+    public string rovFrontCameraName = "FrontCamera";
+
+    public bool switchUnityMainCamera = true;
+    public bool manageAudioListeners = true;
+
+    public string currentCameraView = "DroneFollowCamera";
+
+    [Header("UI")]
+    public Canvas canvas;
+    public Font uiFont;
+
+    private Text clockText;
+    private Text modeText;
+    private Text droneStatusText;
+    private Text rovStatusText;
+    private Text tetherStatusText;
+    private Text environmentText;
+    private Text mainViewOverlayText;
+    private Text cameraPayloadText;
+    private Text missionControlsText;
+    private Text telemetryText;
+    private Text alertsText;
+    private Text bottomStatusText;
+    private Text logText;
+
+    private float autoFindTimerS;
+
+    private Color bg = new Color(0.015f, 0.030f, 0.045f, 0.88f);
+    private Color panel = new Color(0.030f, 0.060f, 0.085f, 0.78f);
+    private Color panel2 = new Color(0.020f, 0.045f, 0.070f, 0.82f);
+    private Color blue = new Color(0.02f, 0.33f, 0.70f, 0.95f);
+    private Color green = new Color(0.08f, 0.50f, 0.16f, 0.95f);
+    private Color yellow = new Color(0.92f, 0.62f, 0.05f, 0.95f);
+    private Color red = new Color(0.86f, 0.10f, 0.10f, 0.95f);
+    private Color white = new Color(0.88f, 0.94f, 1.0f, 1.0f);
+    private Color muted = new Color(0.55f, 0.68f, 0.78f, 1.0f);
+
+    private void Awake()
+    {
+        if (autoFindOnStart)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    private void Start()
+    {
+        if (buildOnStart)
+        {
+            BuildDashboard();
+        }
+    }
+
+    private void Update()
+    {
+        if (!dashboardEnabled)
+        {
+            if (canvas != null)
+            {
+                canvas.enabled = false;
+            }
+
+            return;
+        }
+
+        if (canvas != null)
+        {
+            canvas.enabled = true;
+        }
+
+        if (autoFindPeriodically)
+        {
+            autoFindTimerS += Time.unscaledDeltaTime;
+
+            if (autoFindTimerS >= autoFindPeriodS)
+            {
+                autoFindTimerS = 0.0f;
+                AutoFindReferences();
+            }
+        }
+
+        UpdateDashboardText();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (droneAgent == null) droneAgent = FindBehaviourByTypeName("MIMISKDroneAgent");
+        if (tetherAgent == null) tetherAgent = FindBehaviourByTypeName("MIMISKTetherAgent");
+        if (miniRovAgent == null) miniRovAgent = FindBehaviourByTypeName("MIMISKMiniROVAgent");
+
+        if (unifiedTether == null) unifiedTether = FindBehaviourByTypeName("MIMISKUnifiedTetherManager");
+        if (lowLevelTether == null) lowLevelTether = FindBehaviourByTypeName("MIMISKDroneCoreTetherManager");
+        if (smartWinch == null) smartWinch = FindBehaviourByTypeName("MIMISKTetherSmartWinchController");
+        if (tetherResearchLogger == null) tetherResearchLogger = FindBehaviourByTypeName("MIMISKUnifiedTetherResearchLogger");
+        if (tetherVisual == null) tetherVisual = FindBehaviourByTypeName("MIMISKSingleYellowTetherVisualAuthority");
+
+        if (droneFlightManager == null) droneFlightManager = FindBehaviourByTypeName("MIMISKDroneCoreFlightModeManager");
+        if (droneMissionManager == null) droneMissionManager = FindBehaviourByTypeName("MIMISKDroneCoreMissionManager");
+        if (droneCoreController == null) droneCoreController = FindBehaviourByTypeName("MIMISKDroneCoreRotorController");
+
+        if (miniRovMissionManager == null) miniRovMissionManager = FindBehaviourByTypeName("MIMISKMiniROVMissionManager");
+        if (miniRovPathPlanner == null) miniRovPathPlanner = FindBehaviourByTypeName("MIMISKMiniROVPathPlanner");
+        if (miniRovController == null) miniRovController = FindBehaviourByTypeName("MIMISKMiniROVPlantBasedController");
+
+        if (cameraSwitcher == null) cameraSwitcher = FindBehaviourByTypeName("MIMISKCameraViewSwitcher");
+
+        if (droneFollowCamera == null)
+        {
+            droneFollowCamera = FindCameraByName(droneFollowCameraName);
+        }
+
+        if (rovFollowCamera == null)
+        {
+            rovFollowCamera = FindCameraByName(rovFollowCameraName);
+        }
+
+        if (rovFollowCamera == null)
+        {
+            rovFollowCamera = FindCameraByName("MiniROVFollowCamera");
+        }
+
+        if (rovFrontCamera == null)
+        {
+            rovFrontCamera = FindCameraByName(rovFrontCameraName);
+        }
+
+        if (rovFrontCamera == null)
+        {
+            rovFrontCamera = FindCameraByName("MiniROVFrontCamera");
+        }
+    }
+
+    [ContextMenu("Build Dashboard")]
+    public void BuildDashboard()
+    {
+        EnsureEventSystem();
+
+        if (canvas == null)
+        {
+            GameObject canvasGo = new GameObject("MIMISK_MissionControlDashboard_Canvas");
+            canvasGo.transform.SetParent(transform, false);
+
+            canvas = canvasGo.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 5000;
+
+            CanvasScaler scaler = canvasGo.AddComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1920.0f, 1080.0f);
+            scaler.matchWidthOrHeight = 0.5f;
+
+            canvasGo.AddComponent<GraphicRaycaster>();
+        }
+
+        if (uiFont == null)
+        {
+            uiFont = ResolveRuntimeFont();
+        }
+
+        ClearCanvasChildren();
+
+        GameObject root = CreatePanel("DashboardRoot", canvas.transform, 0, 0, 1920, 1080, new Color(0, 0, 0, 0.0f));
+
+        CreatePanel("TopBar", root.transform, 0, 0, 1920, 76, bg);
+        CreateText("Title", root.transform, 20, 12, 460, 34, "MIMISK SIMULATOR", 22, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        CreateText("Subtitle", root.transform, 20, 42, 520, 24, "Integrated drone-surface-tether-MiniROV operations", 13, FontStyle.Normal, muted, TextAnchor.MiddleLeft);
+
+        modeText = CreateText("ModeBadge", root.transform, 560, 20, 300, 34, "MODE: AUTONOMOUS", 15, FontStyle.Bold, Color.green, TextAnchor.MiddleLeft);
+        clockText = CreateText("SimClock", root.transform, 1160, 18, 300, 38, "Sim Time 00:00:00", 18, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        CreateButton(root.transform, 1460, 16, 190, 44, "EMERGENCY STOP", red, OnEmergencyStop);
+        CreateButton(root.transform, 1680, 16, 90, 44, "RESET", blue, OnResetFaults);
+        CreateButton(root.transform, 1780, 16, 120, 44, "HIDE UI", panel2, ToggleDashboard);
+
+        CreatePanel("LeftVehicles", root.transform, 10, 90, 270, 690, panel);
+        CreateText("VehiclesHeader", root.transform, 25, 105, 220, 24, "VEHICLE STATUS", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        droneStatusText = CreateText("DroneStatus", root.transform, 25, 140, 235, 270, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+        rovStatusText = CreateText("ROVStatus", root.transform, 25, 430, 235, 300, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+
+        CreatePanel("Environment", root.transform, 10, 795, 270, 205, panel);
+        CreateText("EnvHeader", root.transform, 25, 810, 220, 24, "ENVIRONMENT", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        environmentText = CreateText("EnvironmentText", root.transform, 25, 845, 235, 130, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+
+        CreatePanel("MainView", root.transform, 290, 90, 880, 610, new Color(0.02f, 0.06f, 0.09f, 0.18f));
+        CreateText("MainHeader", root.transform, 310, 105, 300, 24, "MAIN 3D VIEW / ACTIVE CAMERA", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        mainViewOverlayText = CreateText("MainOverlay", root.transform, 310, 625, 830, 60, "", 18, FontStyle.Bold, white, TextAnchor.MiddleRight);
+
+        CreatePanel("BottomTelemetry", root.transform, 290, 715, 880, 285, panel);
+        CreateText("BottomHeader", root.transform, 310, 730, 300, 24, "SYSTEM TELEMETRY", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        telemetryText = CreateText("TelemetryText", root.transform, 310, 765, 840, 210, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+
+        // Compact camera switching panel. The active Unity camera is the main 3D view,
+        // so we do not show a second small fake live-view window here.
+        CreatePanel("CameraSwitchPanel", root.transform, 1180, 90, 350, 170, panel);
+        CreateText("PayloadHeader", root.transform, 1200, 105, 300, 24, "CAMERA SWITCHING", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        CreateButton(root.transform, 1200, 142, 105, 34, "DRONE CAM", panel2, OnCameraDrone);
+        CreateButton(root.transform, 1310, 142, 105, 34, "ROV FOLLOW", panel2, OnCameraRovFollow);
+        CreateButton(root.transform, 1420, 142, 90, 34, "ROV FRONT", panel2, OnCameraRovFront);
+
+        CreateText(
+            "CameraSwitchHint",
+            root.transform,
+            1200,
+            186,
+            310,
+            48,
+            "Main 3D view follows the selected camera\nCurrent view is shown in telemetry",
+            13,
+            FontStyle.Normal,
+            muted,
+            TextAnchor.MiddleCenter
+        );
+
+        // Tether data moved to the bottom free area.
+        CreatePanel("TetherMetricsPanel", root.transform, 1180, 715, 350, 285, panel);
+        CreateText("TetherMetricsHeader", root.transform, 1200, 730, 300, 24, "TETHER / WINCH DATA", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        cameraPayloadText = CreateText("TetherMetricsText", root.transform, 1200, 762, 310, 215, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+
+        CreatePanel("Controls", root.transform, 1540, 90, 370, 610, panel);
+        CreateText("ControlsHeader", root.transform, 1560, 105, 300, 24, "MISSION CONTROLS", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        int bx = 1560;
+        int by = 145;
+        int bw = 155;
+        int bh = 40;
+        int gap = 10;
+
+        CreateButton(root.transform, bx, by, bw, bh, "LAND SURFACE", green, OnDroneLandSurface);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "DRONE HOLD", blue, OnDroneHold);
+
+        by += bh + gap;
+        CreateButton(root.transform, bx, by, bw, bh, "TAKEOFF", green, OnDroneTakeoff);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "FULL DRONE", blue, OnDroneFullMission);
+
+        by += bh + gap + 10;
+        CreateButton(root.transform, bx, by, bw, bh, "ATTACH ROV", yellow, OnTetherAttach);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "DEPLOY ROV", yellow, OnTetherDeploy);
+
+        by += bh + gap;
+        CreateButton(root.transform, bx, by, bw, bh, "ROV CONTROL", blue, OnTetherActivateRov);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "SMART TMS", blue, OnTetherSmartTms);
+
+        by += bh + gap;
+        CreateButton(root.transform, bx, by, bw, bh, "RECOVER ROV", yellow, OnTetherRecover);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "HOLD WINCH", panel2, OnTetherHoldWinch);
+
+        by += bh + gap + 10;
+        CreateButton(root.transform, bx, by, bw, bh, "ROV HOLD", green, OnMiniRovHold);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "ROV MISSION", blue, OnMiniRovMission);
+
+        by += bh + gap;
+        CreateButton(root.transform, bx, by, bw, bh, "ROV RETURN", yellow, OnMiniRovReturnHome);
+        CreateButton(root.transform, bx + 170, by, bw, bh, "ROV DWELL", panel2, OnMiniRovDwell);
+
+        missionControlsText = CreateText("MissionControlsText", root.transform, 1560, 560, 325, 120, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+
+        CreatePanel("Alerts", root.transform, 1540, 715, 370, 285, panel);
+        CreateText("AlertsHeader", root.transform, 1560, 730, 300, 24, "TELEMETRY / ALERTS", 16, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+        alertsText = CreateText("AlertsText", root.transform, 1560, 765, 325, 175, "", 13, FontStyle.Normal, white, TextAnchor.UpperLeft);
+        logText = CreateText("LogText", root.transform, 1560, 945, 325, 42, "", 12, FontStyle.Normal, muted, TextAnchor.UpperLeft);
+
+        CreatePanel("BottomBar", root.transform, 0, 1020, 1920, 60, bg);
+        bottomStatusText = CreateText("BottomStatus", root.transform, 20, 1032, 1500, 36, "", 14, FontStyle.Bold, white, TextAnchor.MiddleLeft);
+
+        UpdateDashboardText();
+    }
+
+    [ContextMenu("Rebuild Dashboard")]
+    public void RebuildDashboard()
+    {
+        if (canvas != null)
+        {
+            if (Application.isPlaying)
+            {
+                Destroy(canvas.gameObject);
+            }
+            else
+            {
+                DestroyImmediate(canvas.gameObject);
+            }
+
+            canvas = null;
+        }
+
+        BuildDashboard();
+    }
+
+    private Font ResolveRuntimeFont()
+    {
+        Font font = null;
+
+        try
+        {
+            font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        }
+        catch
+        {
+            font = null;
+        }
+
+        if (font != null)
+        {
+            return font;
+        }
+
+        try
+        {
+            font = Font.CreateDynamicFontFromOSFont("Arial", 14);
+        }
+        catch
+        {
+            font = null;
+        }
+
+        if (font != null)
+        {
+            return font;
+        }
+
+        try
+        {
+            font = Font.CreateDynamicFontFromOSFont("Liberation Sans", 14);
+        }
+        catch
+        {
+            font = null;
+        }
+
+        return font;
+    }
+
+    private void UpdateDashboardText()
+    {
+        if (clockText != null)
+        {
+            TimeSpan ts = TimeSpan.FromSeconds(Time.time);
+            clockText.text = "Sim Time " + ts.ToString(@"hh\:mm\:ss");
+        }
+
+        string droneFlight = ReadString(droneFlightManager, "flightMode", "missing");
+        string droneMission = ReadString(droneMissionManager, "missionState", "missing");
+        string droneControl = ReadString(droneCoreController, "controlMode", "missing");
+        Vector3 dronePos = ReadVector3(droneCoreController, "estimatedPositionWorld", transform.position);
+        Vector3 droneVel = ReadVector3(droneCoreController, "estimatedVelocityWorld", Vector3.zero);
+
+        string rovMission = ReadString(miniRovMissionManager, "missionState", "missing");
+        string rovPath = ReadString(miniRovPathPlanner, "selectedPathType", "missing");
+        string rovControl = ReadString(miniRovController, "controlMode", "missing");
+        float rovDepth = ComputeRovDepth();
+        float rovHome = ReadFloat(miniRovMissionManager, "distanceToHomeM", float.NaN);
+
+        string unifiedState = ReadString(unifiedTether, "tetherState", "missing");
+        string unifiedEvent = ReadString(unifiedTether, "lastEvent", "missing");
+        bool safeToDeploy = ReadBool(unifiedTether, "safeToDeploy", false);
+        bool droneMotionAllowed = ReadBool(unifiedTether, "droneMotionAllowed", true);
+        bool homeRecorded = ReadBool(unifiedTether, "deploymentHomeRecorded", false);
+        float distanceHome = ReadFloat(unifiedTether, "distanceToDeploymentHomeM", float.NaN);
+
+        string tetherState = ReadString(lowLevelTether, "tetherState", "missing");
+        float deployedLen = ReadFloat(lowLevelTether, "deployedLengthM", float.NaN);
+        float targetLen = ReadFloat(lowLevelTether, "targetLengthM", float.NaN);
+        float straight = ReadFloat(lowLevelTether, "straightDistanceM", float.NaN);
+        float slack = ReadFloat(lowLevelTether, "slackM", float.NaN);
+        float stretch = ReadFloat(lowLevelTether, "stretchM", float.NaN);
+        float tension = ReadFloat(lowLevelTether, "tensionN", float.NaN);
+        float winchRate = ReadFloat(lowLevelTether, "winchCommandRateMS", float.NaN);
+
+        bool smartActive = ReadBool(smartWinch, "smartTmsActive", false);
+        string smartDecision = ReadString(smartWinch, "tmsDecision", "missing");
+        float smartError = ReadFloat(smartWinch, "lengthErrorM", float.NaN);
+
+        string cableMode = ReadString(tetherVisual, "cableMode", "missing");
+        float visualSag = ReadFloat(tetherVisual, "sagAmplitudeM", float.NaN);
+        float sideCurve = ReadFloat(tetherVisual, "sideCurveM", float.NaN);
+
+        int loggerLines = (int)ReadFloat(tetherResearchLogger, "linesWritten", 0);
+        string logPath = ReadString(tetherResearchLogger, "currentLogPath", "not recording");
+
+        if (modeText != null)
+        {
+            modeText.text =
+                "MODE: " +
+                (droneMotionAllowed ? "INTEGRATED" : "ROV DEPLOYED");
+        }
+
+        if (droneStatusText != null)
+        {
+            droneStatusText.text =
+                "DRONE 1\n" +
+                "Status: " + droneFlight + "\n" +
+                "Mission: " + droneMission + "\n" +
+                "Controller: " + droneControl + "\n" +
+                "Speed: " + droneVel.magnitude.ToString("F2") + " m/s\n" +
+                "Position:\n" +
+                "  X " + dronePos.x.ToString("F2") + "\n" +
+                "  Y " + dronePos.y.ToString("F2") + "\n" +
+                "  Z " + dronePos.z.ToString("F2") + "\n" +
+                "Drone motion allowed: " + BoolText(droneMotionAllowed) + "\n";
+        }
+
+        if (rovStatusText != null)
+        {
+            rovStatusText.text =
+                "MINIROV 1\n" +
+                "Mission: " + rovMission + "\n" +
+                "Path: " + rovPath + "\n" +
+                "Controller: " + rovControl + "\n" +
+                "Depth: " + F(rovDepth) + " m\n" +
+                "Home set: " + BoolText(homeRecorded) + "\n" +
+                "Distance home: " + F(distanceHome) + " m\n" +
+                "Mission home err: " + F(rovHome) + " m\n";
+        }
+
+        if (tetherStatusText != null)
+        {
+            tetherStatusText.text = "";
+        }
+
+        if (environmentText != null)
+        {
+            environmentText.text =
+                "Wind: simulated\n" +
+                "Current: visual/TMS-ready\n" +
+                "Water surface Y: " + F(ReadFloat(unifiedTether, "waterSurfaceY", 0.0f)) + "\n" +
+                "Camera: switchable\n" +
+                "Logger: " + loggerLines + " samples\n";
+        }
+
+        if (mainViewOverlayText != null)
+        {
+            mainViewOverlayText.text =
+                "ALT " + dronePos.y.ToString("F1") + " m\n" +
+                "DEPTH " + F(rovDepth) + " m";
+        }
+
+        if (cameraPayloadText != null)
+        {
+            cameraPayloadText.text =
+                "TETHER / WINCH DATA\n" +
+                "Camera view: " + currentCameraView + "\n\n" +
+                "Tether state: " + tetherState + "\n" +
+                "Unified state: " + unifiedState + "\n" +
+                "Deployed length: " + F(deployedLen) + " m\n" +
+                "Target length: " + F(targetLen) + " m\n" +
+                "Straight distance: " + F(straight) + " m\n" +
+                "Slack: " + F(slack) + " m\n" +
+                "Stretch: " + F(stretch) + " m\n" +
+                "Tension proxy: " + F(tension) + " N\n" +
+                "Winch rate: " + F(winchRate) + " m/s\n" +
+                "Cable visual: " + cableMode + "\n" +
+                "Sag: " + F(visualSag) + " m, side: " + F(sideCurve) + " m\n";
+        }
+
+        if (missionControlsText != null)
+        {
+            missionControlsText.text =
+                "Workflow:\n" +
+                "1. Land drone on surface\n" +
+                "2. Attach + deploy ROV\n" +
+                "3. Activate ROV control\n" +
+                "4. Enable Smart TMS\n" +
+                "5. Run MiniROV mission\n" +
+                "6. Return home + recover\n\n" +
+                "Last tether event:\n" + unifiedEvent;
+        }
+
+        if (telemetryText != null)
+        {
+            telemetryText.text =
+                "TETHER / SMART TMS\n" +
+                "Smart active: " + BoolText(smartActive) + "\n" +
+                "Smart decision: " + smartDecision + "\n" +
+                "Smart length error: " + F(smartError) + " m\n" +
+                "Safe to deploy: " + BoolText(safeToDeploy) + "\n" +
+                "Drone motion allowed: " + BoolText(droneMotionAllowed) + "\n\n" +
+
+                "DRONE\n" +
+                "Flight: " + droneFlight + " | Mission: " + droneMission + "\n" +
+                "Speed: " + droneVel.magnitude.ToString("F2") + " m/s\n\n" +
+
+                "MINIROV\n" +
+                "Mission: " + rovMission + " | Path: " + rovPath + "\n" +
+                "Control: " + rovControl + " | Depth: " + F(rovDepth) + " m\n";
+        }
+
+        if (alertsText != null)
+        {
+            alertsText.text = BuildAlerts(slack, stretch, tension, droneMotionAllowed, safeToDeploy, smartActive);
+        }
+
+        if (logText != null)
+        {
+            logText.text =
+                "Log samples: " + loggerLines + "\n" +
+                ShortPath(logPath);
+        }
+
+        if (bottomStatusText != null)
+        {
+            bottomStatusText.text =
+                "SIMULATOR ACTIVE  |  Drone: " + droneFlight +
+                "  |  Tether: " + unifiedState +
+                "  |  MiniROV: " + rovMission +
+                "  |  Smart TMS: " + (smartActive ? smartDecision : "off") +
+                "  |  CSV: " + loggerLines + " samples";
+        }
+    }
+
+    private string BuildAlerts(float slack, float stretch, float tension, bool droneMotionAllowed, bool safeToDeploy, bool smartActive)
+    {
+        string s = "";
+
+        if (!droneMotionAllowed)
+        {
+            s += "● Drone motion blocked: ROV/tether deployed\n";
+        }
+
+        if (safeToDeploy)
+        {
+            s += "● Safe to deploy ROV\n";
+        }
+
+        if (smartActive)
+        {
+            s += "● Smart TMS active\n";
+        }
+
+        if (!float.IsNaN(stretch) && stretch > 0.03f)
+        {
+            s += "⚠ Tether stretch high: " + stretch.ToString("F3") + " m\n";
+        }
+
+        if (!float.IsNaN(slack) && slack > 0.50f)
+        {
+            s += "⚠ Tether slack high: " + slack.ToString("F2") + " m\n";
+        }
+
+        if (!float.IsNaN(tension) && tension > 10.0f)
+        {
+            s += "⚠ Tether tension proxy high: " + tension.ToString("F1") + " N\n";
+        }
+
+        if (s.Length == 0)
+        {
+            s = "● No active alerts\n";
+        }
+
+        return s;
+    }
+
+    private float ComputeRovDepth()
+    {
+        float waterY = ReadFloat(unifiedTether, "waterSurfaceY", 0.0f);
+        Transform t = ReadTransform(unifiedTether, "miniRovRoot");
+
+        if (t != null)
+        {
+            return Mathf.Max(0.0f, waterY - t.position.y);
+        }
+
+        Rigidbody rb = ReadRigidbody(unifiedTether, "miniRovRigidbody");
+
+        if (rb != null)
+        {
+            return Mathf.Max(0.0f, waterY - rb.position.y);
+        }
+
+        return float.NaN;
+    }
+
+    private void OnDroneLandSurface()
+    {
+        SwitchDashboardCamera(droneFollowCamera, "Drone Follow");
+
+        if (!CallFirst(droneAgent, "AgentLandOnSurface", "AgentSurfaceHold"))
+        {
+            CallFirst(droneFlightManager, "StartLandingOnSurface", "EnterSurfaceHold");
+        }
+    }
+
+    private void OnDroneTakeoff()
+    {
+        SwitchDashboardCamera(droneFollowCamera, "Drone Follow");
+
+        if (!CallFirst(droneAgent, "AgentTakeoff"))
+        {
+            CallFirst(droneFlightManager, "StartTakeoff");
+        }
+    }
+
+    private void OnDroneHold()
+    {
+        SwitchDashboardCamera(droneFollowCamera, "Drone Follow");
+
+        if (!CallFirst(droneAgent, "AgentHold"))
+        {
+            CallFirst(droneFlightManager, "CapturePositionHold", "EnterSurfaceHold");
+        }
+    }
+
+    private void OnDroneFullMission()
+    {
+        SwitchDashboardCamera(droneFollowCamera, "Drone Follow");
+
+        if (!CallFirst(droneAgent, "AgentStartDroneMission", "AgentStartSelectedMission"))
+        {
+            CallFirst(droneMissionManager, "StartMission");
+        }
+    }
+
+    private void OnTetherAttach()
+    {
+        if (!CallFirst(tetherAgent, "AgentAttachRovToCableEnd"))
+        {
+            CallFirst(unifiedTether, "AttachRovToCableEnd");
+        }
+    }
+
+    private void OnTetherDeploy()
+    {
+        SwitchDashboardCamera(rovFollowCamera, "ROV Follow");
+
+        if (!CallFirst(tetherAgent, "AgentDeployRov"))
+        {
+            CallFirst(unifiedTether, "StartDeployment");
+        }
+    }
+
+    private void OnTetherActivateRov()
+    {
+        SwitchDashboardCamera(rovFollowCamera, "ROV Follow");
+
+        if (!CallFirst(tetherAgent, "AgentActivateRovControl"))
+        {
+            CallFirst(unifiedTether, "ActivateRovControl");
+        }
+    }
+
+    private void OnTetherSmartTms()
+    {
+        if (!CallFirst(tetherAgent, "AgentEnableSmartTms"))
+        {
+            CallFirst(smartWinch, "EnableSmartTms");
+        }
+    }
+
+    private void OnTetherRecover()
+    {
+        if (!CallFirst(tetherAgent, "AgentRecoverRov"))
+        {
+            CallFirst(unifiedTether, "RequestRecovery");
+        }
+    }
+
+    private void OnTetherHoldWinch()
+    {
+        if (!CallFirst(tetherAgent, "AgentHoldWinch"))
+        {
+            CallFirst(unifiedTether, "HoldWinch");
+        }
+    }
+
+    private void OnMiniRovHold()
+    {
+        if (!CallFirst(miniRovAgent, "AgentHold", "AgentStationHold"))
+        {
+            CallFirst(miniRovMissionManager, "StartStationHold", "StationHold");
+        }
+    }
+
+    private void OnMiniRovMission()
+    {
+        SwitchDashboardCamera(rovFollowCamera, "ROV Follow");
+
+        if (!CallFirst(miniRovAgent, "AgentStartSelectedMission", "AgentStartCurrentPath", "AgentStartMission"))
+        {
+            CallFirst(miniRovMissionManager, "StartSelectedMission", "StartMission");
+        }
+    }
+
+    private void OnMiniRovReturnHome()
+    {
+        SwitchDashboardCamera(rovFollowCamera, "ROV Follow");
+
+        if (!CallFirst(miniRovAgent, "AgentReturnHome"))
+        {
+            CallFirst(miniRovMissionManager, "ReturnHome");
+        }
+    }
+
+    private void OnMiniRovDwell()
+    {
+        if (!CallFirst(miniRovAgent, "AgentDwellAtCurrentPose", "AgentDwell"))
+        {
+            CallFirst(miniRovMissionManager, "DwellAtCurrentPose", "StartDwellAtCurrentPose");
+        }
+    }
+
+    private void OnCameraDrone()
+    {
+        if (!SwitchDashboardCamera(droneFollowCamera, "Drone Follow"))
+        {
+            CallFirst(cameraSwitcher, "SwitchToDrone", "ShowDroneCamera", "SetDroneView");
+        }
+    }
+
+    private void OnCameraRovFollow()
+    {
+        if (!SwitchDashboardCamera(rovFollowCamera, "ROV Follow"))
+        {
+            CallFirst(cameraSwitcher, "SwitchToMiniRovFollow", "ShowMiniRovFollowCamera", "SetMiniRovFollowView");
+        }
+    }
+
+    private void OnCameraRovFront()
+    {
+        if (!SwitchDashboardCamera(rovFrontCamera, "ROV Front"))
+        {
+            CallFirst(cameraSwitcher, "SwitchToMiniRovFront", "ShowMiniRovFrontCamera", "SetMiniRovFrontView");
+        }
+    }
+
+    private void OnEmergencyStop()
+    {
+        CallFirst(tetherAgent, "AgentHoldWinch");
+        CallFirst(unifiedTether, "HoldWinch");
+
+        CallFirst(miniRovAgent, "AgentAbortToHold", "AgentStop");
+        CallFirst(miniRovMissionManager, "AbortToHold", "StopMission", "StationHold");
+
+        CallFirst(droneAgent, "AgentFailsafe", "AgentHold");
+        CallFirst(droneFlightManager, "EnterFailsafe", "CapturePositionHold");
+    }
+
+    private void OnResetFaults()
+    {
+        CallFirst(tetherAgent, "AgentDisableSmartTms");
+        CallFirst(tetherAgent, "AgentHoldWinch");
+        CallFirst(unifiedTether, "ResetFault");
+        CallFirst(lowLevelTether, "ResetFault");
+        CallFirst(droneAgent, "AgentHold");
+        CallFirst(miniRovAgent, "AgentHold");
+    }
+
+    private void ToggleDashboard()
+    {
+        dashboardEnabled = !dashboardEnabled;
+    }
+
+    private bool SwitchDashboardCamera(Camera selectedCamera, string viewName)
+    {
+        if (!switchUnityMainCamera)
+        {
+            return false;
+        }
+
+        AutoFindReferences();
+
+        if (selectedCamera == null)
+        {
+            return false;
+        }
+
+        Camera[] knownCameras =
+        {
+            droneFollowCamera,
+            rovFollowCamera,
+            rovFrontCamera
+        };
+
+        for (int i = 0; i < knownCameras.Length; i++)
+        {
+            Camera c =
+                knownCameras[i];
+
+            if (c == null)
+            {
+                continue;
+            }
+
+            c.gameObject.SetActive(true);
+            c.enabled = false;
+        }
+
+        selectedCamera.gameObject.SetActive(true);
+        selectedCamera.enabled = true;
+        selectedCamera.targetDisplay = 0;
+        selectedCamera.depth = 20.0f;
+
+        currentCameraView =
+            viewName;
+
+        if (manageAudioListeners)
+        {
+            AudioListener[] listeners =
+                Resources.FindObjectsOfTypeAll<AudioListener>();
+
+            for (int i = 0; i < listeners.Length; i++)
+            {
+                AudioListener l =
+                    listeners[i];
+
+                if (l == null ||
+                    l.gameObject == null ||
+                    !l.gameObject.scene.IsValid())
+                {
+                    continue;
+                }
+
+                l.enabled =
+                    l.gameObject == selectedCamera.gameObject;
+            }
+
+            AudioListener selectedListener =
+                selectedCamera.GetComponent<AudioListener>();
+
+            if (selectedListener == null)
+            {
+                selectedListener =
+                    selectedCamera.gameObject.AddComponent<AudioListener>();
+            }
+
+            selectedListener.enabled =
+                true;
+        }
+
+        return true;
+    }
+
+    private Camera FindCameraByName(string objectName)
+    {
+        if (string.IsNullOrEmpty(objectName))
+        {
+            return null;
+        }
+
+        Camera[] cameras =
+            Resources.FindObjectsOfTypeAll<Camera>();
+
+        for (int i = 0; i < cameras.Length; i++)
+        {
+            Camera c =
+                cameras[i];
+
+            if (c == null ||
+                c.gameObject == null ||
+                !c.gameObject.scene.IsValid())
+            {
+                continue;
+            }
+
+            if (c.gameObject.name == objectName)
+            {
+                return c;
+            }
+        }
+
+        return null;
+    }
+
+    private MonoBehaviour FindBehaviourByTypeName(string typeName)
+    {
+        MonoBehaviour[] behaviours = Resources.FindObjectsOfTypeAll<MonoBehaviour>();
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b = behaviours[i];
+
+            if (b == null || b.gameObject == null || !b.gameObject.scene.IsValid())
+            {
+                continue;
+            }
+
+            if (b.GetType().Name == typeName)
+            {
+                return b;
+            }
+        }
+
+        return null;
+    }
+
+    private bool CallFirst(object target, params string[] methodNames)
+    {
+        if (target == null)
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        for (int i = 0; i < methodNames.Length; i++)
+        {
+            MethodInfo method = type.GetMethod(
+                methodNames[i],
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+            );
+
+            if (method != null && method.GetParameters().Length == 0)
+            {
+                method.Invoke(target, null);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private object GetMember(object target, string name)
+    {
+        if (target == null || string.IsNullOrEmpty(name))
+        {
+            return null;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field = type.GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+        );
+
+        if (field != null)
+        {
+            return field.GetValue(target);
+        }
+
+        PropertyInfo prop = type.GetProperty(
+            name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+        );
+
+        if (prop != null && prop.CanRead)
+        {
+            return prop.GetValue(target, null);
+        }
+
+        return null;
+    }
+
+    private string ReadString(object target, string member, string fallback)
+    {
+        object value = GetMember(target, member);
+        return value != null ? value.ToString() : fallback;
+    }
+
+    private bool ReadBool(object target, string member, bool fallback)
+    {
+        object value = GetMember(target, member);
+
+        if (value is bool)
+        {
+            return (bool)value;
+        }
+
+        return fallback;
+    }
+
+    private float ReadFloat(object target, string member, float fallback)
+    {
+        object value = GetMember(target, member);
+
+        if (value is float)
+        {
+            return (float)value;
+        }
+
+        if (value is int)
+        {
+            return (int)value;
+        }
+
+        if (value is double)
+        {
+            return (float)(double)value;
+        }
+
+        return fallback;
+    }
+
+    private Vector3 ReadVector3(object target, string member, Vector3 fallback)
+    {
+        object value = GetMember(target, member);
+
+        if (value is Vector3)
+        {
+            return (Vector3)value;
+        }
+
+        return fallback;
+    }
+
+    private Transform ReadTransform(object target, string member)
+    {
+        object value = GetMember(target, member);
+        return value as Transform;
+    }
+
+    private Rigidbody ReadRigidbody(object target, string member)
+    {
+        object value = GetMember(target, member);
+        return value as Rigidbody;
+    }
+
+    private string F(float value)
+    {
+        if (float.IsNaN(value) || float.IsInfinity(value))
+        {
+            return "--";
+        }
+
+        return value.ToString("F2");
+    }
+
+    private string BoolText(bool value)
+    {
+        return value ? "YES" : "NO";
+    }
+
+    private string ShortPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return "No log path";
+        }
+
+        if (path.Length <= 42)
+        {
+            return path;
+        }
+
+        return "..." + path.Substring(path.Length - 42);
+    }
+
+    private void EnsureEventSystem()
+    {
+        EventSystem eventSystem =
+            FindObjectOfType<EventSystem>();
+
+        if (eventSystem == null)
+        {
+            GameObject go =
+                new GameObject("EventSystem");
+
+            eventSystem =
+                go.AddComponent<EventSystem>();
+        }
+
+#if ENABLE_INPUT_SYSTEM
+        StandaloneInputModule[] oldModules =
+            eventSystem.GetComponents<StandaloneInputModule>();
+
+        for (int i = oldModules.Length - 1; i >= 0; i--)
+        {
+            if (oldModules[i] == null)
+            {
+                continue;
+            }
+
+            if (Application.isPlaying)
+            {
+                Destroy(oldModules[i]);
+            }
+            else
+            {
+                DestroyImmediate(oldModules[i]);
+            }
+        }
+
+        InputSystemUIInputModule inputSystemModule =
+            eventSystem.GetComponent<InputSystemUIInputModule>();
+
+        if (inputSystemModule == null)
+        {
+            inputSystemModule =
+                eventSystem.gameObject.AddComponent<InputSystemUIInputModule>();
+        }
+
+        TryAssignDefaultUiActions(inputSystemModule);
+#else
+        StandaloneInputModule standalone =
+            eventSystem.GetComponent<StandaloneInputModule>();
+
+        if (standalone == null)
+        {
+            eventSystem.gameObject.AddComponent<StandaloneInputModule>();
+        }
+#endif
+    }
+
+#if ENABLE_INPUT_SYSTEM
+    private void TryAssignDefaultUiActions(InputSystemUIInputModule module)
+    {
+        if (module == null)
+        {
+            return;
+        }
+
+        try
+        {
+            System.Reflection.MethodInfo assignDefaults =
+                typeof(InputSystemUIInputModule).GetMethod(
+                    "AssignDefaultActions",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic
+                );
+
+            if (assignDefaults != null)
+            {
+                assignDefaults.Invoke(module, null);
+            }
+        }
+        catch
+        {
+            // Some Unity/InputSystem versions do not expose AssignDefaultActions.
+            // In that case, the module still prevents the old Input.mousePosition exception.
+        }
+    }
+#endif
+
+    private void ClearCanvasChildren()
+    {
+        if (canvas == null)
+        {
+            return;
+        }
+
+        for (int i = canvas.transform.childCount - 1; i >= 0; i--)
+        {
+            Transform child = canvas.transform.GetChild(i);
+
+            if (Application.isPlaying)
+            {
+                Destroy(child.gameObject);
+            }
+            else
+            {
+                DestroyImmediate(child.gameObject);
+            }
+        }
+    }
+
+    private GameObject CreatePanel(string name, Transform parent, float x, float y, float w, float h, Color color)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+
+        RectTransform rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.0f, 1.0f);
+        rt.anchorMax = new Vector2(0.0f, 1.0f);
+        rt.pivot = new Vector2(0.0f, 1.0f);
+        rt.anchoredPosition = new Vector2(x, -y);
+        rt.sizeDelta = new Vector2(w, h);
+
+        Image img = go.AddComponent<Image>();
+        img.color = color;
+
+        return go;
+    }
+
+    private Text CreateText(string name, Transform parent, float x, float y, float w, float h, string text, int size, FontStyle style, Color color, TextAnchor anchor)
+    {
+        GameObject go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+
+        RectTransform rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.0f, 1.0f);
+        rt.anchorMax = new Vector2(0.0f, 1.0f);
+        rt.pivot = new Vector2(0.0f, 1.0f);
+        rt.anchoredPosition = new Vector2(x, -y);
+        rt.sizeDelta = new Vector2(w, h);
+
+        Text t = go.AddComponent<Text>();
+        t.font = uiFont;
+        t.text = text;
+        t.fontSize = size;
+        t.fontStyle = style;
+        t.color = color;
+        t.alignment = anchor;
+        t.horizontalOverflow = HorizontalWrapMode.Wrap;
+        t.verticalOverflow = VerticalWrapMode.Truncate;
+
+        return t;
+    }
+
+    private Button CreateButton(Transform parent, float x, float y, float w, float h, string label, Color color, UnityEngine.Events.UnityAction action)
+    {
+        GameObject go = CreatePanel("Button_" + label.Replace(" ", "_"), parent, x, y, w, h, color);
+        Button b = go.AddComponent<Button>();
+        b.targetGraphic = go.GetComponent<Image>();
+        b.onClick.AddListener(action);
+
+        Text t = CreateText("Label", go.transform, 0, 0, w, h, label, 13, FontStyle.Bold, white, TextAnchor.MiddleCenter);
+        t.raycastTarget = false;
+
+        return b;
+    }
+}

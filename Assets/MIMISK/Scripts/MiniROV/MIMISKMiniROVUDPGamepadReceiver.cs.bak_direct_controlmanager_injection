@@ -1,0 +1,527 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVUDPGamepadReceiver : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKMiniROVCoreController coreController;
+    public MIMISKMiniROVMissionManager missionManager;
+
+    [Header("UDP")]
+    public bool receiverEnabled = true;
+
+    [Tooltip("Use 0.0.0.0 to listen on all interfaces. Use 127.0.0.1 for local-only.")]
+    public string listenAddress = "0.0.0.0";
+
+    [Tooltip("Direct Unity MiniROV UDP port. Keep separate from Raspberry/my_app port 54321.")]
+    public int listenPort = 54331;
+
+    public float inputTimeoutS = 0.75f;
+
+    [Header("Activation Safety")]
+    public bool requireMiniROVGamepadMissionState = true;
+    public bool forceCoreGamepadModeWhenActive = true;
+    public bool requireUnityNativeBackend = true;
+
+    [Header("Command Mapping")]
+    public bool useDirectCommandFields = true;
+    public bool deriveFromRawAxes = true;
+
+    [Tooltip("Raw pc_sender_new.py uses ly from gamepad. Stick-up is usually negative, so raw surge uses -ly.")]
+    public bool rawLeftYUpIsForward = true;
+
+    public bool invertSurge = false;
+    public bool invertYaw = false;
+
+    public float surgeScale = 1.0f;
+    public float yawScale = 1.0f;
+    public float depthScale = 1.0f;
+
+    [Header("Runtime - Packet")]
+    public bool udpThreadRunning;
+    public bool connected;
+    public bool packetFresh;
+    public float lastPacketAge;
+    public int packetsReceived;
+    public int packetsApplied;
+    public string lastJson = "";
+    public string lastEvent = "idle";
+
+    [Header("Runtime - Parsed Raw")]
+    public float lx;
+    public float ly;
+    public float rx;
+    public float ry;
+    public float lt;
+    public float rt;
+    public int hatx;
+    public int haty;
+
+    [Header("Runtime - Commands")]
+    public float surge;
+    public float yaw;
+    public float depth;
+    public bool hold;
+    public bool returnHome;
+    public bool stop;
+    public bool sendingToCore;
+
+    private UdpClient udp;
+    private Thread thread;
+    private bool running;
+    private readonly object lockObj = new object();
+    private string latestJson = "";
+    private float lastPacketTime = -999.0f;
+
+    private bool previousReturnHome;
+    private bool previousStop;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void OnEnable()
+    {
+        StartReceiver();
+    }
+
+    private void OnDisable()
+    {
+        StopReceiver();
+        SendZeroToCore("receiver_disabled");
+    }
+
+    private void OnDestroy()
+    {
+        StopReceiver();
+    }
+
+    private void Update()
+    {
+        if (!receiverEnabled)
+        {
+            SendZeroToCore("receiver_disabled");
+            return;
+        }
+
+        AutoFindReferences();
+
+        string json = null;
+
+        lock (lockObj)
+        {
+            if (!string.IsNullOrEmpty(latestJson))
+            {
+                json = latestJson;
+                latestJson = "";
+            }
+        }
+
+        if (!string.IsNullOrEmpty(json))
+        {
+            lastJson = json;
+            lastPacketTime = Time.time;
+            connected = true;
+            packetsReceived++;
+
+            ParsePayload(json);
+        }
+
+        lastPacketAge =
+            Time.time - lastPacketTime;
+
+        packetFresh =
+            connected &&
+            lastPacketAge <= inputTimeoutS;
+
+        if (!packetFresh)
+        {
+            SendZeroToCore("udp_timeout_or_no_packet");
+            return;
+        }
+
+        if (!IsMissionAllowedToReceiveManualInput())
+        {
+            SendZeroToCore("blocked_waiting_for_M_gamepad_manual_test_state");
+            return;
+        }
+
+        if (coreController == null)
+        {
+            sendingToCore = false;
+            lastEvent = "missing_core_controller";
+            return;
+        }
+
+        if (requireUnityNativeBackend &&
+            coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+        {
+            sendingToCore = false;
+            lastEvent = "blocked_backend_not_unity_native";
+            return;
+        }
+
+        if (forceCoreGamepadModeWhenActive)
+        {
+            if (coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+            {
+                coreController.ActivateUnityNativeBackend();
+            }
+
+            if (coreController.controlMode != MIMISKMiniROVCoreController.ControlMode.GamepadManual)
+            {
+                coreController.SetControlMode(MIMISKMiniROVCoreController.ControlMode.GamepadManual);
+            }
+        }
+
+        if (hold)
+        {
+            surge = 0.0f;
+            yaw = 0.0f;
+            depth = 0.0f;
+        }
+
+        coreController.SetManualCommand(
+            surge,
+            yaw,
+            depth
+        );
+
+        packetsApplied++;
+        sendingToCore = true;
+
+        bool returnHomePressed = returnHome;
+        bool stopPressed = stop;
+
+        if (returnHomePressed && !previousReturnHome)
+        {
+            if (missionManager != null)
+            {
+                missionManager.RequestReturnToRecovery();
+                lastEvent = "udp_requested_return_home";
+            }
+        }
+        else if (stopPressed && !previousStop)
+        {
+            if (missionManager != null)
+            {
+                missionManager.StopMissionAndSetRecoveryReady();
+                lastEvent = "udp_requested_stop_recovery_ready";
+            }
+        }
+        else
+        {
+            lastEvent =
+                "applied_udp_to_core_surge_" +
+                surge.ToString("F2") +
+                "_yaw_" +
+                yaw.ToString("F2") +
+                "_depth_" +
+                depth.ToString("F2");
+        }
+
+        previousReturnHome = returnHomePressed;
+        previousStop = stopPressed;
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (coreController == null)
+        {
+            coreController = GetComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (missionManager == null)
+        {
+            missionManager = GetComponent<MIMISKMiniROVMissionManager>();
+        }
+    }
+
+    [ContextMenu("Start Receiver")]
+    public void StartReceiver()
+    {
+        if (!receiverEnabled || running)
+        {
+            return;
+        }
+
+        try
+        {
+            IPAddress ip =
+                string.IsNullOrEmpty(listenAddress) ||
+                listenAddress == "0.0.0.0"
+                    ? IPAddress.Any
+                    : IPAddress.Parse(listenAddress);
+
+            udp =
+                new UdpClient(
+                    new IPEndPoint(ip, listenPort)
+                );
+
+            running = true;
+
+            thread =
+                new Thread(ReceiveLoop);
+
+            thread.IsBackground = true;
+            thread.Start();
+
+            udpThreadRunning = true;
+            lastEvent = "udp_receiver_started_" + listenAddress + ":" + listenPort;
+
+            Debug.Log("[MIMISK MiniROV UDP] Listening on " + listenAddress + ":" + listenPort);
+        }
+        catch (Exception e)
+        {
+            running = false;
+            udpThreadRunning = false;
+            lastEvent = "udp_start_failed_" + e.Message;
+            Debug.LogError("[MIMISK MiniROV UDP] " + lastEvent);
+        }
+    }
+
+    [ContextMenu("Stop Receiver")]
+    public void StopReceiver()
+    {
+        running = false;
+        udpThreadRunning = false;
+
+        try
+        {
+            if (udp != null)
+            {
+                udp.Close();
+                udp = null;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (thread != null && thread.IsAlive)
+            {
+                thread.Join(100);
+            }
+        }
+        catch
+        {
+        }
+
+        thread = null;
+    }
+
+    private void ReceiveLoop()
+    {
+        IPEndPoint remote =
+            new IPEndPoint(IPAddress.Any, 0);
+
+        while (running)
+        {
+            try
+            {
+                byte[] data =
+                    udp.Receive(ref remote);
+
+                string json =
+                    Encoding.UTF8.GetString(data);
+
+                lock (lockObj)
+                {
+                    latestJson = json;
+                }
+            }
+            catch
+            {
+                if (!running)
+                {
+                    break;
+                }
+            }
+        }
+
+        udpThreadRunning = false;
+    }
+
+    private void ParsePayload(string json)
+    {
+        lx = ExtractFloat(json, "lx", lx);
+        ly = ExtractFloat(json, "ly", ly);
+        rx = ExtractFloat(json, "rx", rx);
+        ry = ExtractFloat(json, "ry", ry);
+        lt = ExtractFloat(json, "lt", lt);
+        rt = ExtractFloat(json, "rt", rt);
+        hatx = Mathf.RoundToInt(ExtractFloat(json, "hatx", hatx));
+        haty = Mathf.RoundToInt(ExtractFloat(json, "haty", haty));
+
+        bool hasDirect =
+            HasField(json, "surge") ||
+            HasField(json, "yaw") ||
+            HasField(json, "depth");
+
+        if (useDirectCommandFields && hasDirect)
+        {
+            surge = ExtractFloat(json, "surge", 0.0f);
+            yaw = ExtractFloat(json, "yaw", 0.0f);
+            depth = ExtractFloat(json, "depth", 0.0f);
+
+            if (deriveFromRawAxes &&
+                Mathf.Abs(surge) < 0.0001f &&
+                Mathf.Abs(yaw) < 0.0001f &&
+                Mathf.Abs(depth) < 0.0001f)
+            {
+                DecodeFromRawAxes();
+            }
+        }
+        else
+        {
+            DecodeFromRawAxes();
+        }
+
+        if (invertSurge)
+        {
+            surge = -surge;
+        }
+
+        if (invertYaw)
+        {
+            yaw = -yaw;
+        }
+
+        surge = Mathf.Clamp(surge * surgeScale, -1.0f, 1.0f);
+        yaw = Mathf.Clamp(yaw * yawScale, -1.0f, 1.0f);
+        depth = Mathf.Clamp(depth * depthScale, -1.0f, 1.0f);
+
+        hold =
+            ExtractBool(json, "hold") ||
+            ExtractButton(json, "btn_south") ||
+            ExtractButton(json, "BTN_SOUTH") ||
+            ExtractButton(json, "BTN_A");
+
+        returnHome =
+            ExtractBool(json, "return_home") ||
+            ExtractButton(json, "btn_north") ||
+            ExtractButton(json, "BTN_NORTH") ||
+            ExtractButton(json, "BTN_Y");
+
+        stop =
+            ExtractBool(json, "stop") ||
+            ExtractButton(json, "btn_east") ||
+            ExtractButton(json, "BTN_EAST") ||
+            ExtractButton(json, "BTN_B");
+    }
+
+    private void DecodeFromRawAxes()
+    {
+        surge =
+            rawLeftYUpIsForward
+                ? -ly
+                : ly;
+
+        yaw = rx;
+        depth = rt - lt;
+    }
+
+    private bool IsMissionAllowedToReceiveManualInput()
+    {
+        if (!requireMiniROVGamepadMissionState)
+        {
+            return true;
+        }
+
+        if (missionManager == null)
+        {
+            return false;
+        }
+
+        return
+            missionManager.missionActive &&
+            missionManager.missionState ==
+                MIMISKMiniROVMissionManager.MiniROVMissionState.RunningGamepadTest;
+    }
+
+    private void SendZeroToCore(string reason)
+    {
+        surge = 0.0f;
+        yaw = 0.0f;
+        depth = 0.0f;
+        sendingToCore = false;
+        lastEvent = reason;
+
+        if (coreController != null)
+        {
+            coreController.SetManualCommand(0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    private bool HasField(string json, string name)
+    {
+        return Regex.IsMatch(
+            json,
+            "\\\"" + Regex.Escape(name) + "\\\"\\s*:",
+            RegexOptions.IgnoreCase
+        );
+    }
+
+    private float ExtractFloat(string json, string name, float fallback)
+    {
+        Match m =
+            Regex.Match(
+                json,
+                "\\\"" + Regex.Escape(name) + "\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?)",
+                RegexOptions.IgnoreCase
+            );
+
+        if (!m.Success)
+        {
+            return fallback;
+        }
+
+        float value;
+
+        if (float.TryParse(
+                m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out value))
+        {
+            return value;
+        }
+
+        return fallback;
+    }
+
+    private bool ExtractBool(string json, string name)
+    {
+        Match m =
+            Regex.Match(
+                json,
+                "\\\"" + Regex.Escape(name) + "\\\"\\s*:\\s*(true|false|0|1)",
+                RegexOptions.IgnoreCase
+            );
+
+        if (!m.Success)
+        {
+            return false;
+        }
+
+        string v =
+            m.Groups[1].Value.ToLowerInvariant();
+
+        return v == "true" || v == "1";
+    }
+
+    private bool ExtractButton(string json, string name)
+    {
+        return Mathf.Abs(ExtractFloat(json, name, 0.0f)) > 0.5f;
+    }
+}

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "MIMISK-ROS: A ROS2/gRPC Digital Twin for Drone-Deployed Tethered MiniROV Inspection"
+message: "If you use MIMISK-ROS in your research, please cite this software and the associated paper."
+type: software
+authors:
+  - family-names: Akram
+    given-names: Waseem
+    email: waseem.akram@fer.hr
+    affiliation: "Laboratory for Underwater Systems and Technologies (LABUST), University of Zagreb Faculty of Electrical Engineering and Computing"
+repository-code: "https://github.com/labust/mimisk_ros2_bridge"
+license: Apache-2.0
+keywords:
+  - ROS2
+  - gRPC
+  - Unity
+  - marine robotics
+  - drone
+  - MiniROV
+  - tether
+  - simulation

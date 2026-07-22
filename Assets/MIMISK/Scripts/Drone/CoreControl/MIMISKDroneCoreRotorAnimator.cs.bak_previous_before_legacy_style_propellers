@@ -1,0 +1,281 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreRotorAnimator : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKDroneCoreRotorController core;
+    public MIMISKDroneCoreFlightModeManager modeManager;
+
+    [Tooltip("Used only to copy rotor visual transforms. Keep the old rotor model disabled.")]
+    public MIMISKDroneRotorModel legacyRotorModel;
+
+    [Header("Rotor Visuals in Core Order: FL, FR, RL, RR")]
+    public Transform rotorFL;
+    public Transform rotorFR;
+    public Transform rotorRL;
+    public Transform rotorRR;
+
+    [Header("Animation")]
+    public bool animate = true;
+
+    [Tooltip("Drone V1 propellers usually spin around local Z.")]
+    public Vector3 localSpinAxis = Vector3.forward;
+
+    public float idleRpm = 500.0f;
+    public float maxRpm = 5200.0f;
+    public float rpmResponseHz = 14.0f;
+
+    [Header("Debug")]
+    public Vector4 rpmFL_FR_RL_RR;
+    public string rotorAnimationState = "unknown";
+
+    private Vector4 rpmState;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        AutoBindRotorVisuals();
+    }
+
+    private void Update()
+    {
+        if (!animate || core == null)
+        {
+            return;
+        }
+
+        float dt = Time.deltaTime;
+        float maxThrust = Mathf.Max(0.001f, core.maxThrustPerRotorN);
+
+        Vector4 targetRpm;
+
+        if (!ShouldRotorsSpin())
+        {
+            rotorAnimationState = "stopped";
+            targetRpm = Vector4.zero;
+        }
+        else if (ShouldUseIdleOnly())
+        {
+            rotorAnimationState = "idle";
+            targetRpm = new Vector4(idleRpm, idleRpm, idleRpm, idleRpm);
+        }
+        else
+        {
+            rotorAnimationState = "thrust_based";
+
+            Vector4 thrust = core.motorThrustActualN;
+
+            targetRpm = new Vector4(
+                RpmFromThrust(thrust.x, maxThrust),
+                RpmFromThrust(thrust.y, maxThrust),
+                RpmFromThrust(thrust.z, maxThrust),
+                RpmFromThrust(thrust.w, maxThrust)
+            );
+        }
+
+        float alpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, rpmResponseHz) * dt);
+
+        rpmState = Vector4.Lerp(rpmState, targetRpm, alpha);
+        rpmFL_FR_RL_RR = rpmState;
+
+        Vector4 spin = core.rotorSpinSigns;
+
+        Spin(rotorFL, rpmState.x, spin.x, dt);
+        Spin(rotorFR, rpmState.y, spin.y, dt);
+        Spin(rotorRL, rpmState.z, spin.z, dt);
+        Spin(rotorRR, rpmState.w, spin.w, dt);
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        if (modeManager == null)
+        {
+            modeManager = GetComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        if (legacyRotorModel == null)
+        {
+            legacyRotorModel = GetComponentInChildren<MIMISKDroneRotorModel>(true);
+        }
+    }
+
+    [ContextMenu("Auto Bind Rotor Visuals")]
+    public void AutoBindRotorVisuals()
+    {
+        AutoFindReferences();
+
+        bool boundFromLegacy = false;
+
+        if (legacyRotorModel != null)
+        {
+            // Legacy order:
+            // motor1_RR, motor2_FR, motor3_RL, motor4_FL.
+            // Core order:
+            // FL, FR, RL, RR.
+            if (legacyRotorModel.motor4_FL != null &&
+                legacyRotorModel.motor4_FL.rotorTransform != null)
+            {
+                rotorFL = legacyRotorModel.motor4_FL.rotorTransform;
+                boundFromLegacy = true;
+            }
+
+            if (legacyRotorModel.motor2_FR != null &&
+                legacyRotorModel.motor2_FR.rotorTransform != null)
+            {
+                rotorFR = legacyRotorModel.motor2_FR.rotorTransform;
+                boundFromLegacy = true;
+            }
+
+            if (legacyRotorModel.motor3_RL != null &&
+                legacyRotorModel.motor3_RL.rotorTransform != null)
+            {
+                rotorRL = legacyRotorModel.motor3_RL.rotorTransform;
+                boundFromLegacy = true;
+            }
+
+            if (legacyRotorModel.motor1_RR != null &&
+                legacyRotorModel.motor1_RR.rotorTransform != null)
+            {
+                rotorRR = legacyRotorModel.motor1_RR.rotorTransform;
+                boundFromLegacy = true;
+            }
+
+            if (legacyRotorModel.motor4_FL != null &&
+                legacyRotorModel.motor4_FL.localSpinAxis.sqrMagnitude > 0.0001f)
+            {
+                localSpinAxis = legacyRotorModel.motor4_FL.localSpinAxis;
+            }
+        }
+
+        if (!boundFromLegacy)
+        {
+            AutoBindByNameAndPosition();
+        }
+    }
+
+    private void AutoBindByNameAndPosition()
+    {
+        Transform[] all = GetComponentsInChildren<Transform>(true);
+        List<Transform> candidates = new List<Transform>();
+
+        for (int i = 0; i < all.Length; i++)
+        {
+            string n = Normalize(all[i].name);
+
+            if (n.Contains("prop") ||
+                n.Contains("rotor") ||
+                n.Contains("blade") ||
+                n.Contains("fan") ||
+                n.Contains("helice") ||
+                n.Contains("motor"))
+            {
+                candidates.Add(all[i]);
+            }
+        }
+
+        if (rotorFL == null) rotorFL = BestCandidate(candidates, -1.0f, -1.0f);
+        if (rotorFR == null) rotorFR = BestCandidate(candidates,  1.0f, -1.0f);
+        if (rotorRL == null) rotorRL = BestCandidate(candidates, -1.0f,  1.0f);
+        if (rotorRR == null) rotorRR = BestCandidate(candidates,  1.0f,  1.0f);
+    }
+
+    private Transform BestCandidate(List<Transform> candidates, float signX, float signZ)
+    {
+        Transform best = null;
+        float bestScore = float.PositiveInfinity;
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            Vector3 local = transform.InverseTransformPoint(candidates[i].position);
+
+            float sx = signX < 0.0f ? -local.x : local.x;
+            float sz = signZ < 0.0f ? -local.z : local.z;
+
+            float penalty = 0.0f;
+
+            if (sx < 0.0f) penalty += 100.0f;
+            if (sz < 0.0f) penalty += 100.0f;
+
+            float score =
+                penalty +
+                Mathf.Abs(Mathf.Abs(local.x) - 0.58f) +
+                Mathf.Abs(Mathf.Abs(local.z) - 0.50f);
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = candidates[i];
+            }
+        }
+
+        return best;
+    }
+
+    private bool ShouldRotorsSpin()
+    {
+        if (modeManager == null)
+        {
+            return core != null && core.controllerEnabled;
+        }
+
+        switch (modeManager.flightMode)
+        {
+            case MIMISKDroneCoreFlightModeManager.FlightMode.Disabled:
+            case MIMISKDroneCoreFlightModeManager.FlightMode.Disarmed:
+            case MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable:
+            case MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold:
+                return false;
+
+            default:
+                return true;
+        }
+    }
+
+    private bool ShouldUseIdleOnly()
+    {
+        return modeManager != null &&
+               modeManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.TakeoffIdle;
+    }
+
+    private float RpmFromThrust(float thrustN, float maxThrustN)
+    {
+        float u = Mathf.Clamp01(thrustN / maxThrustN);
+        return Mathf.Lerp(idleRpm, maxRpm, Mathf.Sqrt(u));
+    }
+
+    private void Spin(Transform rotor, float rpm, float spinSign, float dt)
+    {
+        if (rotor == null)
+        {
+            return;
+        }
+
+        float deg =
+            spinSign * rpm * 360.0f * dt / 60.0f;
+
+        rotor.Rotate(localSpinAxis.normalized, deg, Space.Self);
+    }
+
+    private string Normalize(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "";
+        }
+
+        return value.ToLowerInvariant()
+            .Replace(" ", "")
+            .Replace("_", "")
+            .Replace("-", "")
+            .Replace("é", "e");
+    }
+}

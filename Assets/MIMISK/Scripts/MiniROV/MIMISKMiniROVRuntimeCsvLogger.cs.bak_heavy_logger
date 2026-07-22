@@ -1,0 +1,785 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVRuntimeCsvLogger : MonoBehaviour
+{
+    [Header("References")]
+    public Rigidbody rb;
+    public ControlManager controlManager;
+    public UnityVirtualESP32 unityVirtualESP32;
+
+    [Header("Optional Observed Components")]
+    public Behaviour plantBasedController;
+    public Behaviour directRaspberryBypassInput;
+    public Behaviour waterInteraction;
+    public Behaviour simpleBuoyancy;
+    public Behaviour sensorManager;
+
+    [Header("Logging")]
+    public bool autoStartOnPlay = true;
+    public bool logAllTheTime = true;
+    public float logRateHz = 50.0f;
+    public string testName = "minirov_runtime";
+    public string logSubfolder = "Logs/MiniROV";
+    public float waterLevelY = 0.0f;
+
+    [Header("Runtime")]
+    public bool logging;
+    public string currentCsvPath = "";
+    public string currentSummaryPath = "";
+    public int sampleCount;
+    public string activeCommandOwner = "unknown";
+    public string lastEvent = "idle";
+
+    private StreamWriter writer;
+    private float nextLogTime;
+    private float startTime;
+    private bool applicationQuitting;
+
+    private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        if (autoStartOnPlay)
+        {
+            StartLog();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!logging)
+        {
+            return;
+        }
+
+        if (Time.time < nextLogTime)
+        {
+            return;
+        }
+
+        float period =
+            1.0f / Mathf.Max(1.0f, logRateHz);
+
+        nextLogTime =
+            Time.time + period;
+
+        AutoFindReferences();
+        WriteSample();
+    }
+
+    private void OnApplicationQuit()
+    {
+        applicationQuitting = true;
+
+        if (logging)
+        {
+            StopLog();
+        }
+    }
+
+    private void OnDisable()
+    {
+        if (!applicationQuitting && logging)
+        {
+            StopLog();
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (logging)
+        {
+            StopLog();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (controlManager == null)
+        {
+            controlManager = GetComponent<ControlManager>();
+        }
+
+        if (unityVirtualESP32 == null)
+        {
+            unityVirtualESP32 = GetComponent<UnityVirtualESP32>();
+        }
+
+        if (plantBasedController == null)
+        {
+            plantBasedController =
+                FindBehaviourByClassName("MIMISKMiniROVPlantBasedController");
+        }
+
+        if (directRaspberryBypassInput == null)
+        {
+            directRaspberryBypassInput =
+                FindBehaviourByClassName("MIMISKMiniROVDirectRaspberryBypassInput");
+        }
+
+        if (waterInteraction == null)
+        {
+            waterInteraction =
+                FindBehaviourByClassName("MIMISKWaterInteraction");
+        }
+
+        if (simpleBuoyancy == null)
+        {
+            simpleBuoyancy =
+                FindBehaviourByClassName("SimpleROVBuoyancy");
+        }
+
+        if (sensorManager == null)
+        {
+            sensorManager =
+                FindBehaviourByClassName("SensorManager");
+        }
+    }
+
+    [ContextMenu("Start Log")]
+    public void StartLog()
+    {
+        AutoFindReferences();
+
+        StopWriterOnly();
+
+        sampleCount = 0;
+
+        string projectRoot =
+            Directory.GetParent(Application.dataPath).FullName;
+
+        string dir =
+            Path.Combine(projectRoot, logSubfolder);
+
+        Directory.CreateDirectory(dir);
+
+        string scene =
+            SceneManager.GetActiveScene().name;
+
+        string stamp =
+            DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+        string safeName =
+            MakeSafeFileName(testName);
+
+        string safeScene =
+            MakeSafeFileName(scene);
+
+        currentCsvPath =
+            Path.Combine(
+                dir,
+                "minirov_" + safeScene + "_" + safeName + "_" + stamp + ".csv"
+            );
+
+        currentSummaryPath =
+            Path.Combine(
+                dir,
+                "minirov_" + safeScene + "_" + safeName + "_" + stamp + "_summary.md"
+            );
+
+        writer =
+            new StreamWriter(currentCsvPath, false, Encoding.UTF8);
+
+        WriteHeader();
+
+        startTime =
+            Time.time;
+
+        nextLogTime =
+            Time.time;
+
+        logging =
+            true;
+
+        lastEvent =
+            "logging_started";
+
+        Debug.Log("[MIMISK] MiniROV runtime CSV logger started: " + currentCsvPath);
+    }
+
+    [ContextMenu("Stop Log")]
+    public void StopLog()
+    {
+        logging =
+            false;
+
+        StopWriterOnly();
+        WriteSummary();
+
+        lastEvent =
+            "logging_stopped";
+
+        Debug.Log("[MIMISK] MiniROV runtime CSV logger stopped: " + currentCsvPath);
+    }
+
+    private void StopWriterOnly()
+    {
+        if (writer != null)
+        {
+            writer.Flush();
+            writer.Close();
+            writer.Dispose();
+            writer = null;
+        }
+    }
+
+    private void WriteHeader()
+    {
+        writer.WriteLine(
+            "time_s,frame,scene,test_name,active_command_owner," +
+
+            "rov_enabled,rb_is_kinematic,rb_use_gravity," +
+            "position_x,position_y,position_z,depth_m," +
+            "rotation_x_deg,rotation_y_deg,rotation_z_deg," +
+            "linear_velocity_x,linear_velocity_y,linear_velocity_z," +
+            "angular_velocity_x,angular_velocity_y,angular_velocity_z," +
+            "body_surge_u_m_s,body_lateral_v_m_s,body_vertical_y_m_s,depth_rate_m_s,yaw_rate_rad_s," +
+
+            "plant_enabled,plant_controller_enabled,plant_mode," +
+            "plant_target_surge_m_s,plant_target_yaw_deg,plant_target_depth_m," +
+            "plant_target_point_x,plant_target_point_y,plant_target_point_z,plant_target_point_depth_m," +
+            "plant_surge_error_m_s,plant_yaw_error_deg,plant_depth_error_m," +
+            "plant_distance_to_target_m,plant_los_cross_track_error_m,plant_los_tracking_error_m," +
+            "plant_path_segment_index,plant_path_complete," +
+            "plant_surge_cmd,plant_yaw_cmd,plant_ballast_cmd," +
+            "plant_left_pwm,plant_right_pwm,plant_dc_port_pwm,plant_dc_starboard_pwm," +
+
+            "bypass_enabled,bypass_receiver_enabled,bypass_connected,bypass_packet_fresh,bypass_packets_received," +
+            "bypass_lx,bypass_ly,bypass_rx,bypass_ry,bypass_lt,bypass_rt," +
+            "bypass_throttle,bypass_yaw,bypass_vertical_dc," +
+            "bypass_thruster_port,bypass_thruster_starboard,bypass_dc_port,bypass_dc_starboard," +
+
+            "esp32_enabled,esp32_auto_open_on_start,esp32_motor_rx_connected,esp32_sensor_tx_connected," +
+            "esp32_motor_rx_hz,esp32_sensor_tx_hz," +
+            "esp32_last_left_thruster,esp32_last_right_thruster,esp32_last_dc_port,esp32_last_dc_starboard," +
+
+            "control_enabled,control_auto_open_on_start," +
+            "control_left_raw,control_right_raw,control_dc_port_raw,control_dc_starboard_raw," +
+            "control_left_command,control_right_command,control_dc_port_command,control_dc_starboard_command," +
+            "control_left_force,control_right_force,control_propulsion_force,control_yaw_differential_force," +
+            "control_thruster_max_force,control_deadzone_pwm,control_use_thruster_transform_forward," +
+
+            "water_enabled,buoyancy_enabled,sensor_manager_enabled"
+        );
+    }
+
+    private void WriteSample()
+    {
+        if (writer == null)
+        {
+            return;
+        }
+
+        sampleCount++;
+
+        Vector3 pos =
+            rb != null ? rb.position : transform.position;
+
+        Vector3 euler =
+            transform.eulerAngles;
+
+        Vector3 linVel =
+            rb != null ? rb.linearVelocity : Vector3.zero;
+
+        Vector3 angVel =
+            rb != null ? rb.angularVelocity : Vector3.zero;
+
+        float bodyU =
+            Vector3.Dot(linVel, transform.forward);
+
+        float bodyV =
+            Vector3.Dot(linVel, transform.right);
+
+        float bodyY =
+            Vector3.Dot(linVel, transform.up);
+
+        float depth =
+            waterLevelY - pos.y;
+
+        float depthRate =
+            -linVel.y;
+
+        activeCommandOwner =
+            DetermineActiveCommandOwner();
+
+        StringBuilder sb =
+            new StringBuilder(4096);
+
+        Append(sb, Time.time - startTime);
+        Append(sb, Time.frameCount);
+        AppendText(sb, SceneManager.GetActiveScene().name);
+        AppendText(sb, testName);
+        AppendText(sb, activeCommandOwner);
+
+        AppendBool(sb, enabled);
+        AppendBool(sb, rb != null && rb.isKinematic);
+        AppendBool(sb, rb != null && rb.useGravity);
+
+        Append(sb, pos.x);
+        Append(sb, pos.y);
+        Append(sb, pos.z);
+        Append(sb, depth);
+
+        Append(sb, euler.x);
+        Append(sb, euler.y);
+        Append(sb, euler.z);
+
+        Append(sb, linVel.x);
+        Append(sb, linVel.y);
+        Append(sb, linVel.z);
+
+        Append(sb, angVel.x);
+        Append(sb, angVel.y);
+        Append(sb, angVel.z);
+
+        Append(sb, bodyU);
+        Append(sb, bodyV);
+        Append(sb, bodyY);
+        Append(sb, depthRate);
+        Append(sb, angVel.y);
+
+        // Plant-based controller.
+        AppendBool(sb, plantBasedController != null && plantBasedController.enabled);
+        AppendBool(sb, ReadBool(plantBasedController, false, "controllerEnabled"));
+        AppendText(sb, ReadString(plantBasedController, "controlMode", "missing"));
+
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "targetSurgeSpeedMS"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "targetYawDeg"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "targetDepthM"));
+
+        AppendVector3(sb, ReadVector3(plantBasedController, "targetPointWorld"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "targetPointDepthM"));
+
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "surgeErrorMS"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "yawErrorDeg"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "depthErrorM"));
+
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "distanceToTargetM"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "losCrossTrackErrorM"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "losTrackingErrorM"));
+
+        Append(sb, ReadInt(plantBasedController, -1, "pathSegmentIndex"));
+        AppendBool(sb, ReadBool(plantBasedController, false, "pathComplete"));
+
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "surgeCmd"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "yawCmd"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "ballastCmd"));
+
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "leftPwm"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "rightPwm"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "dcPortPwm"));
+        Append(sb, ReadFloat(plantBasedController, float.NaN, "dcStarboardPwm"));
+
+        // Direct Raspberry bypass input.
+        AppendBool(sb, directRaspberryBypassInput != null && directRaspberryBypassInput.enabled);
+        AppendBool(sb, ReadBool(directRaspberryBypassInput, false, "receiverEnabled"));
+        AppendBool(sb, ReadBool(directRaspberryBypassInput, false, "connected"));
+        AppendBool(sb, ReadBool(directRaspberryBypassInput, false, "packetFresh"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "packetsReceived"));
+
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "lx"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "ly"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "rx"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "ry"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "lt"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "rt"));
+
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "throttle"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "yaw"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "verticalDc"));
+
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "thrusterPort"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "thrusterStarboard"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "dcPort"));
+        Append(sb, ReadFloat(directRaspberryBypassInput, float.NaN, "dcStarboard"));
+
+        // UnityVirtualESP32.
+        AppendBool(sb, unityVirtualESP32 != null && unityVirtualESP32.enabled);
+        AppendBool(sb, ReadBool(unityVirtualESP32, false, "autoOpenOnStart"));
+        AppendBool(sb, ReadBool(unityVirtualESP32, false, "motorRxConnected"));
+        AppendBool(sb, ReadBool(unityVirtualESP32, false, "sensorTxConnected"));
+
+        Append(sb, ReadFloat(unityVirtualESP32, float.NaN, "motorRxHz"));
+        Append(sb, ReadFloat(unityVirtualESP32, float.NaN, "sensorTxHz"));
+
+        Append(sb, ReadFirstFloat(unityVirtualESP32, "lastLeftThruster", "leftThruster", "thrusterPort"));
+        Append(sb, ReadFirstFloat(unityVirtualESP32, "lastRightThruster", "rightThruster", "thrusterStarboard"));
+        Append(sb, ReadFirstFloat(unityVirtualESP32, "lastDcPort", "dcPort"));
+        Append(sb, ReadFirstFloat(unityVirtualESP32, "lastDcStarboard", "dcStarboard"));
+
+        // ControlManager.
+        AppendBool(sb, controlManager != null && controlManager.enabled);
+        AppendBool(sb, ReadBool(controlManager, false, "autoOpenOnStart"));
+
+        Append(sb, ReadFirstFloat(controlManager, "leftThrusterRaw", "leftRaw", "lastLeftThruster", "thrusterPortRaw"));
+        Append(sb, ReadFirstFloat(controlManager, "rightThrusterRaw", "rightRaw", "lastRightThruster", "thrusterStarboardRaw"));
+        Append(sb, ReadFirstFloat(controlManager, "dcPortRaw", "dc1Raw", "lastDcPort"));
+        Append(sb, ReadFirstFloat(controlManager, "dcStarboardRaw", "dc2Raw", "lastDcStarboard"));
+
+        Append(sb, ReadFirstFloat(controlManager, "leftThrusterCommand", "leftCommand", "leftCmd"));
+        Append(sb, ReadFirstFloat(controlManager, "rightThrusterCommand", "rightCommand", "rightCmd"));
+        Append(sb, ReadFirstFloat(controlManager, "dcPortCommand", "dc1Command", "dcPortCmd"));
+        Append(sb, ReadFirstFloat(controlManager, "dcStarboardCommand", "dc2Command", "dcStarboardCmd"));
+
+        Append(sb, ReadFirstFloat(controlManager, "leftThrusterForce", "leftForce", "portThrusterForce"));
+        Append(sb, ReadFirstFloat(controlManager, "rightThrusterForce", "rightForce", "starboardThrusterForce"));
+        Append(sb, ReadFirstFloat(controlManager, "propulsionForce", "surgeForce", "forwardForce"));
+        Append(sb, ReadFirstFloat(controlManager, "yawDifferentialForce", "differentialForce", "yawForce"));
+
+        Append(sb, ReadFirstFloat(controlManager, "thrusterMaxForce", "maxThrusterForce"));
+        Append(sb, ReadFirstFloat(controlManager, "thrusterDeadzonePwm", "deadzonePwm"));
+        AppendBool(sb, ReadBool(controlManager, false, "useThrusterTransformForward"));
+
+        AppendBool(sb, waterInteraction != null && waterInteraction.enabled);
+        AppendBool(sb, simpleBuoyancy != null && simpleBuoyancy.enabled);
+        AppendBoolLast(sb, sensorManager != null && sensorManager.enabled);
+
+        writer.WriteLine(sb.ToString());
+
+        if (sampleCount % 100 == 0)
+        {
+            writer.Flush();
+        }
+    }
+
+    private string DetermineActiveCommandOwner()
+    {
+        bool plantActive =
+            plantBasedController != null &&
+            plantBasedController.enabled &&
+            ReadBool(plantBasedController, false, "controllerEnabled");
+
+        if (plantActive)
+        {
+            return "plant_based_controller";
+        }
+
+        bool bypassActive =
+            directRaspberryBypassInput != null &&
+            directRaspberryBypassInput.enabled &&
+            ReadBool(directRaspberryBypassInput, false, "receiverEnabled");
+
+        if (bypassActive)
+        {
+            return "direct_raspberry_bypass";
+        }
+
+        bool espActive =
+            unityVirtualESP32 != null &&
+            unityVirtualESP32.enabled &&
+            ReadBool(unityVirtualESP32, false, "motorRxConnected");
+
+        if (espActive)
+        {
+            return "unity_virtual_esp32";
+        }
+
+        return "unknown";
+    }
+
+    private void WriteSummary()
+    {
+        if (string.IsNullOrEmpty(currentSummaryPath))
+        {
+            return;
+        }
+
+        StringBuilder sb =
+            new StringBuilder();
+
+        sb.AppendLine("# MiniROV Runtime CSV Log");
+        sb.AppendLine();
+        sb.AppendLine("- CSV: `" + currentCsvPath + "`");
+        sb.AppendLine("- Scene: `" + SceneManager.GetActiveScene().name + "`");
+        sb.AppendLine("- Test name: `" + testName + "`");
+        sb.AppendLine("- Samples: `" + sampleCount + "`");
+        sb.AppendLine("- Last active command owner: `" + activeCommandOwner + "`");
+        sb.AppendLine();
+        sb.AppendLine("Upload the CSV file for detailed analysis.");
+
+        File.WriteAllText(currentSummaryPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private Behaviour FindBehaviourByClassName(string className)
+    {
+        Type type =
+            FindTypeByName(className);
+
+        if (type == null)
+        {
+            return null;
+        }
+
+        Component c =
+            GetComponent(type);
+
+        return c as Behaviour;
+    }
+
+    private Type FindTypeByName(string className)
+    {
+        Assembly[] assemblies =
+            AppDomain.CurrentDomain.GetAssemblies();
+
+        for (int a = 0; a < assemblies.Length; a++)
+        {
+            Type t =
+                assemblies[a].GetType(className);
+
+            if (t != null)
+            {
+                return t;
+            }
+
+            Type[] types;
+
+            try
+            {
+                types =
+                    assemblies[a].GetTypes();
+            }
+            catch
+            {
+                continue;
+            }
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                if (types[i].Name == className)
+                {
+                    return types[i];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private float ReadFirstFloat(object target, params string[] names)
+    {
+        if (names == null)
+        {
+            return float.NaN;
+        }
+
+        for (int i = 0; i < names.Length; i++)
+        {
+            float v =
+                ReadFloat(target, float.NaN, names[i]);
+
+            if (!float.IsNaN(v))
+            {
+                return v;
+            }
+        }
+
+        return float.NaN;
+    }
+
+    private float ReadFloat(object target, float fallback, string name)
+    {
+        object raw;
+
+        if (!TryReadMember(target, name, out raw))
+        {
+            return fallback;
+        }
+
+        try
+        {
+            return Convert.ToSingle(raw, CI);
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private int ReadInt(object target, int fallback, string name)
+    {
+        object raw;
+
+        if (!TryReadMember(target, name, out raw))
+        {
+            return fallback;
+        }
+
+        try
+        {
+            return Convert.ToInt32(raw, CI);
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private bool ReadBool(object target, bool fallback, string name)
+    {
+        object raw;
+
+        if (!TryReadMember(target, name, out raw))
+        {
+            return fallback;
+        }
+
+        try
+        {
+            return Convert.ToBoolean(raw, CI);
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private string ReadString(object target, string name, string fallback)
+    {
+        object raw;
+
+        if (!TryReadMember(target, name, out raw))
+        {
+            return fallback;
+        }
+
+        return raw != null ? raw.ToString() : fallback;
+    }
+
+    private Vector3 ReadVector3(object target, string name)
+    {
+        object raw;
+
+        if (!TryReadMember(target, name, out raw))
+        {
+            return Vector3.zero;
+        }
+
+        if (raw is Vector3)
+        {
+            return (Vector3)raw;
+        }
+
+        return Vector3.zero;
+    }
+
+    private bool TryReadMember(object target, string name, out object value)
+    {
+        value =
+            null;
+
+        if (target == null || string.IsNullOrEmpty(name))
+        {
+            return false;
+        }
+
+        BindingFlags flags =
+            BindingFlags.Instance |
+            BindingFlags.Public |
+            BindingFlags.NonPublic;
+
+        Type t =
+            target.GetType();
+
+        FieldInfo f =
+            t.GetField(name, flags);
+
+        if (f != null)
+        {
+            value =
+                f.GetValue(target);
+
+            return true;
+        }
+
+        PropertyInfo p =
+            t.GetProperty(name, flags);
+
+        if (p != null && p.CanRead)
+        {
+            value =
+                p.GetValue(target, null);
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void Append(StringBuilder sb, float value)
+    {
+        sb.Append(value.ToString("G9", CI));
+        sb.Append(',');
+    }
+
+    private static void Append(StringBuilder sb, int value)
+    {
+        sb.Append(value.ToString(CI));
+        sb.Append(',');
+    }
+
+    private static void AppendBool(StringBuilder sb, bool value)
+    {
+        sb.Append(value ? "1" : "0");
+        sb.Append(',');
+    }
+
+    private static void AppendText(StringBuilder sb, string value)
+    {
+        sb.Append('"');
+        sb.Append((value ?? "").Replace("\"", "\"\""));
+        sb.Append('"');
+        sb.Append(',');
+    }
+
+    private static void AppendVector3(StringBuilder sb, Vector3 value)
+    {
+        Append(sb, value.x);
+        Append(sb, value.y);
+        Append(sb, value.z);
+    }
+
+    private static void AppendBoolLast(StringBuilder sb, bool value)
+    {
+        sb.Append(value ? "1" : "0");
+    }
+
+    private static string MakeSafeFileName(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "test";
+        }
+
+        char[] invalid =
+            Path.GetInvalidFileNameChars();
+
+        string output =
+            value;
+
+        for (int i = 0; i < invalid.Length; i++)
+        {
+            output =
+                output.Replace(invalid[i], '_');
+        }
+
+        return output.Replace(' ', '_');
+    }
+}

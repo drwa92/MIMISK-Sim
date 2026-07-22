@@ -1,0 +1,12 @@
+flowchart TD
+    A["Start Unity + gRPC server"] --> B["Verify telemetry / TF / clock"]
+    B --> C["Drone surface-ready"]
+    C --> D["Attach ROV"]
+    D --> E["Deploy ROV"]
+    E --> F["Activate ROV control"]
+    F --> G["Enable TMS"]
+    G --> H["Select MiniROV path"]
+    H --> I["Run MiniROV mission"]
+    I --> J["Return home"]
+    J --> K["Recover ROV"]
+    K --> L["Save rosbag + summary"]

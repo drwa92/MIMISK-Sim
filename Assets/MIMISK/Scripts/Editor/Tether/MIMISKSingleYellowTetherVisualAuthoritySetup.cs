@@ -1,0 +1,255 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKSingleYellowTetherVisualAuthoritySetup
+{
+    [MenuItem("MIMISK/Tether/Setup Single Yellow Tether Visual Authority")]
+    public static void SetupSingleYellowTetherVisualAuthority()
+    {
+        GameObject root =
+            Selection.activeGameObject;
+
+        if (root == null)
+        {
+            MIMISKDroneCoreTetherManager tether =
+                Object.FindFirstObjectByType<MIMISKDroneCoreTetherManager>();
+
+            if (tether != null)
+            {
+                root =
+                    tether.gameObject;
+            }
+        }
+
+        if (root == null)
+        {
+            Debug.LogError("[MIMISK] Select the Drone / tether root first.");
+            return;
+        }
+
+        DisableDuplicateVisualComponents(root);
+        HideDuplicateVisualObjects(root);
+
+        MIMISKSingleYellowTetherVisualAuthority visual =
+            root.GetComponent<MIMISKSingleYellowTetherVisualAuthority>();
+
+        if (visual == null)
+        {
+            visual =
+                root.AddComponent<MIMISKSingleYellowTetherVisualAuthority>();
+        }
+
+        visual.unifiedTether =
+            root.GetComponent<MIMISKUnifiedTetherManager>();
+
+        visual.tetherManager =
+            root.GetComponent<MIMISKDroneCoreTetherManager>();
+
+        visual.visualAuthorityEnabled = true;
+        visual.disableDuplicateVisualComponents = true;
+        visual.deactivateDuplicateCableObjects = true;
+        visual.hideOtherTetherLineRenderers = true;
+        visual.hideShortYellowCableMeshRenderer = true;
+        visual.forceValidYellowMaterial = true;
+        visual.preferredYellowMaterialName = "yellow_winch_cable_rope";
+        visual.fallbackYellowCableColor = new Color(1.0f, 0.78f, 0.05f, 1.0f);
+
+        visual.lineSegments = 48;
+        visual.lineWidthM = 0.014f;
+
+        visual.minimumSagM = 0.015f;
+        visual.slackSagGain = 0.35f;
+        visual.maxSagM = 0.55f;
+        visual.minimumDynamicSideCurveM = 0.08f;
+
+        visual.enableCurrentDeflection = true;
+        visual.currentDirectionWorld = new Vector3(1.0f, 0.0f, 0.20f);
+        visual.currentDeflectionGain = 0.10f;
+        visual.maxCurrentDeflectionM = 0.35f;
+
+        visual.enableSmallWaveMotion = true;
+        visual.waveAmplitudeM = 0.010f;
+        visual.waveSpatialFrequency = 1.8f;
+        visual.waveTemporalFrequency = 0.45f;
+
+        visual.AutoFindReferences();
+        visual.ConfigureSingleCableVisual();
+
+        if (visual.tetherManager != null)
+        {
+            if (visual.fairlead != null)
+            {
+                visual.tetherManager.fairleadLineStart =
+                    visual.fairlead;
+            }
+
+            if (visual.primaryLine != null)
+            {
+                visual.tetherManager.tetherLineRenderer =
+                    visual.primaryLine;
+            }
+
+            if (visual.yellowCableEnd != null)
+            {
+                visual.tetherManager.movingTetherEndVisual =
+                    visual.yellowCableEnd;
+            }
+
+            visual.tetherManager.hideStaticShortCableMeshWhenDynamic = false;
+            visual.tetherManager.staticShortDeploymentCableMesh = null;
+
+            EditorUtility.SetDirty(visual.tetherManager);
+        }
+
+        if (visual.unifiedTether != null)
+        {
+            if (visual.fairlead != null)
+            {
+                visual.unifiedTether.fairleadLineStart =
+                    visual.fairlead;
+            }
+
+            if (visual.yellowCableEnd != null)
+            {
+                visual.unifiedTether.yellowCableEndPoint =
+                    visual.yellowCableEnd;
+            }
+
+            if (visual.hookVisual != null)
+            {
+                visual.unifiedTether.hookVisual =
+                    visual.hookVisual;
+            }
+
+            if (visual.primaryLine != null)
+            {
+                visual.unifiedTether.activeYellowLine =
+                    visual.primaryLine;
+            }
+
+            EditorUtility.SetDirty(visual.unifiedTether);
+        }
+
+        EditorUtility.SetDirty(visual);
+
+        EditorSceneManager.MarkSceneDirty(
+            EditorSceneManager.GetActiveScene()
+        );
+
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] Single Yellow Tether Visual Authority configured. Duplicate tether visuals disabled/hidden.");
+    }
+
+    private static void DisableDuplicateVisualComponents(GameObject root)
+    {
+        string[] duplicateTypeNames =
+        {
+            "MIMISKWinchRopeSingleVisual",
+            "MIMISKTetherCableModel",
+            "MIMISKFinalTetherEndpointRig",
+            "MIMISKFinalTetherLineSynchronizer",
+            "MIMISKMiniROVTetherVisualBridge",
+            "MIMISKFinalContinuousTetherVisual",
+            "MIMISKFinalTetherVisualBridge"
+        };
+
+        MonoBehaviour[] behaviours =
+            root.GetComponents<MonoBehaviour>();
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b =
+                behaviours[i];
+
+            if (b == null)
+            {
+                continue;
+            }
+
+            string typeName =
+                b.GetType().Name;
+
+            for (int j = 0; j < duplicateTypeNames.Length; j++)
+            {
+                if (typeName == duplicateTypeNames[j])
+                {
+                    b.enabled = false;
+                    EditorUtility.SetDirty(b);
+                }
+            }
+        }
+    }
+
+    private static void HideDuplicateVisualObjects(GameObject root)
+    {
+        string[] duplicateNames =
+        {
+            "MIMISK_RealisticTetherCableMesh",
+            "MIMISK_FinalActiveYellowTether",
+            "MIMISK_Final_ActiveYellowTether",
+            "MIMISK_Final_ContinuousYellowTether",
+            "MIMISK_Final_ActiveYellowTetherLine",
+            "MIMISK_Final_ContinuousYellowTetherLine",
+            "MIMISK_Final_TetherCable",
+            "MIMISK_FinalCable",
+            "MIMISK_ContinuousYellowTether"
+        };
+
+        for (int i = 0; i < duplicateNames.Length; i++)
+        {
+            Transform t =
+                FindDeepChild(root.transform, duplicateNames[i]);
+
+            if (t == null)
+            {
+                continue;
+            }
+
+            Renderer[] renderers =
+                t.GetComponentsInChildren<Renderer>(true);
+
+            for (int r = 0; r < renderers.Length; r++)
+            {
+                renderers[r].enabled = false;
+                EditorUtility.SetDirty(renderers[r]);
+            }
+
+            LineRenderer[] lines =
+                t.GetComponentsInChildren<LineRenderer>(true);
+
+            for (int l = 0; l < lines.Length; l++)
+            {
+                lines[l].enabled = false;
+                EditorUtility.SetDirty(lines[l]);
+            }
+        }
+    }
+
+    private static Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null || string.IsNullOrEmpty(childName))
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

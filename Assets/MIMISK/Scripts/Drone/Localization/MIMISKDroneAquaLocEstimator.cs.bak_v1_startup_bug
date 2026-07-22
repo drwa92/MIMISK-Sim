@@ -1,0 +1,627 @@
+using UnityEngine;
+
+public class MIMISKDroneAquaLocEstimator : MonoBehaviour
+{
+    public enum AquaMode
+    {
+        Unknown,
+        Airborne,
+        LandingApproach,
+        WaterContact,
+        SurfaceFloat
+    }
+
+    [Header("Sensor References")]
+    public MIMISKDroneImuDevice imu;
+    public MIMISKDroneBarometerDevice barometer;
+    public MIMISKDroneMagnetometerDevice magnetometer;
+    public MIMISKDroneGnssDevice gnss;
+    public MIMISKDroneRangefinderDevice rangefinder;
+    public MIMISKDroneSurfaceBuoyancy surfaceBuoyancy;
+    public MIMISKDroneBatteryPowerDevice batteryPower;
+
+    [Header("Estimator Enable")]
+    public bool estimatorEnabled = true;
+    public bool resetOnStart = true;
+
+    [Header("Mode Logic")]
+    public AquaMode currentMode = AquaMode.Unknown;
+    public float landingApproachRangeM = 3.0f;
+    public int waterContactMinBuoyancyPoints = 1;
+    public int surfaceFloatMinBuoyancyPoints = 3;
+
+    [Header("IMU Propagation")]
+    public bool useImuPropagation = true;
+    public Vector3 estimatedGyroBiasRadS;
+    public Vector3 estimatedAccelBiasMS2;
+    public float gyroBiasLeak = 0.001f;
+    public float accelBiasLeak = 0.001f;
+
+    [Header("Robust Fusion Gains")]
+    public float gnssPositionGain = 2.5f;
+    public float gnssVelocityGain = 3.5f;
+    public float barometerGain = 3.5f;
+    public float rangefinderGain = 8.0f;
+    public float magnetometerYawGain = 2.0f;
+    public float accelerometerTiltGain = 2.0f;
+    public float surfaceConstraintGain = 10.0f;
+
+    [Header("Measurement Standard Deviations")]
+    public float gnssHorizontalSigmaM = 1.2f;
+    public float gnssVerticalSigmaM = 1.8f;
+    public float gnssVelocitySigmaMS = 0.18f;
+    public float barometerSigmaM = 0.15f;
+    public float rangefinderSigmaM = 0.05f;
+    public float magnetometerYawSigmaDeg = 4.0f;
+
+    [Header("Robust Gating")]
+    public bool enableRobustGating = true;
+    public float softGate = 2.5f;
+    public float hardGate = 6.0f;
+
+    [Header("Surface / Water Constraints")]
+    public bool enableSurfaceConstraint = true;
+    public float waterSurfaceY = 0.0f;
+    public float surfaceFloatRootHeightM = 0.35f;
+    public bool disableOpticalRangefinderWhenWet = true;
+
+    [Header("Estimated State")]
+    public bool estimatorReady;
+    public Vector3 estimatedPositionWorld;
+    public Vector3 estimatedVelocityWorld;
+    public Quaternion estimatedRotationWorld;
+    public Vector3 estimatedEulerDeg;
+    public Vector3 estimatedBodyRatesRadS;
+    public float estimatedYawDeg;
+    public float estimatedHeightAboveWaterM;
+
+    [Header("Sensor Usage Flags")]
+    public bool usedImu;
+    public bool usedGnss;
+    public bool usedBarometer;
+    public bool usedRangefinder;
+    public bool usedMagnetometer;
+    public bool usedSurfaceConstraint;
+    public bool rejectedGnss;
+    public bool rejectedBarometer;
+    public bool rejectedRangefinder;
+    public bool rejectedMagnetometer;
+
+    [Header("Robust Weights")]
+    public float gnssPositionWeight;
+    public float gnssVelocityWeight;
+    public float barometerWeight;
+    public float rangefinderWeight;
+    public float magnetometerWeight;
+    public float surfaceConstraintWeight;
+
+    [Header("Innovation Debug")]
+    public Vector3 gnssPositionInnovationM;
+    public Vector3 gnssVelocityInnovationMS;
+    public float barometerInnovationM;
+    public float rangefinderInnovationM;
+    public float surfaceConstraintInnovationM;
+    public float yawInnovationDeg;
+
+    [Header("Truth Debug")]
+    public Vector3 truePositionWorld;
+    public Vector3 trueVelocityWorld;
+    public Vector3 trueEulerDeg;
+    public float trueYawDeg;
+
+    private Rigidbody rb;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+        AutoFindSensors();
+    }
+
+    private void Start()
+    {
+        if (resetOnStart)
+        {
+            ResetEstimator();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!estimatorEnabled)
+        {
+            return;
+        }
+
+        if (!estimatorReady)
+        {
+            ResetEstimator();
+            return;
+        }
+
+        ResetUsageFlags();
+        UpdateTruthDebug();
+        UpdateMode();
+
+        float dt = Time.fixedDeltaTime;
+
+        PropagateWithImu(dt);
+        CorrectWithGnss(dt);
+        CorrectWithBarometer(dt);
+        CorrectWithRangefinder(dt);
+        CorrectWithMagnetometer(dt);
+        CorrectWithSurfaceConstraint(dt);
+
+        ApplyBiasLeak(dt);
+        UpdateOutputs();
+    }
+
+    [ContextMenu("Auto Find Sensors")]
+    public void AutoFindSensors()
+    {
+        if (imu == null) imu = GetComponentInChildren<MIMISKDroneImuDevice>();
+        if (barometer == null) barometer = GetComponentInChildren<MIMISKDroneBarometerDevice>();
+        if (magnetometer == null) magnetometer = GetComponentInChildren<MIMISKDroneMagnetometerDevice>();
+        if (gnss == null) gnss = GetComponentInChildren<MIMISKDroneGnssDevice>();
+        if (rangefinder == null) rangefinder = GetComponentInChildren<MIMISKDroneRangefinderDevice>();
+        if (surfaceBuoyancy == null) surfaceBuoyancy = GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        if (batteryPower == null) batteryPower = GetComponentInChildren<MIMISKDroneBatteryPowerDevice>();
+    }
+
+    [ContextMenu("Reset AquaLoc Estimator")]
+    public void ResetEstimator()
+    {
+        AutoFindSensors();
+
+        estimatedPositionWorld = transform.position;
+        estimatedVelocityWorld = rb != null ? rb.linearVelocity : Vector3.zero;
+        estimatedRotationWorld = transform.rotation;
+
+        if (gnss != null && gnss.fixType != MIMISKDroneGnssDevice.FixType.NoFix)
+        {
+            estimatedPositionWorld = gnss.homeWorldPosition + gnss.localPositionENU_M;
+            estimatedVelocityWorld = gnss.velocityENU_MS;
+        }
+
+        if (imu != null)
+        {
+            Vector3 imuEuler = imu.transform.eulerAngles;
+
+            if (magnetometer != null)
+            {
+                imuEuler.y = Wrap360(magnetometer.magneticHeadingDeg + magnetometer.declinationDeg);
+            }
+
+            estimatedRotationWorld = Quaternion.Euler(imuEuler);
+        }
+
+        estimatedGyroBiasRadS = Vector3.zero;
+        estimatedAccelBiasMS2 = Vector3.zero;
+
+        UpdateOutputs();
+        estimatorReady = true;
+    }
+
+    private void ResetUsageFlags()
+    {
+        usedImu = false;
+        usedGnss = false;
+        usedBarometer = false;
+        usedRangefinder = false;
+        usedMagnetometer = false;
+        usedSurfaceConstraint = false;
+
+        rejectedGnss = false;
+        rejectedBarometer = false;
+        rejectedRangefinder = false;
+        rejectedMagnetometer = false;
+
+        gnssPositionWeight = 0.0f;
+        gnssVelocityWeight = 0.0f;
+        barometerWeight = 0.0f;
+        rangefinderWeight = 0.0f;
+        magnetometerWeight = 0.0f;
+        surfaceConstraintWeight = 0.0f;
+    }
+
+    private void UpdateMode()
+    {
+        bool buoyancyContact =
+            surfaceBuoyancy != null &&
+            surfaceBuoyancy.activePointCount >= waterContactMinBuoyancyPoints;
+
+        bool strongFloatContact =
+            surfaceBuoyancy != null &&
+            surfaceBuoyancy.activePointCount >= surfaceFloatMinBuoyancyPoints;
+
+        bool validRange =
+            rangefinder != null &&
+            rangefinder.validReturn &&
+            rangefinder.verticalDistanceM > 0.0f;
+
+        if (strongFloatContact)
+        {
+            currentMode = AquaMode.SurfaceFloat;
+        }
+        else if (buoyancyContact)
+        {
+            currentMode = AquaMode.WaterContact;
+        }
+        else if (validRange && rangefinder.verticalDistanceM < landingApproachRangeM)
+        {
+            currentMode = AquaMode.LandingApproach;
+        }
+        else
+        {
+            currentMode = AquaMode.Airborne;
+        }
+    }
+
+    private void PropagateWithImu(float dt)
+    {
+        if (!useImuPropagation || imu == null)
+        {
+            return;
+        }
+
+        usedImu = true;
+
+        Vector3 omegaBody = imu.gyroscopeBodyRadS - estimatedGyroBiasRadS;
+        estimatedBodyRatesRadS = omegaBody;
+
+        Quaternion dq = Quaternion.Euler(
+            omegaBody.x * Mathf.Rad2Deg * dt,
+            omegaBody.y * Mathf.Rad2Deg * dt,
+            omegaBody.z * Mathf.Rad2Deg * dt
+        );
+
+        estimatedRotationWorld = estimatedRotationWorld * dq;
+
+        Vector3 accelBody = imu.accelerometerBodyMS2 - estimatedAccelBiasMS2;
+
+        CorrectTiltWithAccelerometer(accelBody, dt);
+
+        Vector3 accelWorld = estimatedRotationWorld * accelBody + Physics.gravity;
+
+        estimatedVelocityWorld += accelWorld * dt;
+        estimatedPositionWorld += estimatedVelocityWorld * dt;
+    }
+
+    private void CorrectTiltWithAccelerometer(Vector3 accelBody, float dt)
+    {
+        float g = Mathf.Abs(Physics.gravity.y);
+        float accelMag = accelBody.magnitude;
+
+        if (accelMag < 0.1f)
+        {
+            return;
+        }
+
+        // Only use accelerometer for tilt when it looks close to gravity.
+        if (Mathf.Abs(accelMag - g) > 2.5f)
+        {
+            return;
+        }
+
+        Vector3 measuredUpBody = accelBody.normalized;
+        Vector3 predictedUpBody = Quaternion.Inverse(estimatedRotationWorld) * Vector3.up;
+
+        Vector3 errorBody = Vector3.Cross(predictedUpBody, measuredUpBody);
+
+        Vector3 correctionDeg =
+            errorBody * accelerometerTiltGain * Mathf.Rad2Deg * dt;
+
+        estimatedRotationWorld =
+            estimatedRotationWorld *
+            Quaternion.Euler(correctionDeg.x, 0.0f, correctionDeg.z);
+    }
+
+    private void CorrectWithGnss(float dt)
+    {
+        if (gnss == null || gnss.fixType == MIMISKDroneGnssDevice.FixType.NoFix)
+        {
+            return;
+        }
+
+        Vector3 measuredPosition = gnss.homeWorldPosition + gnss.localPositionENU_M;
+        Vector3 measuredVelocity = gnss.velocityENU_MS;
+
+        gnssPositionInnovationM = measuredPosition - estimatedPositionWorld;
+        gnssVelocityInnovationMS = measuredVelocity - estimatedVelocityWorld;
+
+        float sx = Mathf.Max(0.05f, gnssHorizontalSigmaM);
+        float sy = Mathf.Max(0.05f, gnssVerticalSigmaM);
+        float sz = Mathf.Max(0.05f, gnssHorizontalSigmaM);
+
+        float normalizedPositionError =
+            Mathf.Sqrt(
+                Mathf.Pow(gnssPositionInnovationM.x / sx, 2.0f) +
+                Mathf.Pow(gnssPositionInnovationM.y / sy, 2.0f) +
+                Mathf.Pow(gnssPositionInnovationM.z / sz, 2.0f)
+            );
+
+        gnssPositionWeight = RobustWeight(normalizedPositionError);
+
+        float normalizedVelocityError =
+            gnssVelocityInnovationMS.magnitude /
+            Mathf.Max(0.05f, gnssVelocitySigmaMS);
+
+        gnssVelocityWeight = RobustWeight(normalizedVelocityError);
+
+        if (gnssPositionWeight <= 0.0f)
+        {
+            rejectedGnss = true;
+        }
+        else
+        {
+            float alpha = Alpha(gnssPositionGain * gnssPositionWeight, dt);
+            estimatedPositionWorld =
+                Vector3.Lerp(estimatedPositionWorld, measuredPosition, alpha);
+            usedGnss = true;
+        }
+
+        if (gnssVelocityWeight > 0.0f)
+        {
+            float alpha = Alpha(gnssVelocityGain * gnssVelocityWeight, dt);
+            estimatedVelocityWorld =
+                Vector3.Lerp(estimatedVelocityWorld, measuredVelocity, alpha);
+            usedGnss = true;
+        }
+    }
+
+    private void CorrectWithBarometer(float dt)
+    {
+        if (barometer == null)
+        {
+            return;
+        }
+
+        float measuredY = barometer.homeWorldY + barometer.relativeAltitudeM;
+        barometerInnovationM = measuredY - estimatedPositionWorld.y;
+
+        float normalizedError =
+            Mathf.Abs(barometerInnovationM) /
+            Mathf.Max(0.03f, barometerSigmaM);
+
+        barometerWeight = RobustWeight(normalizedError);
+
+        if (barometerWeight <= 0.0f)
+        {
+            rejectedBarometer = true;
+            return;
+        }
+
+        float alpha = Alpha(barometerGain * barometerWeight, dt);
+
+        estimatedPositionWorld.y =
+            Mathf.Lerp(estimatedPositionWorld.y, measuredY, alpha);
+
+        estimatedVelocityWorld.y =
+            Mathf.Lerp(estimatedVelocityWorld.y, barometer.verticalSpeedMS, alpha * 0.4f);
+
+        usedBarometer = true;
+    }
+
+    private void CorrectWithRangefinder(float dt)
+    {
+        if (rangefinder == null)
+        {
+            return;
+        }
+
+        bool wet =
+            disableOpticalRangefinderWhenWet &&
+            rangefinder.sensorFrame != null &&
+            rangefinder.sensorFrame.position.y <= rangefinder.waterLevelY + 0.02f;
+
+        bool usable =
+            rangefinder.validReturn &&
+            !wet &&
+            rangefinder.verticalDistanceM > 0.0f &&
+            rangefinder.verticalDistanceM < rangefinder.maxRangeM;
+
+        if (!usable)
+        {
+            return;
+        }
+
+        float sensorOffsetY =
+            rangefinder.sensorFrame != null
+                ? transform.TransformVector(rangefinder.sensorFrame.localPosition).y
+                : 0.0f;
+
+        float measuredRootY =
+            rangefinder.waterLevelY +
+            rangefinder.verticalDistanceM -
+            sensorOffsetY;
+
+        rangefinderInnovationM = measuredRootY - estimatedPositionWorld.y;
+
+        float sigma =
+            Mathf.Max(rangefinderSigmaM, 0.02f + rangefinder.verticalDistanceM * 0.01f);
+
+        float normalizedError =
+            Mathf.Abs(rangefinderInnovationM) / Mathf.Max(0.02f, sigma);
+
+        rangefinderWeight = RobustWeight(normalizedError);
+
+        if (rangefinderWeight <= 0.0f)
+        {
+            rejectedRangefinder = true;
+            return;
+        }
+
+        float gain = rangefinderGain;
+
+        if (currentMode == AquaMode.LandingApproach)
+        {
+            gain *= 1.5f;
+        }
+
+        float alpha = Alpha(gain * rangefinderWeight, dt);
+
+        estimatedPositionWorld.y =
+            Mathf.Lerp(estimatedPositionWorld.y, measuredRootY, alpha);
+
+        estimatedHeightAboveWaterM =
+            estimatedPositionWorld.y - rangefinder.waterLevelY;
+
+        usedRangefinder = true;
+    }
+
+    private void CorrectWithMagnetometer(float dt)
+    {
+        if (magnetometer == null)
+        {
+            return;
+        }
+
+        float measuredTrueYaw =
+            Wrap360(magnetometer.magneticHeadingDeg + magnetometer.declinationDeg);
+
+        float currentYaw = GetYawDeg(estimatedRotationWorld);
+        yawInnovationDeg = Mathf.DeltaAngle(currentYaw, measuredTrueYaw);
+
+        float normalizedError =
+            Mathf.Abs(yawInnovationDeg) /
+            Mathf.Max(1.0f, magnetometerYawSigmaDeg);
+
+        magnetometerWeight = RobustWeight(normalizedError);
+
+        if (magnetometerWeight <= 0.0f)
+        {
+            rejectedMagnetometer = true;
+            return;
+        }
+
+        float gain = magnetometerYawGain;
+
+        // During high current, reduce magnetometer trust because motors and wiring can disturb it.
+        if (batteryPower != null && batteryPower.currentA > 15.0f)
+        {
+            gain *= 0.6f;
+        }
+
+        float alpha = Alpha(gain * magnetometerWeight, dt);
+
+        estimatedRotationWorld =
+            Quaternion.AngleAxis(yawInnovationDeg * alpha, Vector3.up) *
+            estimatedRotationWorld;
+
+        usedMagnetometer = true;
+    }
+
+    private void CorrectWithSurfaceConstraint(float dt)
+    {
+        if (!enableSurfaceConstraint || surfaceBuoyancy == null)
+        {
+            return;
+        }
+
+        if (currentMode != AquaMode.SurfaceFloat)
+        {
+            return;
+        }
+
+        float constrainedY = waterSurfaceY + surfaceFloatRootHeightM;
+        surfaceConstraintInnovationM = constrainedY - estimatedPositionWorld.y;
+
+        surfaceConstraintWeight = 1.0f;
+
+        float alpha = Alpha(surfaceConstraintGain, dt);
+
+        estimatedPositionWorld.y =
+            Mathf.Lerp(estimatedPositionWorld.y, constrainedY, alpha);
+
+        estimatedVelocityWorld.y =
+            Mathf.Lerp(estimatedVelocityWorld.y, 0.0f, alpha);
+
+        usedSurfaceConstraint = true;
+    }
+
+    private void ApplyBiasLeak(float dt)
+    {
+        estimatedGyroBiasRadS =
+            Vector3.Lerp(estimatedGyroBiasRadS, Vector3.zero, gyroBiasLeak * dt);
+
+        estimatedAccelBiasMS2 =
+            Vector3.Lerp(estimatedAccelBiasMS2, Vector3.zero, accelBiasLeak * dt);
+    }
+
+    private float RobustWeight(float normalizedError)
+    {
+        if (!enableRobustGating)
+        {
+            return 1.0f;
+        }
+
+        if (normalizedError >= hardGate)
+        {
+            return 0.0f;
+        }
+
+        if (normalizedError <= softGate)
+        {
+            return 1.0f;
+        }
+
+        return Mathf.Clamp01(softGate / normalizedError);
+    }
+
+    private void UpdateOutputs()
+    {
+        estimatedEulerDeg = estimatedRotationWorld.eulerAngles;
+        estimatedEulerDeg.x = NormalizeAngleDeg(estimatedEulerDeg.x);
+        estimatedEulerDeg.y = Wrap360(estimatedEulerDeg.y);
+        estimatedEulerDeg.z = NormalizeAngleDeg(estimatedEulerDeg.z);
+
+        estimatedYawDeg = estimatedEulerDeg.y;
+        estimatedHeightAboveWaterM = estimatedPositionWorld.y - waterSurfaceY;
+    }
+
+    private void UpdateTruthDebug()
+    {
+        truePositionWorld = transform.position;
+        trueVelocityWorld = rb != null ? rb.linearVelocity : Vector3.zero;
+
+        trueEulerDeg = transform.eulerAngles;
+        trueEulerDeg.x = NormalizeAngleDeg(trueEulerDeg.x);
+        trueEulerDeg.y = Wrap360(trueEulerDeg.y);
+        trueEulerDeg.z = NormalizeAngleDeg(trueEulerDeg.z);
+
+        trueYawDeg = trueEulerDeg.y;
+    }
+
+    private float Alpha(float gain, float dt)
+    {
+        return 1.0f - Mathf.Exp(-Mathf.Max(0.001f, gain) * dt);
+    }
+
+    private float GetYawDeg(Quaternion q)
+    {
+        Vector3 f = q * Vector3.forward;
+        f.y = 0.0f;
+
+        if (f.sqrMagnitude < 0.0001f)
+        {
+            return 0.0f;
+        }
+
+        f.Normalize();
+
+        return Wrap360(Mathf.Atan2(f.x, f.z) * Mathf.Rad2Deg);
+    }
+
+    private float NormalizeAngleDeg(float angle)
+    {
+        while (angle > 180.0f) angle -= 360.0f;
+        while (angle < -180.0f) angle += 360.0f;
+        return angle;
+    }
+
+    private float Wrap360(float angle)
+    {
+        while (angle >= 360.0f) angle -= 360.0f;
+        while (angle < 0.0f) angle += 360.0f;
+        return angle;
+    }
+}

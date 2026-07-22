@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace MIMISK.Common
+{
+    public enum MIMISKAgentKind
+    {
+        Unknown,
+        Drone,
+        Tether,
+        MiniROV
+    }
+
+    public enum MIMISKAgentMode
+    {
+        Unknown,
+        Idle,
+        Manual,
+        StationHolding,
+        ExecutingMission,
+        Dwell,
+        ReturningHome,
+        RecoveryReady,
+        Fault
+    }
+
+    public enum MIMISKCommandVerb
+    {
+        None,
+
+        AutoFindReferences,
+        SetHome,
+        Hold,
+        StartSelectedMission,
+        StartMissionAction,
+        StartPath,
+        GoToPoint,
+        DwellAtCurrentPose,
+        ReturnHome,
+        AbortToHold,
+        Stop,
+        ManualMode,
+        PrepareForRecovery
+    }
+
+    public enum MIMISKCommandStatus
+    {
+        Unknown,
+        Accepted,
+        Rejected,
+        Failed
+    }
+
+    [Serializable]
+    public class MIMISKCommand
+    {
+        public string requestId = "";
+        public string source = "local";
+        public MIMISKCommandVerb verb = MIMISKCommandVerb.None;
+
+        [Header("Mission / Path Selection")]
+        public string actionName = "";
+        public string pathTypeName = "";
+
+        [Header("Target")]
+        public Vector3 targetWorld;
+        public float targetDepthM = float.NaN;
+
+        [Header("Dwell")]
+        public float dwellSeconds = 3.0f;
+        public string dwellYawPolicyName = "CurrentYaw";
+        public float dwellFixedYawDeg = 0.0f;
+        public Vector3 dwellFacePointWorld;
+    }
+
+    [Serializable]
+    public class MIMISKCommandResult
+    {
+        public MIMISKCommandStatus status = MIMISKCommandStatus.Unknown;
+        public string reason = "";
+        public MIMISKState stateAfter;
+
+        public static MIMISKCommandResult Accepted(string reason, MIMISKState state)
+        {
+            return new MIMISKCommandResult
+            {
+                status = MIMISKCommandStatus.Accepted,
+                reason = reason,
+                stateAfter = state
+            };
+        }
+
+        public static MIMISKCommandResult Rejected(string reason, MIMISKState state)
+        {
+            return new MIMISKCommandResult
+            {
+                status = MIMISKCommandStatus.Rejected,
+                reason = reason,
+                stateAfter = state
+            };
+        }
+
+        public static MIMISKCommandResult Failed(string reason, MIMISKState state)
+        {
+            return new MIMISKCommandResult
+            {
+                status = MIMISKCommandStatus.Failed,
+                reason = reason,
+                stateAfter = state
+            };
+        }
+    }
+
+    [Serializable]
+    public class MIMISKState
+    {
+        public string agentName = "";
+        public MIMISKAgentKind agentKind = MIMISKAgentKind.Unknown;
+        public MIMISKAgentMode mode = MIMISKAgentMode.Unknown;
+
+        public bool available;
+        public bool active;
+        public bool recoveryReady;
+        public bool fault;
+
+        public Vector3 positionWorld;
+        public float depthM;
+        public float yawDeg;
+        public float speedMS;
+
+        public string missionState = "";
+        public string controllerMode = "";
+        public string selectedPathType = "";
+        public string selectedYawPolicy = "";
+        public string lastEvent = "";
+
+        public float distanceToHomeM;
+        public float distanceToTargetM;
+    }
+
+    [Serializable]
+    public class MIMISKEvent
+    {
+        public string timeUtc = "";
+        public string agentName = "";
+        public MIMISKAgentKind agentKind = MIMISKAgentKind.Unknown;
+        public string eventType = "";
+        public string message = "";
+        public MIMISKState state;
+    }
+
+    [Serializable]
+    public class MIMISKMissionPlan
+    {
+        public string planId = "";
+        public string description = "";
+        public List<MIMISKCommand> steps = new List<MIMISKCommand>();
+    }
+
+    public interface IMIMISKAgent
+    {
+        string AgentName { get; }
+        MIMISKAgentKind AgentKind { get; }
+
+        event Action<MIMISKEvent> OnEvent;
+
+        void AutoFindReferences();
+        MIMISKState GetState();
+        bool CanAccept(MIMISKCommand command, out string reason);
+        MIMISKCommandResult Execute(MIMISKCommand command);
+    }
+}

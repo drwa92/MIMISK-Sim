@@ -1,0 +1,160 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreRotorAnimator : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKDroneCoreRotorController core;
+
+    [Header("Rotor Visuals: FL, FR, RL, RR")]
+    public Transform rotorFL;
+    public Transform rotorFR;
+    public Transform rotorRL;
+    public Transform rotorRR;
+
+    [Header("Animation")]
+    public bool animate = true;
+    public Vector3 localSpinAxis = Vector3.up;
+    public float idleRpm = 900.0f;
+    public float maxRpm = 6500.0f;
+    public float rpmResponseHz = 14.0f;
+
+    [Header("Debug")]
+    public Vector4 rpmFL_FR_RL_RR;
+
+    private Vector4 rpmState;
+
+    private void Awake()
+    {
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        AutoBindByPositionAndName();
+    }
+
+    private void Update()
+    {
+        if (!animate || core == null)
+        {
+            return;
+        }
+
+        float dt = Time.deltaTime;
+        float maxThrust = Mathf.Max(0.001f, core.maxThrustPerRotorN);
+
+        Vector4 thrust = core.motorThrustActualN;
+
+        Vector4 targetRpm = new Vector4(
+            RpmFromThrust(thrust.x, maxThrust),
+            RpmFromThrust(thrust.y, maxThrust),
+            RpmFromThrust(thrust.z, maxThrust),
+            RpmFromThrust(thrust.w, maxThrust)
+        );
+
+        float alpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, rpmResponseHz) * dt);
+
+        rpmState = Vector4.Lerp(rpmState, targetRpm, alpha);
+        rpmFL_FR_RL_RR = rpmState;
+
+        Vector4 spin = core.rotorSpinSigns;
+
+        Spin(rotorFL, rpmState.x, spin.x, dt);
+        Spin(rotorFR, rpmState.y, spin.y, dt);
+        Spin(rotorRL, rpmState.z, spin.z, dt);
+        Spin(rotorRR, rpmState.w, spin.w, dt);
+    }
+
+    private float RpmFromThrust(float thrustN, float maxThrustN)
+    {
+        float u = Mathf.Clamp01(thrustN / maxThrustN);
+        return Mathf.Lerp(idleRpm, maxRpm, Mathf.Sqrt(u));
+    }
+
+    private void Spin(Transform rotor, float rpm, float spinSign, float dt)
+    {
+        if (rotor == null)
+        {
+            return;
+        }
+
+        float deg = spinSign * rpm * 360.0f * dt / 60.0f;
+        rotor.Rotate(localSpinAxis.normalized, deg, Space.Self);
+    }
+
+    [ContextMenu("Auto Bind Rotor Visuals")]
+    public void AutoBindByPositionAndName()
+    {
+        Transform[] all = GetComponentsInChildren<Transform>(true);
+        List<Transform> candidates = new List<Transform>();
+
+        for (int i = 0; i < all.Length; i++)
+        {
+            string n = Normalize(all[i].name);
+
+            if (n.Contains("prop") ||
+                n.Contains("rotor") ||
+                n.Contains("blade") ||
+                n.Contains("fan") ||
+                n.Contains("helice") ||
+                n.Contains("propulseur"))
+            {
+                candidates.Add(all[i]);
+            }
+        }
+
+        rotorFL = rotorFL != null ? rotorFL : BestCandidate(candidates, -1.0f, -1.0f);
+        rotorFR = rotorFR != null ? rotorFR : BestCandidate(candidates,  1.0f, -1.0f);
+        rotorRL = rotorRL != null ? rotorRL : BestCandidate(candidates, -1.0f,  1.0f);
+        rotorRR = rotorRR != null ? rotorRR : BestCandidate(candidates,  1.0f,  1.0f);
+    }
+
+    private Transform BestCandidate(List<Transform> candidates, float signX, float signZ)
+    {
+        Transform best = null;
+        float bestScore = float.PositiveInfinity;
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            Vector3 local = transform.InverseTransformPoint(candidates[i].position);
+
+            float sx = signX < 0.0f ? -local.x : local.x;
+            float sz = signZ < 0.0f ? -local.z : local.z;
+
+            float quadrantPenalty = 0.0f;
+
+            if (sx < 0.0f) quadrantPenalty += 100.0f;
+            if (sz < 0.0f) quadrantPenalty += 100.0f;
+
+            float score =
+                quadrantPenalty +
+                Mathf.Abs(Mathf.Abs(local.x) - Mathf.Abs(signX * 0.58f)) +
+                Mathf.Abs(Mathf.Abs(local.z) - Mathf.Abs(signZ * 0.50f));
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = candidates[i];
+            }
+        }
+
+        return best;
+    }
+
+    private string Normalize(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "";
+        }
+
+        return value.ToLowerInvariant()
+            .Replace(" ", "")
+            .Replace("_", "")
+            .Replace("-", "")
+            .Replace("é", "e");
+    }
+}

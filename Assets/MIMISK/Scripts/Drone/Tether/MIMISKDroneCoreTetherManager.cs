@@ -1,0 +1,664 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreTetherManager : MonoBehaviour
+{
+    public enum TetherState
+    {
+        Idle,
+        Locked,
+        Ready,
+        Deploying,
+        HoldingDeployed,
+        Recovering,
+        Recovered,
+        Fault
+    }
+
+    [Header("References")]
+    public MIMISKDroneCoreMissionManager missionManager;
+    public MIMISKDroneCoreFlightModeManager flightManager;
+    public MIMISKDroneSurfaceBuoyancy surfaceBuoyancy;
+    public Rigidbody droneRigidbody;
+
+    [Header("Winch / Tether Points")]
+    public Transform winchPoint;
+    public Transform tetherAnchor;
+    public Transform fairleadLineStart;
+
+    [Header("Moving Deployment Cable Visual")]
+    public Transform movingTetherEndVisual;
+    public Transform staticShortDeploymentCableMesh;
+    public bool moveHookVisualWithTether = true;
+    public bool hideStaticShortCableMeshWhenDynamic = true;
+    public Transform miniRovCarrySlot;
+    public Transform miniRovTetherPoint;
+    public Rigidbody miniRovRigidbody;
+
+    [Header("Visual Tether Line")]
+    public LineRenderer tetherLineRenderer;
+    public int lineSegments = 16;
+    public float tetherLineWidthM = 0.012f;
+    public float slackSagScale = 0.25f;
+    public float maxSagM = 0.60f;
+
+    [Header("Winch Visuals")]
+    public Transform winchSpoolPivot;
+    public Transform leftCheekPlate;
+    public Transform rightCheekPlate;
+    public Vector3 localWinchSpinAxis = Vector3.right;
+    public float spoolRadiusM = 0.055f;
+    public float visualSpinSign = 1.0f;
+
+    [Header("Deployment")]
+    public bool tetherSystemEnabled = true;
+    public TetherState tetherState = TetherState.Idle;
+
+    public bool requireSurfaceStable = true;
+    public bool allowManualDeploymentWhenSurfaceStable = true;
+
+    public float minimumLengthM = 0.15f;
+    public float maximumLengthM = 12.0f;
+    public float targetDeployLengthM = 3.0f;
+    public float payoutSpeedMS = 0.25f;
+    public float recoverySpeedMS = 0.30f;
+
+    [Header("Virtual Payload Endpoint")]
+    [Tooltip("Until the MiniROV is physically attached, the tether endpoint is simulated below the winch.")]
+    public bool useVirtualEndpointWhenNoMiniRov = true;
+    public Vector3 virtualEndpointWorld;
+
+    [Header("Tether Physics")]
+    public bool enableTetherForceWhenMiniRovAttached = true;
+    public float tetherStiffnessNPerM = 45.0f;
+    public float tetherDampingNPerMS = 8.0f;
+    public float maximumSafeTensionN = 25.0f;
+    public float tensionFaultResetThresholdN = 10.0f;
+
+    [Header("Keyboard Test")]
+    public bool acceptKeyboardCommands = true;
+    public Key deployKey = Key.U;
+    public Key recoverKey = Key.R;
+    public Key stopKey = Key.K;
+    public Key resetFaultKey = Key.F;
+
+    [Header("Runtime")]
+    public bool readyForDeployment;
+    public bool safeToDeploy;
+    public bool safeToRecover;
+
+    public float deployedLengthM;
+    public float targetLengthM;
+    public float winchCommandRateMS;
+
+    public Vector3 tetherStartWorld;
+    public Vector3 tetherEndWorld;
+
+    public float straightDistanceM;
+    public float slackM;
+    public float stretchM;
+    public float tensionN;
+    public float rawTensionN;
+
+    public string lastEvent = "idle";
+
+    private float previousLengthM;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        deployedLengthM = Mathf.Clamp(deployedLengthM, minimumLengthM, maximumLengthM);
+        targetLengthM = deployedLengthM;
+        previousLengthM = deployedLengthM;
+
+        UpdateEndpointAndMeasurements();
+        UpdateLineRenderer();
+    }
+
+    private void Update()
+    {
+        if (!tetherSystemEnabled || !acceptKeyboardCommands)
+        {
+            return;
+        }
+
+        if (Keyboard.current == null)
+        {
+            return;
+        }
+
+        if (Keyboard.current[deployKey].wasPressedThisFrame)
+        {
+            StartDeployment();
+        }
+
+        if (Keyboard.current[recoverKey].wasPressedThisFrame)
+        {
+            StartRecovery();
+        }
+
+        if (Keyboard.current[stopKey].wasPressedThisFrame)
+        {
+            StopWinch();
+        }
+
+        if (Keyboard.current[resetFaultKey].wasPressedThisFrame)
+        {
+            ResetFault();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!tetherSystemEnabled)
+        {
+            return;
+        }
+
+        UpdateReadinessState();
+        UpdateWinch(Time.fixedDeltaTime);
+        UpdateEndpointAndMeasurements();
+        ApplyTetherForcesIfPossible();
+    }
+
+    private void LateUpdate()
+    {
+        if (!tetherSystemEnabled)
+        {
+            return;
+        }
+
+        UpdateMovingDeploymentVisuals();
+        UpdateLineRenderer();
+        UpdateWinchVisuals(Time.deltaTime);
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (missionManager == null)
+        {
+            missionManager = GetComponent<MIMISKDroneCoreMissionManager>();
+        }
+
+        if (flightManager == null)
+        {
+            flightManager = GetComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        if (surfaceBuoyancy == null)
+        {
+            surfaceBuoyancy = GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        }
+
+        if (droneRigidbody == null)
+        {
+            droneRigidbody = GetComponent<Rigidbody>();
+        }
+
+        if (winchPoint == null)
+        {
+            winchPoint = FindDeepChild(transform, "WinchPoint");
+        }
+
+        if (tetherAnchor == null)
+        {
+            tetherAnchor = FindDeepChild(transform, "TetherAnchor");
+        }
+
+        if (fairleadLineStart == null)
+        {
+            fairleadLineStart =
+                FindDeepChild(transform, "WinchFairlead_for_Unity_LineRenderer_Start");
+        }
+
+        if (movingTetherEndVisual == null)
+        {
+            movingTetherEndVisual =
+                FindDeepChild(transform, "small_dark_open_deployment_hook_for_miniROV");
+        }
+
+        if (staticShortDeploymentCableMesh == null)
+        {
+            staticShortDeploymentCableMesh =
+                FindDeepChild(transform, "real_mesh_short_yellow_deployment_cable_to_hook");
+        }
+
+        if (miniRovCarrySlot == null)
+        {
+            miniRovCarrySlot = FindDeepChild(transform, "MiniROV_CarrySlot");
+        }
+
+        if (winchSpoolPivot == null)
+        {
+            winchSpoolPivot =
+                FindDeepChild(transform, "Winch_Reel_spin_pivot_Unity_rotate_local_X");
+        }
+
+        if (winchSpoolPivot == null)
+        {
+            winchSpoolPivot =
+                FindDeepChild(transform, "centered_winch_spool_dark_core_inside_integrated_bracket");
+        }
+
+        if (leftCheekPlate == null)
+        {
+            leftCheekPlate =
+                FindDeepChild(transform, "centered_winch_left_rotating_cheek_plate");
+        }
+
+        if (rightCheekPlate == null)
+        {
+            rightCheekPlate =
+                FindDeepChild(transform, "centered_winch_right_rotating_cheek_plate");
+        }
+
+        if (tetherLineRenderer == null)
+        {
+            Transform lineObject = FindDeepChild(transform, "TetherLine");
+
+            if (lineObject != null)
+            {
+                tetherLineRenderer =
+                    lineObject.GetComponent<LineRenderer>();
+
+                if (tetherLineRenderer == null)
+                {
+                    tetherLineRenderer =
+                        lineObject.gameObject.AddComponent<LineRenderer>();
+                }
+            }
+        }
+    }
+
+    [ContextMenu("Start Deployment")]
+    public void StartDeployment()
+    {
+        UpdateReadinessState();
+
+        if (!safeToDeploy)
+        {
+            lastEvent = "deployment_rejected_not_ready";
+            Debug.LogWarning("[MIMISK] Tether deployment rejected: drone is not ready.");
+            return;
+        }
+
+        targetLengthM =
+            Mathf.Clamp(targetDeployLengthM, minimumLengthM, maximumLengthM);
+
+        tetherState = TetherState.Deploying;
+        lastEvent = "deployment_started";
+
+        Debug.Log("[MIMISK] Tether deployment started.");
+    }
+
+    [ContextMenu("Start Recovery")]
+    public void StartRecovery()
+    {
+        if (tetherState == TetherState.Fault)
+        {
+            lastEvent = "recovery_rejected_fault";
+            return;
+        }
+
+        targetLengthM = minimumLengthM;
+        tetherState = TetherState.Recovering;
+        lastEvent = "recovery_started";
+
+        Debug.Log("[MIMISK] Tether recovery started.");
+    }
+
+    [ContextMenu("Stop Winch")]
+    public void StopWinch()
+    {
+        if (tetherState == TetherState.Deploying ||
+            tetherState == TetherState.Recovering)
+        {
+            tetherState = TetherState.HoldingDeployed;
+            targetLengthM = deployedLengthM;
+            winchCommandRateMS = 0.0f;
+            lastEvent = "winch_stopped_hold";
+        }
+    }
+
+    [ContextMenu("Reset Fault")]
+    public void ResetFault()
+    {
+        if (tetherState != TetherState.Fault)
+        {
+            return;
+        }
+
+        if (tensionN <= tensionFaultResetThresholdN)
+        {
+            tetherState = readyForDeployment ? TetherState.Ready : TetherState.Locked;
+            lastEvent = "fault_reset";
+        }
+    }
+
+    private void UpdateReadinessState()
+    {
+        bool surfaceReady = true;
+
+        if (requireSurfaceStable)
+        {
+            surfaceReady =
+                flightManager != null &&
+                (
+                    flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable ||
+                    flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold
+                );
+        }
+
+        bool missionReady = true;
+
+        if (missionManager != null)
+        {
+            missionReady =
+                missionManager.missionState == MIMISKDroneCoreMissionManager.MissionState.ReadyForTetherDeployment ||
+                missionManager.missionState == MIMISKDroneCoreMissionManager.MissionState.Completed;
+
+            if (allowManualDeploymentWhenSurfaceStable && surfaceReady)
+            {
+                missionReady = true;
+            }
+        }
+
+        readyForDeployment = surfaceReady && missionReady;
+        safeToDeploy = readyForDeployment && tetherState != TetherState.Fault;
+        safeToRecover = tetherState != TetherState.Fault;
+
+        if (tetherState == TetherState.Idle ||
+            tetherState == TetherState.Locked ||
+            tetherState == TetherState.Recovered)
+        {
+            tetherState = readyForDeployment ? TetherState.Ready : TetherState.Locked;
+        }
+
+        if (!readyForDeployment &&
+            tetherState == TetherState.Ready)
+        {
+            tetherState = TetherState.Locked;
+        }
+    }
+
+    private void UpdateWinch(float dt)
+    {
+        previousLengthM = deployedLengthM;
+
+        if (tetherState == TetherState.Deploying)
+        {
+            deployedLengthM =
+                Mathf.MoveTowards(
+                    deployedLengthM,
+                    targetLengthM,
+                    payoutSpeedMS * dt
+                );
+
+            if (Mathf.Abs(deployedLengthM - targetLengthM) <= 0.001f)
+            {
+                tetherState = TetherState.HoldingDeployed;
+                lastEvent = "deployment_target_reached";
+            }
+        }
+        else if (tetherState == TetherState.Recovering)
+        {
+            deployedLengthM =
+                Mathf.MoveTowards(
+                    deployedLengthM,
+                    targetLengthM,
+                    recoverySpeedMS * dt
+                );
+
+            if (Mathf.Abs(deployedLengthM - targetLengthM) <= 0.001f)
+            {
+                tetherState = TetherState.Recovered;
+                lastEvent = "recovery_complete";
+            }
+        }
+
+        deployedLengthM =
+            Mathf.Clamp(deployedLengthM, minimumLengthM, maximumLengthM);
+
+        winchCommandRateMS =
+            (deployedLengthM - previousLengthM) /
+            Mathf.Max(0.001f, dt);
+    }
+
+    private void UpdateEndpointAndMeasurements()
+    {
+        tetherStartWorld =
+            fairleadLineStart != null
+                ? fairleadLineStart.position
+                : (
+                    tetherAnchor != null
+                        ? tetherAnchor.position
+                        : (
+                            winchPoint != null
+                                ? winchPoint.position
+                                : transform.position
+                          )
+                  );
+
+        if (miniRovTetherPoint != null)
+        {
+            tetherEndWorld = miniRovTetherPoint.position;
+        }
+        else if (miniRovRigidbody != null)
+        {
+            tetherEndWorld = miniRovRigidbody.position;
+        }
+        else if (miniRovCarrySlot != null && !useVirtualEndpointWhenNoMiniRov)
+        {
+            tetherEndWorld = miniRovCarrySlot.position;
+        }
+        else
+        {
+            virtualEndpointWorld =
+                tetherStartWorld + Vector3.down * deployedLengthM;
+
+            tetherEndWorld = virtualEndpointWorld;
+        }
+
+        straightDistanceM =
+            Vector3.Distance(tetherStartWorld, tetherEndWorld);
+
+        slackM =
+            Mathf.Max(0.0f, deployedLengthM - straightDistanceM);
+
+        stretchM =
+            Mathf.Max(0.0f, straightDistanceM - deployedLengthM);
+
+        rawTensionN = 0.0f;
+        tensionN = 0.0f;
+
+        if (straightDistanceM > 0.001f && stretchM > 0.0f)
+        {
+            Vector3 dirStartToEnd =
+                (tetherEndWorld - tetherStartWorld) / straightDistanceM;
+
+            Vector3 startVelocity =
+                droneRigidbody != null ? droneRigidbody.linearVelocity : Vector3.zero;
+
+            Vector3 endVelocity =
+                miniRovRigidbody != null ? miniRovRigidbody.linearVelocity : Vector3.zero;
+
+            float relativeSpeedAway =
+                Vector3.Dot(endVelocity - startVelocity, dirStartToEnd);
+
+            rawTensionN =
+                tetherStiffnessNPerM * stretchM +
+                tetherDampingNPerMS * Mathf.Max(0.0f, relativeSpeedAway);
+
+            tensionN =
+                Mathf.Max(0.0f, rawTensionN);
+        }
+
+        if (rawTensionN > maximumSafeTensionN)
+        {
+            tetherState = TetherState.Fault;
+            targetLengthM = deployedLengthM;
+            winchCommandRateMS = 0.0f;
+            lastEvent = "fault_over_tension";
+        }
+    }
+
+    private void ApplyTetherForcesIfPossible()
+    {
+        if (!enableTetherForceWhenMiniRovAttached ||
+            miniRovRigidbody == null ||
+            droneRigidbody == null ||
+            tensionN <= 0.0f ||
+            straightDistanceM <= 0.001f)
+        {
+            return;
+        }
+
+        Vector3 dirEndToStart =
+            (tetherStartWorld - tetherEndWorld) / straightDistanceM;
+
+        Vector3 forceOnRov =
+            dirEndToStart * tensionN;
+
+        Vector3 forceOnDrone =
+            -forceOnRov;
+
+        miniRovRigidbody.AddForce(forceOnRov, ForceMode.Force);
+
+        droneRigidbody.AddForceAtPosition(
+            forceOnDrone,
+            tetherStartWorld,
+            ForceMode.Force
+        );
+    }
+
+
+    private void UpdateMovingDeploymentVisuals()
+    {
+        if (hideStaticShortCableMeshWhenDynamic &&
+            staticShortDeploymentCableMesh != null)
+        {
+            SetRenderersEnabled(staticShortDeploymentCableMesh, false);
+        }
+
+        if (moveHookVisualWithTether &&
+            movingTetherEndVisual != null)
+        {
+            movingTetherEndVisual.position = tetherEndWorld;
+        }
+    }
+
+    private void SetRenderersEnabled(Transform root, bool enabled)
+    {
+        if (root == null)
+        {
+            return;
+        }
+
+        Renderer[] renderers =
+            root.GetComponentsInChildren<Renderer>(true);
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            renderers[i].enabled = enabled;
+        }
+    }
+
+    private void UpdateLineRenderer()
+    {
+        if (tetherLineRenderer == null)
+        {
+            return;
+        }
+
+        int n =
+            Mathf.Max(2, lineSegments);
+
+        tetherLineRenderer.positionCount = n;
+        tetherLineRenderer.widthMultiplier = tetherLineWidthM;
+        tetherLineRenderer.useWorldSpace = true;
+
+        float sag =
+            Mathf.Min(maxSagM, slackM * slackSagScale);
+
+        for (int i = 0; i < n; i++)
+        {
+            float u =
+                i / Mathf.Max(1.0f, (float)(n - 1));
+
+            Vector3 p =
+                Vector3.Lerp(tetherStartWorld, tetherEndWorld, u);
+
+            p += Vector3.down * Mathf.Sin(Mathf.PI * u) * sag;
+
+            tetherLineRenderer.SetPosition(i, p);
+        }
+    }
+
+    private void UpdateWinchVisuals(float dt)
+    {
+        if (Mathf.Abs(winchCommandRateMS) <= 0.0001f)
+        {
+            return;
+        }
+
+        float radius =
+            Mathf.Max(0.005f, spoolRadiusM);
+
+        float angleRad =
+            winchCommandRateMS * dt / radius;
+
+        float angleDeg =
+            angleRad * Mathf.Rad2Deg * visualSpinSign;
+
+        RotateWinchPart(winchSpoolPivot, angleDeg);
+        RotateWinchPart(leftCheekPlate, angleDeg);
+        RotateWinchPart(rightCheekPlate, angleDeg);
+    }
+
+    private void RotateWinchPart(Transform t, float angleDeg)
+    {
+        if (t == null)
+        {
+            return;
+        }
+
+        Vector3 axis =
+            localWinchSpinAxis.sqrMagnitude > 0.0001f
+                ? localWinchSpinAxis.normalized
+                : Vector3.right;
+
+        t.Rotate(axis, angleDeg, Space.Self);
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

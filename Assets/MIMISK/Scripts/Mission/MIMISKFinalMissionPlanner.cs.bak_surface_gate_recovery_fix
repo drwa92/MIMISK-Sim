@@ -1,0 +1,879 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKFinalMissionPlanner : MonoBehaviour
+{
+    public enum FinalMissionState
+    {
+        Disabled,
+        WaitingForDroneMission,
+        SurfaceDeploymentReady,
+        DeployingTether,
+        MiniROVAtDeploymentDepth,
+        MiniROVControlActive,
+        RecoveringMiniROV,
+        Recovered,
+        Fault
+    }
+
+    [Header("References")]
+    public MIMISKDroneCoreMissionManager droneMission;
+    public MIMISKDroneCoreFlightModeManager flightManager;
+    public MIMISKDroneCoreTetherManager tetherManager;
+    public MIMISKMiniROVModule miniRovModule;
+
+    public Rigidbody droneRigidbody;
+    public Transform droneRoot;
+    public Transform miniRovRoot;
+    public Transform rovTetherAnchor;
+
+    [Header("Deployment Position")]
+    public Transform deploymentTarget;
+    public bool requireDeploymentTargetPosition = false;
+    public float deploymentHorizontalToleranceM = 0.75f;
+    public float deploymentYawToleranceDeg = 30.0f;
+
+    [Header("Cable / Tether References")]
+    public Transform cableEndFollowRoot;
+    public Transform tetherMovingEndpoint;
+    public Transform tetherStart;
+    public Transform hookVisual;
+
+    [Header("Tether Deployment")]
+    public float targetDeployLengthM = 0.90f;
+    public float payoutSpeedMS = 0.22f;
+    public float recoverySpeedMS = 0.25f;
+    public float deployedLengthToleranceM = 0.03f;
+
+    [Header("MiniROV Handoff")]
+    public bool autoAttachMiniRovWhenReady = true;
+    public bool autoDeployWhenSurfaceReady = false;
+    public bool autoEnableMiniRovControl = false;
+
+    [Tooltip("For final control, MiniROV module should use SimpleROVBuoyancy and gravity, as verified in your working test.")]
+    public bool configureMiniRovFinalStack = true;
+
+    [Header("Recovery")]
+    public bool allowKinematicRecoverySnap = true;
+    public float recoveryCaptureDistanceM = 0.50f;
+
+    [Header("Active Yellow Tether Visual")]
+    public bool enableActiveYellowTetherLine = true;
+    public string activeYellowTetherLineName = "MIMISK_Final_ActiveYellowTether";
+    public LineRenderer activeYellowTetherLine;
+    public float activeTetherLineWidthM = 0.018f;
+    public int activeTetherLineSegments = 20;
+    public float activeTetherSagM = 0.08f;
+    public bool disableOtherTetherLineRenderersOnROVControl = true;
+
+    [Header("Keyboard")]
+    public Key deployKey = Key.U;
+    public Key enableRovControlKey = Key.I;
+    public Key recoverKey = Key.R;
+    public Key holdKey = Key.K;
+    public Key resetKey = Key.F;
+
+    [Header("Runtime")]
+    public bool plannerEnabled = true;
+
+    [Tooltip("Prevents stale deployment state from holding the drone during takeoff/flight.")]
+    public bool resetPlannerToWaitingDuringDroneFlight = true;
+    public FinalMissionState state = FinalMissionState.WaitingForDroneMission;
+    public string lastEvent = "waiting";
+    public float stateTimerS;
+    public float missionTimerS;
+
+    public bool droneSurfaceStable;
+    public bool droneMissionReady;
+    public bool droneAtDeploymentPoint;
+    public float deploymentHorizontalErrorM;
+    public float deploymentYawErrorDeg;
+
+    private bool autoDeployConsumed;
+    private bool autoControlConsumed;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        ConfigureSafeDefaults();
+    }
+
+    private void Update()
+    {
+        if (!plannerEnabled)
+        {
+            return;
+        }
+
+        if (Keyboard.current != null)
+        {
+            if (Keyboard.current[deployKey].wasPressedThisFrame)
+            {
+                RequestTetherDeployment();
+            }
+
+            if (Keyboard.current[enableRovControlKey].wasPressedThisFrame)
+            {
+                RequestMiniRovControlHandoff();
+            }
+
+            if (Keyboard.current[recoverKey].wasPressedThisFrame)
+            {
+                RequestRecovery();
+            }
+
+            if (Keyboard.current[holdKey].wasPressedThisFrame)
+            {
+                HoldTether();
+            }
+
+            if (Keyboard.current[resetKey].wasPressedThisFrame)
+            {
+                ResetPlanner();
+            }
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!plannerEnabled)
+        {
+            return;
+        }
+
+        float dt = Time.fixedDeltaTime;
+        stateTimerS += dt;
+        missionTimerS += dt;
+
+        RefreshReadiness();
+        ReleaseDeploymentBridgeIfDroneMissionRunning();
+        UpdateStateMachine();
+    }
+
+    private void LateUpdate()
+    {
+        if (!plannerEnabled)
+        {
+            return;
+        }
+
+        bool cableOwned =
+            state == FinalMissionState.SurfaceDeploymentReady ||
+            state == FinalMissionState.DeployingTether ||
+            state == FinalMissionState.MiniROVAtDeploymentDepth ||
+            state == FinalMissionState.RecoveringMiniROV ||
+            state == FinalMissionState.Recovered;
+
+        if (cableOwned)
+        {
+            SyncCableFollowRootToMovingEndpoint();
+        }
+
+        if (state == FinalMissionState.MiniROVControlActive &&
+            enableActiveYellowTetherLine)
+        {
+            UpdateActiveYellowTetherLine();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        droneRoot = transform;
+
+        if (droneRigidbody == null)
+        {
+            droneRigidbody = GetComponent<Rigidbody>();
+        }
+
+        if (droneMission == null)
+        {
+            droneMission = GetComponent<MIMISKDroneCoreMissionManager>();
+        }
+
+        if (flightManager == null)
+        {
+            flightManager = GetComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        if (tetherManager == null)
+        {
+            tetherManager = GetComponent<MIMISKDroneCoreTetherManager>();
+        }
+
+        if (miniRovModule == null)
+        {
+            GameObject rov = GameObject.Find("MiniROV");
+
+            if (rov != null)
+            {
+                miniRovModule = rov.GetComponent<MIMISKMiniROVModule>();
+            }
+        }
+
+        if (miniRovModule != null)
+        {
+            miniRovModule.AutoFindReferences();
+            miniRovRoot = miniRovModule.miniRovRoot;
+            rovTetherAnchor = miniRovModule.rovTetherAnchor;
+        }
+
+        if (deploymentTarget == null)
+        {
+            GameObject target = GameObject.Find("MIMISK_FinalDeploymentPoint");
+
+            if (target != null)
+            {
+                deploymentTarget = target.transform;
+            }
+        }
+
+        if (cableEndFollowRoot == null)
+        {
+            Transform found = FindDeepChild(transform, "MiniROV_CableEndFollowRoot");
+
+            if (found != null)
+            {
+                cableEndFollowRoot = found;
+            }
+        }
+
+        if (cableEndFollowRoot == null)
+        {
+            GameObject root = new GameObject("MiniROV_CableEndFollowRoot");
+            root.transform.SetParent(transform, false);
+            cableEndFollowRoot = root.transform;
+        }
+
+        if (tetherMovingEndpoint == null && tetherManager != null)
+        {
+            tetherMovingEndpoint = tetherManager.movingTetherEndVisual;
+        }
+
+        if (tetherMovingEndpoint == null)
+        {
+            tetherMovingEndpoint =
+                FindDeepChild(transform, "real_mesh_short_yellow_deployment_cable_to_hook");
+        }
+
+        if (tetherMovingEndpoint == null)
+        {
+            tetherMovingEndpoint =
+                FindDeepChild(transform, "small_dark_open_deployment_hook_for_miniROV");
+        }
+
+        if (tetherStart == null)
+        {
+            tetherStart =
+                FindDeepChild(transform, "WinchFairlead_for_Unity_LineRenderer_Start");
+        }
+
+        if (tetherStart == null)
+        {
+            tetherStart = FindDeepChild(transform, "TetherAnchor");
+        }
+
+        if (tetherStart == null)
+        {
+            tetherStart = FindDeepChild(transform, "WinchPoint");
+        }
+
+        if (hookVisual == null)
+        {
+            hookVisual =
+                FindDeepChild(transform, "small_dark_open_deployment_hook_for_miniROV");
+        }
+
+        EnsureActiveYellowTetherLine();
+    }
+
+    [ContextMenu("Configure Safe Defaults")]
+    public void ConfigureSafeDefaults()
+    {
+        AutoFindReferences();
+
+        if (tetherManager != null)
+        {
+            tetherManager.acceptKeyboardCommands = false;
+            tetherManager.tetherSystemEnabled = true;
+
+            tetherManager.targetDeployLengthM =
+                Mathf.Clamp(
+                    targetDeployLengthM,
+                    tetherManager.minimumLengthM,
+                    tetherManager.maximumLengthM
+                );
+
+            tetherManager.payoutSpeedMS = payoutSpeedMS;
+            tetherManager.recoverySpeedMS = recoverySpeedMS;
+
+            tetherManager.enableTetherForceWhenMiniRovAttached = false;
+            tetherManager.tetherStiffnessNPerM = 0.0f;
+            tetherManager.tetherDampingNPerMS = 0.0f;
+            tetherManager.maximumSafeTensionN = 999999.0f;
+        }
+
+        if (miniRovModule != null && configureMiniRovFinalStack)
+        {
+            miniRovModule.keyboardTestEnabled = false;
+            miniRovModule.requireExternalSerialBeforeControl = true;
+            miniRovModule.unityEsp32SerialDevice = "/dev/unity_esp32";
+
+            miniRovModule.useGravityInControl = true;
+            miniRovModule.enableSimpleRovBuoyancyInFinalStack = true;
+            miniRovModule.keepSensorManagerDisabled = true;
+
+            miniRovModule.correctOrientationOnHandoff = true;
+            miniRovModule.freeSwimWorldEuler = Vector3.zero;
+            miniRovModule.preserveCurrentYaw = false;
+            miniRovModule.keepTetherAnchorLockedDuringOrientationFix = true;
+
+            miniRovModule.enableCollidersDuringControl = true;
+        }
+
+        lastEvent = "safe_defaults_configured";
+    }
+
+    private void RefreshReadiness()
+    {
+        droneSurfaceStable = false;
+
+        if (flightManager != null)
+        {
+            droneSurfaceStable =
+                flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable ||
+                flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold;
+        }
+
+        droneMissionReady = false;
+
+        if (droneMission != null)
+        {
+            droneMissionReady =
+                droneMission.missionState == MIMISKDroneCoreMissionManager.MissionState.ReadyForTetherDeployment ||
+                droneMission.missionState == MIMISKDroneCoreMissionManager.MissionState.Completed;
+        }
+
+        RefreshDeploymentPointError();
+    }
+
+    private void RefreshDeploymentPointError()
+    {
+        if (deploymentTarget == null || droneRoot == null)
+        {
+            droneAtDeploymentPoint = !requireDeploymentTargetPosition;
+            deploymentHorizontalErrorM = 0.0f;
+            deploymentYawErrorDeg = 0.0f;
+            return;
+        }
+
+        Vector3 d = droneRoot.position - deploymentTarget.position;
+        d.y = 0.0f;
+
+        deploymentHorizontalErrorM = d.magnitude;
+
+        float yawDrone = droneRoot.eulerAngles.y;
+        float yawTarget = deploymentTarget.eulerAngles.y;
+
+        deploymentYawErrorDeg =
+            Mathf.Abs(Mathf.DeltaAngle(yawDrone, yawTarget));
+
+        droneAtDeploymentPoint =
+            deploymentHorizontalErrorM <= deploymentHorizontalToleranceM &&
+            deploymentYawErrorDeg <= deploymentYawToleranceDeg;
+    }
+
+
+    private void ReleaseDeploymentBridgeIfDroneMissionRunning()
+    {
+        if (!resetPlannerToWaitingDuringDroneFlight)
+        {
+            return;
+        }
+
+        if (droneMission == null)
+        {
+            return;
+        }
+
+        bool missionRunning =
+            droneMission.missionActive;
+
+        bool missionAlreadyReadyForTether =
+            droneMission.missionState ==
+                MIMISKDroneCoreMissionManager.MissionState.ReadyForTetherDeployment ||
+            droneMission.missionState ==
+                MIMISKDroneCoreMissionManager.MissionState.Completed;
+
+        if (!missionRunning || missionAlreadyReadyForTether)
+        {
+            return;
+        }
+
+        bool bridgeIsTryingToOwnDeployment =
+            state == FinalMissionState.SurfaceDeploymentReady ||
+            state == FinalMissionState.DeployingTether ||
+            state == FinalMissionState.MiniROVAtDeploymentDepth ||
+            state == FinalMissionState.MiniROVControlActive ||
+            state == FinalMissionState.RecoveringMiniROV ||
+            state == FinalMissionState.Recovered;
+
+        if (!bridgeIsTryingToOwnDeployment)
+        {
+            return;
+        }
+
+        if (activeYellowTetherLine != null)
+        {
+            activeYellowTetherLine.enabled = false;
+        }
+
+        state = FinalMissionState.WaitingForDroneMission;
+        stateTimerS = 0.0f;
+        lastEvent = "reset_stale_bridge_state_while_drone_mission_running";
+
+        Debug.Log("[MIMISK] Final planner reset stale deployment state while drone mission is running.");
+    }
+
+    private void UpdateStateMachine()
+    {
+        if (state == FinalMissionState.Disabled ||
+            state == FinalMissionState.Fault)
+        {
+            return;
+        }
+
+        if (state == FinalMissionState.WaitingForDroneMission)
+        {
+            if (droneMissionReady && droneSurfaceStable && droneAtDeploymentPoint)
+            {
+                EnterState(
+                    FinalMissionState.SurfaceDeploymentReady,
+                    "drone_surface_stable_ready_for_tether_deployment"
+                );
+
+                if (autoAttachMiniRovWhenReady)
+                {
+                    AttachMiniRovToCableEndpoint();
+                }
+            }
+        }
+        else if (state == FinalMissionState.SurfaceDeploymentReady)
+        {
+            if (autoDeployWhenSurfaceReady && !autoDeployConsumed)
+            {
+                autoDeployConsumed = true;
+                RequestTetherDeployment();
+            }
+        }
+        else if (state == FinalMissionState.DeployingTether)
+        {
+            bool lengthReached =
+                tetherManager != null &&
+                tetherManager.deployedLengthM >= tetherManager.targetLengthM - deployedLengthToleranceM;
+
+            bool stateReached =
+                tetherManager != null &&
+                tetherManager.tetherState == MIMISKDroneCoreTetherManager.TetherState.HoldingDeployed;
+
+            if (lengthReached || stateReached)
+            {
+                HoldTether();
+
+                EnterState(
+                    FinalMissionState.MiniROVAtDeploymentDepth,
+                    "minirov_at_deployment_depth_waiting_for_control_handoff"
+                );
+            }
+        }
+        else if (state == FinalMissionState.MiniROVAtDeploymentDepth)
+        {
+            if (autoEnableMiniRovControl && !autoControlConsumed)
+            {
+                autoControlConsumed = true;
+                RequestMiniRovControlHandoff();
+            }
+        }
+        else if (state == FinalMissionState.MiniROVControlActive)
+        {
+            // MiniROV now owns its own Rigidbody.
+            // Tether is visual only here.
+        }
+        else if (state == FinalMissionState.RecoveringMiniROV)
+        {
+            bool recovered =
+                tetherManager != null &&
+                tetherManager.deployedLengthM <= tetherManager.minimumLengthM + deployedLengthToleranceM;
+
+            if (recovered)
+            {
+                HoldTether();
+
+                EnterState(
+                    FinalMissionState.Recovered,
+                    "minirov_recovered"
+                );
+            }
+        }
+    }
+
+    [ContextMenu("Request Tether Deployment")]
+    public void RequestTetherDeployment()
+    {
+        ConfigureSafeDefaults();
+        RefreshReadiness();
+
+        if (!droneSurfaceStable || !droneMissionReady)
+        {
+            lastEvent = "deploy_rejected_drone_not_surface_ready";
+            Debug.LogWarning("[MIMISK] Final mission deploy rejected: drone not SurfaceStable/ReadyForTetherDeployment.");
+            return;
+        }
+
+        if (!droneAtDeploymentPoint)
+        {
+            lastEvent = "deploy_rejected_wrong_deployment_position";
+            Debug.LogWarning(
+                "[MIMISK] Final mission deploy rejected: wrong deployment position. " +
+                "horizontal_error=" + deploymentHorizontalErrorM.ToString("F2") +
+                " m, yaw_error=" + deploymentYawErrorDeg.ToString("F1") +
+                " deg"
+            );
+            return;
+        }
+
+        if (tetherManager == null || miniRovModule == null)
+        {
+            EnterState(FinalMissionState.Fault, "deploy_failed_missing_tether_or_minirov_module");
+            return;
+        }
+
+        AttachMiniRovToCableEndpoint();
+
+        tetherManager.targetDeployLengthM =
+            Mathf.Clamp(
+                targetDeployLengthM,
+                tetherManager.minimumLengthM,
+                tetherManager.maximumLengthM
+            );
+
+        tetherManager.targetLengthM = tetherManager.targetDeployLengthM;
+        tetherManager.payoutSpeedMS = payoutSpeedMS;
+        tetherManager.tetherState = MIMISKDroneCoreTetherManager.TetherState.Deploying;
+        tetherManager.lastEvent = "final_mission_tether_deploy_started";
+
+        EnterState(FinalMissionState.DeployingTether, "tether_deploy_started");
+    }
+
+    private void AttachMiniRovToCableEndpoint()
+    {
+        if (miniRovModule == null || cableEndFollowRoot == null)
+        {
+            return;
+        }
+
+        SyncCableFollowRootToMovingEndpoint();
+
+        miniRovModule.AttachKinematicToCable(cableEndFollowRoot);
+
+        lastEvent = "minirov_attached_to_cable_endpoint";
+    }
+
+    [ContextMenu("Request MiniROV Control Handoff")]
+    public void RequestMiniRovControlHandoff()
+    {
+        if (miniRovModule == null)
+        {
+            EnterState(FinalMissionState.Fault, "control_handoff_failed_missing_minirov_module");
+            return;
+        }
+
+        HoldTether();
+
+        miniRovModule.EnableExternalControl();
+
+        if (miniRovModule.state == MIMISKMiniROVModule.MiniROVState.ExternalControlActive)
+        {
+            ConfigureVisualTetherToMiniRov();
+
+            EnterState(
+                FinalMissionState.MiniROVControlActive,
+                "minirov_external_control_active"
+            );
+        }
+        else
+        {
+            lastEvent = "control_handoff_requested_but_not_active_" + miniRovModule.lastEvent;
+        }
+    }
+
+    [ContextMenu("Request Recovery")]
+    public void RequestRecovery()
+    {
+        if (tetherManager == null || miniRovModule == null)
+        {
+            EnterState(FinalMissionState.Fault, "recovery_failed_missing_tether_or_minirov");
+            return;
+        }
+
+        if (!allowKinematicRecoverySnap)
+        {
+            float d =
+                rovTetherAnchor != null && cableEndFollowRoot != null
+                    ? Vector3.Distance(rovTetherAnchor.position, cableEndFollowRoot.position)
+                    : 999.0f;
+
+            if (d > recoveryCaptureDistanceM)
+            {
+                lastEvent = "recovery_rejected_rov_not_near_cable_endpoint";
+                Debug.LogWarning("[MIMISK] Recovery rejected: ROV is not near cable endpoint.");
+                return;
+            }
+        }
+
+        activeYellowTetherLine.enabled = false;
+
+        SyncCableFollowRootToMovingEndpoint();
+
+        miniRovModule.SetPassiveKinematic();
+        miniRovModule.AttachKinematicToCable(cableEndFollowRoot);
+
+        tetherManager.targetLengthM = tetherManager.minimumLengthM;
+        tetherManager.recoverySpeedMS = recoverySpeedMS;
+        tetherManager.tetherState = MIMISKDroneCoreTetherManager.TetherState.Recovering;
+        tetherManager.lastEvent = "final_mission_recovery_started";
+
+        EnterState(FinalMissionState.RecoveringMiniROV, "recovery_started");
+    }
+
+    [ContextMenu("Hold Tether")]
+    public void HoldTether()
+    {
+        if (tetherManager == null)
+        {
+            return;
+        }
+
+        tetherManager.targetLengthM = tetherManager.deployedLengthM;
+        tetherManager.winchCommandRateMS = 0.0f;
+        tetherManager.tetherState = MIMISKDroneCoreTetherManager.TetherState.HoldingDeployed;
+        tetherManager.lastEvent = "final_mission_tether_hold";
+    }
+
+    [ContextMenu("Reset Planner")]
+    public void ResetPlanner()
+    {
+        autoDeployConsumed = false;
+        autoControlConsumed = false;
+
+        if (activeYellowTetherLine != null)
+        {
+            activeYellowTetherLine.enabled = false;
+        }
+
+        EnterState(FinalMissionState.WaitingForDroneMission, "planner_reset_waiting");
+    }
+
+    private void SyncCableFollowRootToMovingEndpoint()
+    {
+        if (cableEndFollowRoot == null)
+        {
+            return;
+        }
+
+        if (tetherMovingEndpoint == null)
+        {
+            return;
+        }
+
+        cableEndFollowRoot.SetParent(transform, true);
+        cableEndFollowRoot.localScale = Vector3.one;
+        cableEndFollowRoot.SetPositionAndRotation(
+            tetherMovingEndpoint.position,
+            tetherMovingEndpoint.rotation
+        );
+    }
+
+    private void ConfigureVisualTetherToMiniRov()
+    {
+        if (tetherManager != null && miniRovModule != null)
+        {
+            tetherManager.useVirtualEndpointWhenNoMiniRov = false;
+            tetherManager.miniRovRigidbody = miniRovModule.miniRovRigidbody;
+            tetherManager.miniRovTetherPoint =
+                rovTetherAnchor != null ? rovTetherAnchor : miniRovRoot;
+
+            tetherManager.enableTetherForceWhenMiniRovAttached = false;
+            tetherManager.tetherStiffnessNPerM = 0.0f;
+            tetherManager.tetherDampingNPerMS = 0.0f;
+            tetherManager.maximumSafeTensionN = 999999.0f;
+            tetherManager.lastEvent = "final_visual_tether_follows_rov_anchor";
+        }
+
+        if (enableActiveYellowTetherLine)
+        {
+            EnsureActiveYellowTetherLine();
+
+            if (disableOtherTetherLineRenderersOnROVControl)
+            {
+                DisableOtherTetherLineRenderers();
+            }
+
+            activeYellowTetherLine.enabled = true;
+            UpdateActiveYellowTetherLine();
+        }
+    }
+
+    private void EnsureActiveYellowTetherLine()
+    {
+        if (activeYellowTetherLine != null)
+        {
+            ConfigureLineRenderer(activeYellowTetherLine);
+            return;
+        }
+
+        GameObject existing = GameObject.Find(activeYellowTetherLineName);
+
+        if (existing == null)
+        {
+            existing = new GameObject(activeYellowTetherLineName);
+            existing.transform.SetParent(transform.root, false);
+        }
+
+        activeYellowTetherLine = existing.GetComponent<LineRenderer>();
+
+        if (activeYellowTetherLine == null)
+        {
+            activeYellowTetherLine = existing.AddComponent<LineRenderer>();
+        }
+
+        ConfigureLineRenderer(activeYellowTetherLine);
+        activeYellowTetherLine.enabled = false;
+    }
+
+    private void ConfigureLineRenderer(LineRenderer lr)
+    {
+        lr.useWorldSpace = true;
+        lr.positionCount = Mathf.Max(2, activeTetherLineSegments);
+        lr.widthMultiplier = activeTetherLineWidthM;
+
+        if (lr.sharedMaterial == null)
+        {
+            Shader shader = Shader.Find("Sprites/Default");
+
+            if (shader != null)
+            {
+                Material mat = new Material(shader);
+                mat.color = new Color(1.0f, 0.78f, 0.05f, 1.0f);
+                lr.sharedMaterial = mat;
+            }
+        }
+    }
+
+    private void UpdateActiveYellowTetherLine()
+    {
+        if (activeYellowTetherLine == null ||
+            tetherStart == null ||
+            rovTetherAnchor == null)
+        {
+            return;
+        }
+
+        int n = Mathf.Max(2, activeTetherLineSegments);
+        activeYellowTetherLine.positionCount = n;
+
+        Vector3 a = tetherStart.position;
+        Vector3 b = rovTetherAnchor.position;
+
+        for (int i = 0; i < n; i++)
+        {
+            float u = i / Mathf.Max(1.0f, (float)(n - 1));
+
+            Vector3 p = Vector3.Lerp(a, b, u);
+            p += Vector3.down * Mathf.Sin(Mathf.PI * u) * activeTetherSagM;
+
+            activeYellowTetherLine.SetPosition(i, p);
+        }
+
+        if (hookVisual != null)
+        {
+            hookVisual.position = b;
+            hookVisual.rotation = rovTetherAnchor.rotation;
+        }
+    }
+
+    private void DisableOtherTetherLineRenderers()
+    {
+        LineRenderer[] lines =
+            Object.FindObjectsByType<LineRenderer>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None
+            );
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            LineRenderer lr = lines[i];
+
+            if (lr == null)
+            {
+                continue;
+            }
+
+            if (activeYellowTetherLine != null && lr == activeYellowTetherLine)
+            {
+                continue;
+            }
+
+            string n = lr.gameObject.name.ToLowerInvariant();
+
+            bool looksLikeTether =
+                n.Contains("tether") ||
+                n.Contains("cable") ||
+                n.Contains("line");
+
+            if (looksLikeTether)
+            {
+                lr.enabled = false;
+            }
+        }
+    }
+
+    private void EnterState(FinalMissionState newState, string eventText)
+    {
+        state = newState;
+        stateTimerS = 0.0f;
+        lastEvent = eventText;
+
+        Debug.Log("[MIMISK] Final mission planner: " + newState + " / " + eventText);
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found = FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

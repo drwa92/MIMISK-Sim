@@ -1,0 +1,709 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Controls;
+
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+
+[RequireComponent(typeof(MIMISKDroneModelGamepadInput))]
+public class MIMISKDroneInputCalibrationWizard : MonoBehaviour
+{
+    public enum CalibrationStep
+    {
+        ArmButton,
+        TakeoffButton,
+        AltitudeHoldButton,
+        ManualModeButton,
+        LandButton,
+        DisarmButton,
+        FailsafeButton,
+
+        ForwardAxis,
+        RightAxis,
+        YawAxis,
+        AltitudeUpAxis,
+        AltitudeDownAxis,
+
+        Complete
+    }
+
+    [Serializable]
+    public class Mapping
+    {
+        public bool forceGenericAxisMapping = true;
+
+        public string armButtonNames;
+        public string takeoffButtonNames;
+        public string altitudeHoldButtonNames;
+        public string manualModeButtonNames;
+        public string landButtonNames;
+        public string disarmButtonNames;
+        public string failsafeButtonNames;
+
+        public string forwardAxisNames;
+        public float forwardAxisSign = 1.0f;
+
+        public string rightAxisNames;
+        public float rightAxisSign = 1.0f;
+
+        public string yawAxisNames;
+        public float yawAxisSign = 1.0f;
+
+        public string altitudeUpAxisNames;
+        public float altitudeUpAxisSign = 1.0f;
+
+        public string altitudeDownAxisNames;
+        public float altitudeDownAxisSign = 1.0f;
+    }
+
+    private struct Capture
+    {
+        public InputDevice device;
+        public InputControl control;
+        public float sign;
+    }
+
+    [Header("Calibration")]
+    public bool runCalibration = false;
+    public CalibrationStep currentStep = CalibrationStep.ArmButton;
+
+    [Tooltip("How far an axis/button must move from neutral before it is captured.")]
+    public float captureThreshold = 0.45f;
+
+    [Tooltip("All controls must return below this threshold before the wizard advances to the next step.")]
+    public float releaseThreshold = 0.20f;
+
+    public string mappingRelativePath = "Assets/MIMISK/Settings/InputMappings/gamesir_mapping.json";
+
+    [Header("Debug")]
+    public string activeDeviceName = "waiting";
+    public string activeDeviceLayout = "waiting";
+    public string prompt = "";
+    public string status = "";
+    public string lastCapturedControl = "none";
+    public float lastCapturedSign = 1.0f;
+    public string mappingPreview = "";
+    public bool saved;
+
+    private Mapping mapping = new Mapping();
+    private MIMISKDroneModelGamepadInput input;
+
+    private InputDevice lockedDevice;
+    private bool waitingForRelease;
+    private Dictionary<string, float> neutralValues = new Dictionary<string, float>();
+
+    [ContextMenu("Start Calibration From Beginning")]
+    public void StartCalibration()
+    {
+        input = GetComponent<MIMISKDroneModelGamepadInput>();
+
+        mapping = new Mapping();
+        currentStep = CalibrationStep.ArmButton;
+        runCalibration = true;
+        saved = false;
+        waitingForRelease = false;
+        lockedDevice = null;
+
+        lastCapturedControl = "none";
+        lastCapturedSign = 1.0f;
+        mappingPreview = "";
+
+        CaptureNeutralForAllDevices();
+
+        status = "Calibration started. Release all controls, then follow the prompts.";
+        Debug.Log("[MIMISKDroneInputCalibrationWizard] " + status);
+    }
+
+    [ContextMenu("Save Current Mapping")]
+    public void SaveCurrentMapping()
+    {
+        SaveMapping();
+        ApplyMappingToInput();
+    }
+
+    private void Awake()
+    {
+        input = GetComponent<MIMISKDroneModelGamepadInput>();
+    }
+
+    private void Update()
+    {
+        if (!runCalibration)
+        {
+            return;
+        }
+
+        if (currentStep == CalibrationStep.Complete)
+        {
+            prompt = "Calibration complete. Mapping saved.";
+
+            if (!saved)
+            {
+                SaveMapping();
+                ApplyMappingToInput();
+            }
+
+            return;
+        }
+
+        prompt = GetPrompt(currentStep);
+
+        if (waitingForRelease)
+        {
+            if (AllControlsReleased())
+            {
+                waitingForRelease = false;
+                AdvanceStep();
+                CaptureNeutralForAllDevices();
+                status = "Released. Next step ready.";
+            }
+            else
+            {
+                status = "Captured " + lastCapturedControl + ". Release all buttons/sticks/triggers.";
+            }
+
+            return;
+        }
+
+        Capture capture;
+
+        bool found = IsButtonStep(currentStep)
+            ? TryCaptureButtonLikeControl(out capture)
+            : TryCaptureAxisLikeControl(out capture);
+
+        if (!found)
+        {
+            status = "Waiting for input...";
+            UpdateDeviceDebug();
+            return;
+        }
+
+        lockedDevice = capture.device;
+        activeDeviceName = capture.device != null ? capture.device.displayName : "unknown";
+        activeDeviceLayout = capture.device != null ? capture.device.layout : "unknown";
+
+        lastCapturedControl = capture.control.path;
+        lastCapturedSign = capture.sign;
+
+        if (IsButtonStep(currentStep))
+        {
+            AssignCapturedButton(currentStep, capture.control.path);
+        }
+        else
+        {
+            AssignCapturedAxis(currentStep, capture.control.path, capture.sign);
+        }
+
+        UpdatePreview();
+
+        waitingForRelease = true;
+        status = "Captured " + lastCapturedControl + ". Release controls to continue.";
+
+        Debug.Log(
+            "[MIMISKDroneInputCalibrationWizard] Captured " +
+            currentStep + " = " + lastCapturedControl +
+            " sign=" + lastCapturedSign
+        );
+    }
+
+    private bool IsButtonStep(CalibrationStep step)
+    {
+        return
+            step == CalibrationStep.ArmButton ||
+            step == CalibrationStep.TakeoffButton ||
+            step == CalibrationStep.AltitudeHoldButton ||
+            step == CalibrationStep.ManualModeButton ||
+            step == CalibrationStep.LandButton ||
+            step == CalibrationStep.DisarmButton ||
+            step == CalibrationStep.FailsafeButton;
+    }
+
+    private bool TryCaptureButtonLikeControl(out Capture capture)
+    {
+        capture = new Capture();
+
+        foreach (InputDevice device in GetCandidateDevices())
+        {
+            foreach (InputControl control in device.allControls)
+            {
+                ButtonControl button = control as ButtonControl;
+
+                if (button != null && button.isPressed)
+                {
+                    capture.device = device;
+                    capture.control = control;
+                    capture.sign = 1.0f;
+                    return true;
+                }
+            }
+        }
+
+        // Some controllers expose buttons as analog axes.
+        foreach (InputDevice device in GetCandidateDevices())
+        {
+            foreach (InputControl control in device.allControls)
+            {
+                AxisControl axis = control as AxisControl;
+
+                if (axis == null)
+                {
+                    continue;
+                }
+
+                float delta = ReadDelta(device, control, axis);
+
+                if (Mathf.Abs(delta) >= captureThreshold)
+                {
+                    capture.device = device;
+                    capture.control = control;
+                    capture.sign = delta >= 0.0f ? 1.0f : -1.0f;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryCaptureAxisLikeControl(out Capture capture)
+    {
+        capture = new Capture();
+
+        foreach (InputDevice device in GetCandidateDevices())
+        {
+            foreach (InputControl control in device.allControls)
+            {
+                AxisControl axis = control as AxisControl;
+
+                if (axis == null || control is ButtonControl)
+                {
+                    continue;
+                }
+
+                float delta = ReadDelta(device, control, axis);
+
+                if (Mathf.Abs(delta) >= captureThreshold)
+                {
+                    capture.device = device;
+                    capture.control = control;
+                    capture.sign = delta >= 0.0f ? 1.0f : -1.0f;
+                    return true;
+                }
+            }
+        }
+
+        // Allow analog triggers that Unity exposes as ButtonControl.
+        foreach (InputDevice device in GetCandidateDevices())
+        {
+            foreach (InputControl control in device.allControls)
+            {
+                AxisControl axis = control as AxisControl;
+
+                if (axis == null)
+                {
+                    continue;
+                }
+
+                float delta = ReadDelta(device, control, axis);
+
+                if (Mathf.Abs(delta) >= captureThreshold)
+                {
+                    capture.device = device;
+                    capture.control = control;
+                    capture.sign = delta >= 0.0f ? 1.0f : -1.0f;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private List<InputDevice> GetCandidateDevices()
+    {
+        List<InputDevice> devices = new List<InputDevice>();
+
+        if (lockedDevice != null && IsDeviceConnected(lockedDevice))
+        {
+            devices.Add(lockedDevice);
+            return devices;
+        }
+
+        foreach (InputDevice device in InputSystem.devices)
+        {
+            if (IsControllerLikeDevice(device))
+            {
+                devices.Add(device);
+            }
+        }
+
+        return devices;
+    }
+
+    private bool IsControllerLikeDevice(InputDevice device)
+    {
+        if (device == null)
+        {
+            return false;
+        }
+
+        if (device is Keyboard || device is Mouse || device is Touchscreen)
+        {
+            return false;
+        }
+
+        string s =
+            (device.displayName + " " + device.layout + " " + device.name)
+            .ToLowerInvariant();
+
+        if (ContainsToken(s, "gamepad") ||
+            ContainsToken(s, "joystick") ||
+            ContainsToken(s, "controller") ||
+            ContainsToken(s, "gamesir") ||
+            ContainsToken(s, "xbox") ||
+            ContainsToken(s, "hid"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+
+    private bool IsDeviceConnected(InputDevice device)
+    {
+        if (device == null)
+        {
+            return false;
+        }
+
+        foreach (InputDevice d in InputSystem.devices)
+        {
+            if (d == device)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool ContainsToken(string text, string token)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(token))
+        {
+            return false;
+        }
+
+        return text.IndexOf(token) >= 0;
+    }
+
+    private void CaptureNeutralForAllDevices()
+    {
+        neutralValues.Clear();
+
+        foreach (InputDevice device in InputSystem.devices)
+        {
+            if (!IsControllerLikeDevice(device))
+            {
+                continue;
+            }
+
+            foreach (InputControl control in device.allControls)
+            {
+                AxisControl axis = control as AxisControl;
+
+                if (axis == null)
+                {
+                    continue;
+                }
+
+                neutralValues[Key(device, control)] = axis.ReadValue();
+            }
+        }
+    }
+
+    private float ReadDelta(InputDevice device, InputControl control, AxisControl axis)
+    {
+        string key = Key(device, control);
+
+        float neutral = neutralValues.ContainsKey(key)
+            ? neutralValues[key]
+            : 0.0f;
+
+        return axis.ReadValue() - neutral;
+    }
+
+    private string Key(InputDevice device, InputControl control)
+    {
+        return device.deviceId + "|" + control.path;
+    }
+
+    private bool AllControlsReleased()
+    {
+        foreach (InputDevice device in GetCandidateDevices())
+        {
+            foreach (InputControl control in device.allControls)
+            {
+                ButtonControl button = control as ButtonControl;
+
+                if (button != null && button.isPressed)
+                {
+                    return false;
+                }
+
+                AxisControl axis = control as AxisControl;
+
+                if (axis != null)
+                {
+                    float delta = ReadDelta(device, control, axis);
+
+                    if (Mathf.Abs(delta) > releaseThreshold)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private void AssignCapturedButton(CalibrationStep step, string path)
+    {
+        switch (step)
+        {
+            case CalibrationStep.ArmButton:
+                mapping.armButtonNames = path;
+                break;
+
+            case CalibrationStep.TakeoffButton:
+                mapping.takeoffButtonNames = path;
+                break;
+
+            case CalibrationStep.AltitudeHoldButton:
+                mapping.altitudeHoldButtonNames = path;
+                break;
+
+            case CalibrationStep.ManualModeButton:
+                mapping.manualModeButtonNames = path;
+                break;
+
+            case CalibrationStep.LandButton:
+                mapping.landButtonNames = path;
+                break;
+
+            case CalibrationStep.DisarmButton:
+                mapping.disarmButtonNames = path;
+                break;
+
+            case CalibrationStep.FailsafeButton:
+                mapping.failsafeButtonNames = path;
+                break;
+        }
+    }
+
+    private void AssignCapturedAxis(CalibrationStep step, string path, float sign)
+    {
+        switch (step)
+        {
+            case CalibrationStep.ForwardAxis:
+                mapping.forwardAxisNames = path;
+                mapping.forwardAxisSign = sign;
+                break;
+
+            case CalibrationStep.RightAxis:
+                mapping.rightAxisNames = path;
+                mapping.rightAxisSign = sign;
+                break;
+
+            case CalibrationStep.YawAxis:
+                mapping.yawAxisNames = path;
+                mapping.yawAxisSign = sign;
+                break;
+
+            case CalibrationStep.AltitudeUpAxis:
+                mapping.altitudeUpAxisNames = path;
+                mapping.altitudeUpAxisSign = sign;
+                break;
+
+            case CalibrationStep.AltitudeDownAxis:
+                mapping.altitudeDownAxisNames = path;
+                mapping.altitudeDownAxisSign = sign;
+                break;
+        }
+    }
+
+    private void AdvanceStep()
+    {
+        currentStep = (CalibrationStep)((int)currentStep + 1);
+
+        if (currentStep > CalibrationStep.Complete)
+        {
+            currentStep = CalibrationStep.Complete;
+        }
+    }
+
+    private string GetPrompt(CalibrationStep step)
+    {
+        switch (step)
+        {
+            case CalibrationStep.ArmButton:
+                return "Press and hold the button for ARM / IDLE.";
+
+            case CalibrationStep.TakeoffButton:
+                return "Press and hold the button for TAKEOFF.";
+
+            case CalibrationStep.AltitudeHoldButton:
+                return "Press and hold the button for ALTITUDE HOLD.";
+
+            case CalibrationStep.ManualModeButton:
+                return "Press and hold the button for MANUAL MODE.";
+
+            case CalibrationStep.LandButton:
+                return "Press and hold the button for LAND ON WATER.";
+
+            case CalibrationStep.DisarmButton:
+                return "Press and hold the button for DISARM.";
+
+            case CalibrationStep.FailsafeButton:
+                return "Press and hold the button for FAILSAFE.";
+
+            case CalibrationStep.ForwardAxis:
+                return "Push FORWARD and hold until captured.";
+
+            case CalibrationStep.RightAxis:
+                return "Push RIGHT and hold until captured.";
+
+            case CalibrationStep.YawAxis:
+                return "Push YAW RIGHT and hold until captured.";
+
+            case CalibrationStep.AltitudeUpAxis:
+                return "Press/move ALTITUDE UP and hold until captured.";
+
+            case CalibrationStep.AltitudeDownAxis:
+                return "Press/move ALTITUDE DOWN and hold until captured.";
+
+            case CalibrationStep.Complete:
+                return "Calibration complete.";
+
+            default:
+                return "";
+        }
+    }
+
+    private void UpdateDeviceDebug()
+    {
+        List<InputDevice> devices = GetCandidateDevices();
+
+        if (devices.Count == 0)
+        {
+            activeDeviceName = "none";
+            activeDeviceLayout = "none";
+            return;
+        }
+
+        InputDevice device = devices[0];
+        activeDeviceName = device.displayName;
+        activeDeviceLayout = device.layout;
+    }
+
+    private void UpdatePreview()
+    {
+        StringBuilder sb = new StringBuilder();
+
+        sb.AppendLine("ARM: " + mapping.armButtonNames);
+        sb.AppendLine("TAKEOFF: " + mapping.takeoffButtonNames);
+        sb.AppendLine("HOLD: " + mapping.altitudeHoldButtonNames);
+        sb.AppendLine("MANUAL: " + mapping.manualModeButtonNames);
+        sb.AppendLine("LAND: " + mapping.landButtonNames);
+        sb.AppendLine("DISARM: " + mapping.disarmButtonNames);
+        sb.AppendLine("FAILSAFE: " + mapping.failsafeButtonNames);
+        sb.AppendLine("FORWARD: " + mapping.forwardAxisNames + " sign=" + mapping.forwardAxisSign);
+        sb.AppendLine("RIGHT: " + mapping.rightAxisNames + " sign=" + mapping.rightAxisSign);
+        sb.AppendLine("YAW: " + mapping.yawAxisNames + " sign=" + mapping.yawAxisSign);
+        sb.AppendLine("ALT UP: " + mapping.altitudeUpAxisNames + " sign=" + mapping.altitudeUpAxisSign);
+        sb.AppendLine("ALT DOWN: " + mapping.altitudeDownAxisNames + " sign=" + mapping.altitudeDownAxisSign);
+
+        mappingPreview = sb.ToString();
+    }
+
+    private void SaveMapping()
+    {
+        string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+        string absolutePath = Path.Combine(projectRoot, mappingRelativePath);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(absolutePath));
+
+        File.WriteAllText(absolutePath, JsonUtility.ToJson(mapping, true));
+
+        saved = true;
+
+        Debug.Log("[MIMISKDroneInputCalibrationWizard] Saved mapping to: " + absolutePath);
+
+#if UNITY_EDITOR
+        AssetDatabase.Refresh();
+#endif
+    }
+
+    private void ApplyMappingToInput()
+    {
+        if (input == null)
+        {
+            input = GetComponent<MIMISKDroneModelGamepadInput>();
+        }
+
+        if (input == null)
+        {
+            return;
+        }
+
+        input.forceGenericAxisMapping = mapping.forceGenericAxisMapping;
+
+        input.armButtonNames = mapping.armButtonNames;
+        input.takeoffButtonNames = mapping.takeoffButtonNames;
+        input.altitudeHoldButtonNames = mapping.altitudeHoldButtonNames;
+        input.manualModeButtonNames = mapping.manualModeButtonNames;
+        input.landButtonNames = mapping.landButtonNames;
+        input.disarmButtonNames = mapping.disarmButtonNames;
+        input.failsafeButtonNames = mapping.failsafeButtonNames;
+
+        input.forwardAxisNames = mapping.forwardAxisNames;
+        input.forwardAxisSign = mapping.forwardAxisSign;
+
+        input.rightAxisNames = mapping.rightAxisNames;
+        input.rightAxisSign = mapping.rightAxisSign;
+
+        input.yawAxisNames = mapping.yawAxisNames;
+        input.yawAxisSign = mapping.yawAxisSign;
+
+        input.altitudeUpAxisNames = mapping.altitudeUpAxisNames;
+        input.altitudeUpAxisSign = mapping.altitudeUpAxisSign;
+
+        input.altitudeDownAxisNames = mapping.altitudeDownAxisNames;
+        input.altitudeDownAxisSign = mapping.altitudeDownAxisSign;
+
+        input.enableGamepadInput = true;
+    }
+
+    private void OnGUI()
+    {
+        if (!runCalibration)
+        {
+            return;
+        }
+
+        GUI.Box(new Rect(20, 20, 820, 220), "MIMISK GameSir Calibration");
+        GUI.Label(new Rect(35, 50, 790, 25), "Device: " + activeDeviceName + " / " + activeDeviceLayout);
+        GUI.Label(new Rect(35, 75, 790, 25), "Step: " + currentStep);
+        GUI.Label(new Rect(35, 100, 790, 25), prompt);
+        GUI.Label(new Rect(35, 125, 790, 25), "Status: " + status);
+        GUI.Label(new Rect(35, 150, 790, 25), "Captured: " + lastCapturedControl + " sign=" + lastCapturedSign);
+        GUI.Label(new Rect(35, 175, 790, 25), "Mapping: " + mappingRelativePath);
+    }
+}

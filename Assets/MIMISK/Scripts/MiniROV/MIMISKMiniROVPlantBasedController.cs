@@ -1,0 +1,1891 @@
+using System;
+using System.Reflection;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVPlantBasedController : MonoBehaviour
+{
+    public enum YawReferenceMode
+    {
+        TravelHeading,
+        FixedYaw,
+        FacePoint,
+        FinalYawOnly
+    }
+
+    public enum ControlMode
+    {
+        Disabled,
+        AxisHold,
+        StationHold,
+        GoToPoint,
+        PolylineLOS,
+        CircleLOS
+    }
+
+    [Header("References")]
+    public Rigidbody rb;
+    public ControlManager controlManager;
+    public UnityVirtualESP32 unityVirtualESP32;
+
+    [Header("Ownership")]
+    public bool controllerEnabled;
+    public ControlMode controlMode = ControlMode.Disabled;
+
+    [Header("Yaw / Heading Policy")]
+    [Tooltip("TravelHeading is the safe default for an underactuated two-thruster ROV.")]
+    public YawReferenceMode yawReferenceMode = YawReferenceMode.TravelHeading;
+
+    [Tooltip("Normally OFF. If ON, the ROV tries to track yaw independent from travel heading while moving. This can hurt path tracking because the ROV has no sway.")]
+    public bool allowIndependentYawWhileMoving = false;
+
+    public float fixedYawDeg = 0.0f;
+    public Vector3 yawLookAtPointWorld;
+
+    [Tooltip("If true, when a finite mission completes, StationHold uses finalYawDeg instead of current yaw.")]
+    public bool hasFinalYawReference = false;
+
+    public float finalYawDeg = 0.0f;
+
+    [Header("Runtime Yaw References")]
+    public float activeTravelYawDeg;
+    public float activeControlYawDeg;
+
+    [Tooltip("Disable manual UDP/gamepad/bypass components when autonomy starts.")]
+    public bool disableManualReceiversWhenStarted = true;
+
+    [Tooltip("Stop serial/HIL bridges so this controller owns the motor frame.")]
+    public bool stopSerialBackendsWhenStarted = true;
+
+    public string[] manualReceiverClassNames =
+    {
+        "MIMISKMiniROVDirectRaspberryBypassInput",
+        "MIMISKMiniROVUDPGamepadReceiver",
+        "MIMISKMiniROVGamepadReceiver",
+        "MIMISKMiniROVCoreController"
+    };
+
+    [Header("Water / Coordinates")]
+    public float waterLevelY = 0.0f;
+
+    [Tooltip("Positive depth is downward: depth = waterLevelY - worldY.")]
+    public bool depthPositiveDown = true;
+
+    [Header("Robust Nominal Controller Gains")]
+    public float surgeSpeedKp = 2.5f;
+    public float surgeSpeedKi = 0.25f;
+    public float surgeSpeedKd = 0.0f;
+    public float surgeCmdLimit = 0.95f;
+    public float surgeIntegralLimit = 1.0f;
+
+    public float yawAngleKp = 1.0f;
+    public float yawRateKd = 0.6f;
+    public float yawCmdLimit = 0.08f;
+
+    public float depthKp = 5.0f;
+    public float depthKi = 0.05f;
+    public float depthKd = 25.0f;
+    public float depthCmdLimit = 1.0f;
+    public float depthIntegralLimit = 1.0f;
+
+    [Header("LOS / Path Guidance")]
+    public float waypointDistanceKp = 0.35f;
+    public float waypointMaxSpeedMS = 0.10f;
+    public float losLookaheadM = 0.25f;
+    public float yawAlignmentSlowdownDeg = 45.0f;
+    public float minSpeedAlignmentScale = 0.05f;
+
+    [Header("LOS Heading Reference")]
+    [Tooltip("PolylineLOS uses a cross-segment LOS heading instead of unstable tiny waypoint headings.")]
+    public bool useLosHeadingForPolyline = true;
+
+    public float pathTangentYawDeg;
+    public float losDesiredYawDeg;
+    public float losHeadingCorrectionDeg;
+
+    [Tooltip("Internal one-frame yaw override used by PolylineLOS/CircleLOS.")]
+    public bool useOneFrameTravelYawOverride;
+    public float oneFrameTravelYawDeg;
+
+    [Header("Go To Point")]
+    [Tooltip("If explicit GoToPoint reaches this radius, it switches to StationHold.")]
+    public bool goToPointStopAtTarget = true;
+
+    public float goToPointArrivalRadiusM = 0.15f;
+
+    [Tooltip("Required surge speed before declaring arrival.")]
+    public float goToPointStopSpeedMS = 0.03f;
+
+    [Tooltip("Maximum forward speed for explicit GoToPoint.")]
+    public float goToPointMaxSpeedMS = 0.08f;
+
+    [Tooltip("If yaw error is large, rotate first instead of driving forward.")]
+    public bool goToPointRotateInPlaceWhenYawLarge = true;
+
+    public float goToPointRotateInPlaceYawErrorDeg = 65.0f;
+
+    [Header("Actuator Mapping")]
+    [Range(0, 255)]
+    public int maxThrusterPwm = 255;
+
+    [Range(0, 255)]
+    public int maxBallastPwm = 255;
+
+    [Tooltip("Use this if positive surge moves backward in Unity.")]
+    public bool invertSurgeOutput = false;
+
+    [Tooltip("Use this if positive yaw turns opposite to target yaw.")]
+    public bool invertYawOutput = false;
+
+    public bool invertBallastOutput = false;
+    public bool swapLeftRight = false;
+    public bool invertLeftThruster = false;
+    public bool invertRightThruster = false;
+    public bool invertBothThrusters = false;
+
+    [Header("Axis-Hold Targets")]
+    public float targetSurgeSpeedMS = 0.0f;
+    public float targetYawDeg = 0.0f;
+    public float targetDepthM = 1.2f;
+
+    [Header("Go-To-Point Target")]
+    public Vector3 targetPointWorld;
+    public float targetPointDepthM = 1.2f;
+
+    [Header("Polyline LOS Path")]
+    public Vector3[] pathPointsWorld;
+    public int pathSegmentIndex;
+    public bool holdFinalPointWhenPathComplete = true;
+
+    [Header("Path Completion")]
+    [Tooltip("When a finite polyline path reaches its final segment target, switch to StationHold.")]
+    public bool polylineStopAtEnd = true;
+
+    [Tooltip("Final radius used by PolylineLOS before switching to StationHold.")]
+    public float polylineArrivalRadiusM = 0.15f;
+
+    [Tooltip("When true, completion captures the current pose and holds there. This avoids target chasing after finishing a path.")]
+    public bool completionHoldCurrentPose = true;
+
+    public bool missionCompleted;
+    public string completionReason = "none";
+
+    [Tooltip("Prevents stale path-following speed from carrying into AxisHold.")]
+    public bool zeroSurgeOnAxisHoldStart = true;
+
+    [Header("Station Hold")]
+    [Tooltip("If controller is enabled but no mode is active, capture current pose and enter StationHold.")]
+    public bool autoStationHoldWhenNoMode = true;
+
+    [Tooltip("Inside this radius, StationHold does not run GoToPoint. It only damps surge, holds yaw, and holds depth.")]
+    public float stationHoldDeadbandM = 0.12f;
+
+    [Tooltip("Outside this radius, StationHold slowly returns to the captured station point.")]
+    public float stationHoldReturnRadiusM = 0.22f;
+
+    [Tooltip("Maximum speed used when returning to the station point.")]
+    public float stationHoldMaxReturnSpeedMS = 0.04f;
+
+    [Tooltip("Lock yaw to the yaw captured when StationHold starts.")]
+    public bool stationHoldLockYaw = true;
+
+    public bool stationHoldTargetCaptured;
+    public float stationHoldYawDeg;
+    public float stationHoldErrorM;
+
+    [Header("Circle LOS Path")]
+    public Vector3 circleCenterWorld;
+    public float circleRadiusM = 0.8f;
+    public float circleDepthM = 1.2f;
+    public bool circleClockwise = true;
+
+    [Tooltip("If the ROV is too close to circle center, use heading-based fallback phase.")]
+    public float circleMinRadiusForPhaseM = 0.10f;
+
+    [Tooltip("For demo mode, place the circle center beside the ROV so the ROV starts on the circumference with tangent approximately forward.")]
+    public bool circleStartWithTangentForward = true;
+
+    [Header("Circle Completion")]
+    public bool circleStopAfterCompletedLaps = true;
+    [Min(1)]
+    public int circleTargetLaps = 1;
+    public float circleAngularProgressRad;
+    public float circleLastAngleRad;
+    public bool circleHasPhase;
+    public bool circleCompleted;
+
+    [Header("Runtime State")]
+    public float depthM;
+    public float yawDeg;
+    public float yawRateRadS;
+    public float surgeSpeedMS;
+    public float depthRateMS;
+
+    public float surgeErrorMS;
+    public float yawErrorDeg;
+    public float depthErrorM;
+
+    public float surgeCmd;
+    public float yawCmd;
+    public float ballastCmd;
+
+    public short leftPwm;
+    public short rightPwm;
+    public short dcPortPwm;
+    public short dcStarboardPwm;
+
+    public float losCrossTrackErrorM;
+    public float losTrackingErrorM;
+    public float distanceToTargetM;
+    public bool pathComplete;
+    public bool backendPrepared;
+    public string lastEvent = "idle";
+
+    private float surgeIntegral;
+    private float depthIntegral;
+
+    private MethodInfo controlManagerStopReader;
+    private MethodInfo unityVirtualStopBridge;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void FixedUpdate()
+    {
+        if (!controllerEnabled)
+        {
+            return;
+        }
+
+        AutoFindReferences();
+
+        if (!backendPrepared)
+        {
+            PrepareBackend();
+        }
+
+        UpdateMeasuredState();
+
+        if (controlMode == ControlMode.Disabled)
+        {
+            if (controllerEnabled && autoStationHoldWhenNoMode)
+            {
+                CaptureStationHoldTarget();
+                controlMode = ControlMode.StationHold;
+                lastEvent = "auto_station_hold_from_disabled";
+            }
+            else
+            {
+                InjectMotorFrame(0, 0, 0, 0, "disabled_zero");
+                return;
+            }
+        }
+
+        if (controlMode == ControlMode.AxisHold)
+        {
+            RunAxisHold(Time.fixedDeltaTime);
+            return;
+        }
+
+        if (controlMode == ControlMode.StationHold)
+        {
+            RunStationHold(Time.fixedDeltaTime);
+            return;
+        }
+
+        if (controlMode == ControlMode.GoToPoint)
+        {
+            RunGoToPoint(
+                targetPointWorld.x,
+                targetPointWorld.z,
+                targetPointDepthM,
+                Time.fixedDeltaTime
+            );
+
+            return;
+        }
+
+        if (controlMode == ControlMode.PolylineLOS)
+        {
+            RunPolylineLOS(Time.fixedDeltaTime);
+            return;
+        }
+
+        if (controlMode == ControlMode.CircleLOS)
+        {
+            RunCircleLOS(Time.fixedDeltaTime);
+            return;
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (controlManager == null)
+        {
+            controlManager = GetComponent<ControlManager>();
+        }
+
+        if (unityVirtualESP32 == null)
+        {
+            unityVirtualESP32 = GetComponent<UnityVirtualESP32>();
+        }
+
+        CacheReflection();
+    }
+
+    [ContextMenu("Start Hold Current Pose")]
+    public void StartHoldCurrentPose()
+    {
+        CaptureStationHoldTarget();
+        StartController(ControlMode.StationHold);
+        lastEvent = "station_hold_current_pose_started";
+    }
+
+    public void StartHoldCurrentPoseWithYaw(float yawDegReference)
+    {
+        CaptureStationHoldTarget();
+
+        stationHoldYawDeg =
+            yawDegReference;
+
+        targetYawDeg =
+            yawDegReference;
+
+        targetSurgeSpeedMS =
+            0.0f;
+
+        StartController(ControlMode.StationHold);
+
+        lastEvent =
+            "station_hold_current_pose_with_yaw_" +
+            yawDegReference.ToString("F1");
+    }
+
+    public void StartHoldCurrentPoseFacingPoint(Vector3 pointWorld)
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        float dx =
+            pointWorld.x - p.x;
+
+        float dz =
+            pointWorld.z - p.z;
+
+        float yawRef =
+            yawDeg;
+
+        if (Mathf.Sqrt(dx * dx + dz * dz) > 0.01f)
+        {
+            yawRef =
+                Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+        }
+
+        StartHoldCurrentPoseWithYaw(yawRef);
+
+        lastEvent =
+            "station_hold_current_pose_facing_point";
+    }
+
+    [ContextMenu("Start Hold Current Pose With Current Yaw")]
+    public void StartHoldCurrentPoseWithCurrentYaw()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+        StartHoldCurrentPoseWithYaw(yawDeg);
+    }
+
+    [ContextMenu("Start Axis Hold")]
+    public void StartAxisHold()
+    {
+        if (zeroSurgeOnAxisHoldStart)
+        {
+            targetSurgeSpeedMS = 0.0f;
+        }
+
+        StartController(ControlMode.AxisHold);
+        lastEvent = "axis_hold_started";
+    }
+
+    [ContextMenu("Start Go To Point")]
+    public void StartGoToPoint()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        if (targetPointDepthM <= 0.001f)
+        {
+            targetPointDepthM = depthM;
+        }
+
+        StartController(ControlMode.GoToPoint);
+        lastEvent = "go_to_point_started";
+    }
+
+    [ContextMenu("Start Go To Point 1m Forward")]
+    public void StartGoToPointOneMeterForward()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        targetPointWorld =
+            p + transform.forward * 1.0f;
+
+        targetPointDepthM =
+            depthM;
+
+        StartController(ControlMode.GoToPoint);
+        lastEvent = "go_to_point_1m_forward_started";
+    }
+
+    [ContextMenu("Start Line LOS Demo")]
+    public void StartLineLOSDemo()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 p0 = transform.position;
+        Vector3 p1 = transform.position + transform.forward * 2.5f;
+
+        float y = waterLevelY - targetDepthM;
+
+        p0.y = y;
+        p1.y = y;
+
+        pathPointsWorld =
+            new Vector3[]
+            {
+                p0,
+                p1,
+                p0
+            };
+
+        pathSegmentIndex = 0;
+        pathComplete = false;
+
+        StartController(ControlMode.PolylineLOS);
+        lastEvent = "line_los_demo_started";
+    }
+
+    [ContextMenu("Start Square LOS Demo")]
+    public void StartSquareLOSDemo()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 c = transform.position;
+        float y = waterLevelY - targetDepthM;
+        float side = 1.2f;
+
+        Vector3 f = transform.forward;
+        Vector3 r = transform.right;
+
+        Vector3 p0 = c;
+        Vector3 p1 = c + f * side;
+        Vector3 p2 = c + f * side + r * side;
+        Vector3 p3 = c + r * side;
+
+        p0.y = y;
+        p1.y = y;
+        p2.y = y;
+        p3.y = y;
+
+        pathPointsWorld =
+            new Vector3[]
+            {
+                p0,
+                p1,
+                p2,
+                p3,
+                p0
+            };
+
+        pathSegmentIndex = 0;
+        pathComplete = false;
+
+        StartController(ControlMode.PolylineLOS);
+        lastEvent = "square_los_demo_started";
+    }
+
+    [ContextMenu("Start Circle LOS Demo")]
+    public void StartCircleLOSDemo()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        circleDepthM = targetDepthM;
+        circleRadiusM = Mathf.Max(0.20f, circleRadiusM);
+
+        Vector3 right =
+            transform.right;
+
+        right.y = 0.0f;
+
+        if (right.sqrMagnitude < 0.0001f)
+        {
+            right = Vector3.right;
+        }
+
+        right.Normalize();
+
+        if (circleStartWithTangentForward)
+        {
+            // Put the ROV on the circle circumference.
+            // For circleClockwise=true, center is to the ROV's right so the initial tangent is approximately forward.
+            circleCenterWorld =
+                p +
+                (circleClockwise ? right : -right) * circleRadiusM;
+        }
+        else
+        {
+            circleCenterWorld = p;
+        }
+
+        circleCenterWorld.y =
+            DepthToWorldY(circleDepthM);
+
+        Vector3 rel =
+            p - circleCenterWorld;
+
+        circleLastAngleRad =
+            Mathf.Atan2(rel.x, rel.z);
+
+        circleAngularProgressRad = 0.0f;
+        circleHasPhase = true;
+        circleCompleted = false;
+
+        StartController(ControlMode.CircleLOS);
+        lastEvent = "circle_los_demo_started_on_circumference";
+    }
+
+    [ContextMenu("Stop Controller")]
+    public void StopController()
+    {
+        controllerEnabled = false;
+        controlMode = ControlMode.Disabled;
+        backendPrepared = false;
+        ResetIntegrators();
+        InjectMotorFrame(0, 0, 0, 0, "controller_stopped");
+        lastEvent = "controller_stopped";
+    }
+
+    public void StartController(ControlMode mode)
+    {
+        AutoFindReferences();
+
+        controllerEnabled = true;
+        controlMode = mode;
+        backendPrepared = false;
+        pathComplete = false;
+        missionCompleted = false;
+        completionReason = "none";
+
+        if (mode != ControlMode.StationHold)
+        {
+            stationHoldTargetCaptured = false;
+        }
+        else if (!stationHoldTargetCaptured)
+        {
+            CaptureStationHoldTarget();
+        }
+
+        ResetIntegrators();
+        PrepareBackend();
+
+        lastEvent = "controller_started_" + mode.ToString();
+    }
+
+    private void PrepareBackend()
+    {
+        AutoFindReferences();
+
+        if (disableManualReceiversWhenStarted)
+        {
+            DisableManualReceivers();
+        }
+
+        if (rb != null)
+        {
+            rb.isKinematic = false;
+            rb.useGravity = true;
+            rb.WakeUp();
+        }
+
+        if (controlManager != null)
+        {
+            controlManager.enabled = true;
+            controlManager.autoOpenOnStart = false;
+
+            if (rb != null)
+            {
+                controlManager.rb = rb;
+            }
+
+            if (controlManager.leftThruster == null)
+            {
+                controlManager.leftThruster =
+                    FindDeepChild(transform, "propulseur_gauche");
+            }
+
+            if (controlManager.rightThruster == null)
+            {
+                controlManager.rightThruster =
+                    FindDeepChild(transform, "propulseur_droite");
+            }
+
+            if (stopSerialBackendsWhenStarted &&
+                controlManagerStopReader != null)
+            {
+                try
+                {
+                    controlManagerStopReader.Invoke(controlManager, null);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        if (unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.autoOpenOnStart = false;
+
+            if (stopSerialBackendsWhenStarted &&
+                unityVirtualStopBridge != null)
+            {
+                try
+                {
+                    unityVirtualStopBridge.Invoke(unityVirtualESP32, null);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        backendPrepared = true;
+    }
+
+    private void CaptureStationHoldTarget()
+    {
+        AutoFindReferences();
+        UpdateMeasuredState();
+
+        Vector3 p =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        targetPointWorld = p;
+        targetPointDepthM = depthM;
+
+        stationHoldYawDeg = yawDeg;
+        stationHoldTargetCaptured = true;
+
+        targetSurgeSpeedMS = 0.0f;
+        targetYawDeg = stationHoldYawDeg;
+        targetDepthM = depthM;
+
+        distanceToTargetM = 0.0f;
+        stationHoldErrorM = 0.0f;
+        losCrossTrackErrorM = 0.0f;
+        losTrackingErrorM = 0.0f;
+
+        ResetIntegrators();
+    }
+
+    private void CompleteFinitePath(string reason)
+    {
+        missionCompleted = true;
+        pathComplete = true;
+        completionReason = reason;
+
+        ResetIntegrators();
+
+        if (completionHoldCurrentPose)
+        {
+            CaptureStationHoldTarget();
+        }
+
+        if (hasFinalYawReference)
+        {
+            stationHoldYawDeg = finalYawDeg;
+            targetYawDeg = finalYawDeg;
+        }
+
+        targetSurgeSpeedMS = 0.0f;
+        controlMode = ControlMode.StationHold;
+
+        lastEvent = reason + "_station_hold";
+    }
+
+    private void RunStationHold(float dt)
+    {
+        if (!stationHoldTargetCaptured)
+        {
+            CaptureStationHoldTarget();
+        }
+
+        if (rb == null)
+        {
+            RunAxisHold(dt);
+            return;
+        }
+
+        Vector3 p =
+            rb.position;
+
+        float dx =
+            targetPointWorld.x - p.x;
+
+        float dz =
+            targetPointWorld.z - p.z;
+
+        float horizontalError =
+            Mathf.Sqrt(dx * dx + dz * dz);
+
+        float depthHoldTarget =
+            targetPointDepthM;
+
+        distanceToTargetM =
+            Mathf.Sqrt(
+                horizontalError * horizontalError +
+                Mathf.Pow(depthHoldTarget - depthM, 2.0f)
+            );
+
+        stationHoldErrorM =
+            distanceToTargetM;
+
+        losCrossTrackErrorM =
+            horizontalError;
+
+        losTrackingErrorM =
+            distanceToTargetM;
+
+        // Deadbanded hold:
+        // Do not chase millimeter-level position errors. Just damp speed,
+        // hold captured yaw, and hold captured depth.
+        if (horizontalError <= stationHoldDeadbandM)
+        {
+            targetSurgeSpeedMS = 0.0f;
+            targetYawDeg = stationHoldLockYaw ? stationHoldYawDeg : yawDeg;
+            targetDepthM = depthHoldTarget;
+
+            ComputeAxisController(
+                0.0f,
+                targetYawDeg,
+                targetDepthM,
+                dt
+            );
+
+            SendMixedCommand("station_hold_deadband");
+            return;
+        }
+
+        // Return slowly only when drift is meaningful.
+        float oldMaxSpeed =
+            waypointMaxSpeedMS;
+
+        waypointMaxSpeedMS =
+            Mathf.Min(
+                waypointMaxSpeedMS,
+                stationHoldMaxReturnSpeedMS
+            );
+
+        RunGoToPoint(
+            targetPointWorld.x,
+            targetPointWorld.z,
+            depthHoldTarget,
+            dt
+        );
+
+        waypointMaxSpeedMS =
+            oldMaxSpeed;
+
+        lastEvent = "station_hold_returning";
+    }
+
+    private void RunAxisHold(float dt)
+    {
+        ComputeAxisController(
+            targetSurgeSpeedMS,
+            targetYawDeg,
+            targetDepthM,
+            dt
+        );
+
+        SendMixedCommand("axis_hold");
+    }
+
+    private void RunGoToPoint(
+        float targetX,
+        float targetZ,
+        float targetDepth,
+        float dt)
+    {
+        if (rb == null)
+        {
+            RunAxisHold(dt);
+            return;
+        }
+
+        float dx =
+            targetX - rb.position.x;
+
+        float dz =
+            targetZ - rb.position.z;
+
+        float horizontalDistance =
+            Mathf.Sqrt(dx * dx + dz * dz);
+
+        distanceToTargetM =
+            Mathf.Sqrt(
+                dx * dx +
+                dz * dz +
+                Mathf.Pow(targetDepth - depthM, 2.0f)
+            );
+
+        bool explicitGoToPoint =
+            controlMode == ControlMode.GoToPoint;
+
+        if (explicitGoToPoint &&
+            goToPointStopAtTarget &&
+            distanceToTargetM <= goToPointArrivalRadiusM &&
+            Mathf.Abs(surgeSpeedMS) <= goToPointStopSpeedMS)
+        {
+            CompleteFinitePath("go_to_point_arrived");
+            RunStationHold(dt);
+            return;
+        }
+
+        float travelYawDeg =
+            yawDeg;
+
+        if (horizontalDistance > 0.01f)
+        {
+            travelYawDeg =
+                Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+        }
+
+        if (useOneFrameTravelYawOverride)
+        {
+            travelYawDeg =
+                oneFrameTravelYawDeg;
+
+            useOneFrameTravelYawOverride =
+                false;
+        }
+
+        bool nearArrival =
+            explicitGoToPoint &&
+            distanceToTargetM <= Mathf.Max(
+                goToPointArrivalRadiusM * 2.0f,
+                0.25f
+            );
+
+        float targetYaw =
+            ResolveYawReference(
+                travelYawDeg,
+                targetX,
+                targetZ,
+                targetDepth,
+                explicitGoToPoint,
+                nearArrival
+            );
+
+        activeTravelYawDeg =
+            travelYawDeg;
+
+        activeControlYawDeg =
+            targetYaw;
+
+        // Speed alignment uses travel heading, not inspection yaw.
+        float yawErrAbs =
+            Mathf.Abs(
+                Mathf.DeltaAngle(
+                    yawDeg,
+                    travelYawDeg
+                )
+            );
+
+        float maxSpeed =
+            explicitGoToPoint
+                ? Mathf.Min(
+                    waypointMaxSpeedMS,
+                    goToPointMaxSpeedMS
+                )
+                : waypointMaxSpeedMS;
+
+        float distanceSpeed =
+            Mathf.Min(
+                maxSpeed,
+                waypointDistanceKp * horizontalDistance
+            );
+
+        float align =
+            1.0f -
+            Mathf.Clamp01(
+                yawErrAbs /
+                Mathf.Max(1.0f, yawAlignmentSlowdownDeg)
+            );
+
+        align =
+            Mathf.Max(
+                minSpeedAlignmentScale,
+                align
+            );
+
+        if (explicitGoToPoint &&
+            goToPointRotateInPlaceWhenYawLarge &&
+            yawErrAbs >= goToPointRotateInPlaceYawErrorDeg)
+        {
+            align = 0.0f;
+        }
+
+        if (explicitGoToPoint &&
+            horizontalDistance <= goToPointArrivalRadiusM)
+        {
+            align = 0.0f;
+        }
+
+        float speedRef =
+            distanceSpeed * align;
+
+        targetPointWorld =
+            new Vector3(
+                targetX,
+                DepthToWorldY(targetDepth),
+                targetZ
+            );
+
+        targetPointDepthM =
+            targetDepth;
+
+        targetSurgeSpeedMS =
+            speedRef;
+
+        targetYawDeg =
+            targetYaw;
+
+        targetDepthM =
+            targetDepth;
+
+        ComputeAxisController(
+            speedRef,
+            targetYaw,
+            targetDepth,
+            dt
+        );
+
+        SendMixedCommand("go_to_point");
+    }
+
+    private float ResolveYawReference(
+        float travelYawDeg,
+        float targetX,
+        float targetZ,
+        float targetDepth,
+        bool explicitGoToPoint,
+        bool nearArrival)
+    {
+        // Safe default for this MiniROV:
+        // while moving, yaw should be the travel heading because there is no sway thruster.
+        if (!allowIndependentYawWhileMoving && !nearArrival)
+        {
+            return travelYawDeg;
+        }
+
+        if (yawReferenceMode == YawReferenceMode.TravelHeading)
+        {
+            return travelYawDeg;
+        }
+
+        if (yawReferenceMode == YawReferenceMode.FixedYaw)
+        {
+            return fixedYawDeg;
+        }
+
+        if (yawReferenceMode == YawReferenceMode.FacePoint)
+        {
+            Vector3 p =
+                rb != null
+                    ? rb.position
+                    : transform.position;
+
+            float dx =
+                yawLookAtPointWorld.x - p.x;
+
+            float dz =
+                yawLookAtPointWorld.z - p.z;
+
+            if (Mathf.Sqrt(dx * dx + dz * dz) > 0.01f)
+            {
+                return Mathf.Atan2(dx, dz) * Mathf.Rad2Deg;
+            }
+
+            return travelYawDeg;
+        }
+
+        if (yawReferenceMode == YawReferenceMode.FinalYawOnly)
+        {
+            return nearArrival && hasFinalYawReference
+                ? finalYawDeg
+                : travelYawDeg;
+        }
+
+        return travelYawDeg;
+    }
+
+    private void RunPolylineLOS(float dt)
+    {
+        if (pathPointsWorld == null || pathPointsWorld.Length < 2)
+        {
+            RunAxisHold(dt);
+            lastEvent = "polyline_missing_path_axis_hold";
+            return;
+        }
+
+        if (rb == null)
+        {
+            RunAxisHold(dt);
+            return;
+        }
+
+        int lastSegment =
+            pathPointsWorld.Length - 2;
+
+        pathSegmentIndex =
+            Mathf.Clamp(
+                pathSegmentIndex,
+                0,
+                lastSegment
+            );
+
+        Vector2 p =
+            new Vector2(
+                rb.position.x,
+                rb.position.z
+            );
+
+        // Move through dense resampled points smoothly instead of stopping at each point.
+        for (int guard = 0; guard < 12; guard++)
+        {
+            Vector3 a3 =
+                pathPointsWorld[pathSegmentIndex];
+
+            Vector3 b3 =
+                pathPointsWorld[pathSegmentIndex + 1];
+
+            Vector2 a =
+                new Vector2(a3.x, a3.z);
+
+            Vector2 b =
+                new Vector2(b3.x, b3.z);
+
+            Vector2 ab =
+                b - a;
+
+            float len =
+                ab.magnitude;
+
+            if (len < 0.0001f)
+            {
+                if (pathSegmentIndex < lastSegment)
+                {
+                    pathSegmentIndex++;
+                    continue;
+                }
+
+                break;
+            }
+
+            Vector2 dir =
+                ab / len;
+
+            float along =
+                Vector2.Dot(p - a, dir);
+
+            float endDistance =
+                Vector2.Distance(p, b);
+
+            if (pathSegmentIndex < lastSegment &&
+                (along > len ||
+                 (along > 0.65f * len &&
+                  endDistance <= Mathf.Max(0.08f, losLookaheadM * 0.45f))))
+            {
+                pathSegmentIndex++;
+                continue;
+            }
+
+            break;
+        }
+
+        pathSegmentIndex =
+            Mathf.Clamp(
+                pathSegmentIndex,
+                0,
+                lastSegment
+            );
+
+        Vector3 segA3 =
+            pathPointsWorld[pathSegmentIndex];
+
+        Vector3 segB3 =
+            pathPointsWorld[pathSegmentIndex + 1];
+
+        Vector2 segA =
+            new Vector2(segA3.x, segA3.z);
+
+        Vector2 segB =
+            new Vector2(segB3.x, segB3.z);
+
+        Vector2 segAB =
+            segB - segA;
+
+        float segLen =
+            segAB.magnitude;
+
+        if (segLen < 0.0001f)
+        {
+            if (pathSegmentIndex < lastSegment)
+            {
+                pathSegmentIndex++;
+                return;
+            }
+
+            CompleteFinitePath("polyline_complete");
+            return;
+        }
+
+        Vector2 segDir =
+            segAB / segLen;
+
+        float alongRaw =
+            Vector2.Dot(p - segA, segDir);
+
+        float alongClamped =
+            Mathf.Clamp(
+                alongRaw,
+                0.0f,
+                segLen
+            );
+
+        Vector2 closest =
+            segA + segDir * alongClamped;
+
+        losCrossTrackErrorM =
+            Vector2.Distance(p, closest);
+
+        // Look ahead across future segments.
+        int carrotSegment =
+            pathSegmentIndex;
+
+        float carrotAlong =
+            alongClamped + Mathf.Max(0.05f, losLookaheadM);
+
+        for (int guard = 0; guard < pathPointsWorld.Length; guard++)
+        {
+            Vector3 ca3 =
+                pathPointsWorld[carrotSegment];
+
+            Vector3 cb3 =
+                pathPointsWorld[carrotSegment + 1];
+
+            Vector2 ca =
+                new Vector2(ca3.x, ca3.z);
+
+            Vector2 cb =
+                new Vector2(cb3.x, cb3.z);
+
+            float len =
+                Vector2.Distance(ca, cb);
+
+            if (len < 0.0001f)
+            {
+                if (carrotSegment < lastSegment)
+                {
+                    carrotSegment++;
+                    continue;
+                }
+
+                carrotAlong = 0.0f;
+                break;
+            }
+
+            if (carrotAlong <= len || carrotSegment >= lastSegment)
+            {
+                break;
+            }
+
+            carrotAlong -= len;
+            carrotSegment++;
+        }
+
+        carrotSegment =
+            Mathf.Clamp(
+                carrotSegment,
+                0,
+                lastSegment
+            );
+
+        Vector3 cA3 =
+            pathPointsWorld[carrotSegment];
+
+        Vector3 cB3 =
+            pathPointsWorld[carrotSegment + 1];
+
+        Vector2 cA =
+            new Vector2(cA3.x, cA3.z);
+
+        Vector2 cB =
+            new Vector2(cB3.x, cB3.z);
+
+        Vector2 cAB =
+            cB - cA;
+
+        float cLen =
+            cAB.magnitude;
+
+        float alpha =
+            cLen > 0.0001f
+                ? Mathf.Clamp01(carrotAlong / cLen)
+                : 1.0f;
+
+        Vector2 carrot =
+            Vector2.Lerp(
+                cA,
+                cB,
+                alpha
+            );
+
+        float depthA =
+            WorldYToDepth(cA3.y);
+
+        float depthB =
+            WorldYToDepth(cB3.y);
+
+        float carrotDepth =
+            Mathf.Lerp(
+                depthA,
+                depthB,
+                alpha
+            );
+
+        // Correct target yaw for path following:
+        // Use the actual LOS travel heading to the cross-segment carrot.
+        float losYaw =
+            yawDeg;
+
+        Vector2 toCarrot =
+            carrot - p;
+
+        if (toCarrot.magnitude > 0.001f)
+        {
+            losYaw =
+                Mathf.Atan2(
+                    toCarrot.x,
+                    toCarrot.y
+                ) * Mathf.Rad2Deg;
+        }
+
+        // Also log the path tangent for diagnostics.
+        if (cLen > 0.0001f)
+        {
+            pathTangentYawDeg =
+                Mathf.Atan2(
+                    cAB.x,
+                    cAB.y
+                ) * Mathf.Rad2Deg;
+        }
+        else
+        {
+            pathTangentYawDeg =
+                losYaw;
+        }
+
+        losDesiredYawDeg =
+            losYaw;
+
+        losHeadingCorrectionDeg =
+            Mathf.DeltaAngle(
+                pathTangentYawDeg,
+                losYaw
+            );
+
+        if (useLosHeadingForPolyline)
+        {
+            useOneFrameTravelYawOverride = true;
+            oneFrameTravelYawDeg = losYaw;
+        }
+
+        RunGoToPoint(
+            carrot.x,
+            carrot.y,
+            carrotDepth,
+            dt
+        );
+
+        losTrackingErrorM =
+            Mathf.Sqrt(
+                losCrossTrackErrorM * losCrossTrackErrorM +
+                depthErrorM * depthErrorM
+            );
+
+        Vector3 finalPoint =
+            pathPointsWorld[pathPointsWorld.Length - 1];
+
+        float finalDepth =
+            WorldYToDepth(finalPoint.y);
+
+        float finalError =
+            Mathf.Sqrt(
+                Mathf.Pow(finalPoint.x - rb.position.x, 2.0f) +
+                Mathf.Pow(finalPoint.z - rb.position.z, 2.0f) +
+                Mathf.Pow(finalDepth - depthM, 2.0f)
+            );
+
+        if (pathSegmentIndex >= lastSegment &&
+            finalError <= Mathf.Max(0.05f, polylineArrivalRadiusM))
+        {
+            pathComplete = true;
+
+            if (holdFinalPointWhenPathComplete || polylineStopAtEnd)
+            {
+                CompleteFinitePath("polyline_complete");
+            }
+        }
+    }
+
+    private void RunCircleLOS(float dt)
+    {
+        Vector2 p =
+            new Vector2(
+                rb.position.x - circleCenterWorld.x,
+                rb.position.z - circleCenterWorld.z
+            );
+
+        float radiusNow =
+            p.magnitude;
+
+        if (radiusNow < Mathf.Max(0.02f, circleMinRadiusForPhaseM))
+        {
+            Vector3 right =
+                transform.right;
+
+            right.y = 0.0f;
+
+            if (right.sqrMagnitude < 0.0001f)
+            {
+                right = Vector3.right;
+            }
+
+            right.Normalize();
+
+            Vector3 radial =
+                circleClockwise
+                    ? -right
+                    : right;
+
+            p =
+                new Vector2(
+                    radial.x,
+                    radial.z
+                ) * circleRadiusM;
+
+            radiusNow =
+                circleRadiusM;
+        }
+
+        float theta =
+            Mathf.Atan2(p.x, p.y);
+
+        float direction =
+            circleClockwise ? 1.0f : -1.0f;
+
+        if (!circleHasPhase)
+        {
+            circleLastAngleRad = theta;
+            circleAngularProgressRad = 0.0f;
+            circleHasPhase = true;
+        }
+        else
+        {
+            float deltaRad =
+                Mathf.DeltaAngle(
+                    circleLastAngleRad * Mathf.Rad2Deg,
+                    theta * Mathf.Rad2Deg
+                ) * Mathf.Deg2Rad;
+
+            float signedProgress =
+                direction * deltaRad;
+
+            if (signedProgress > 0.0f)
+            {
+                circleAngularProgressRad += signedProgress;
+            }
+
+            circleLastAngleRad = theta;
+        }
+
+        if (circleStopAfterCompletedLaps &&
+            !circleCompleted &&
+            circleAngularProgressRad >=
+                Mathf.Max(1, circleTargetLaps) * 2.0f * Mathf.PI)
+        {
+            circleCompleted = true;
+
+            CompleteFinitePath("circle_complete");
+            RunStationHold(dt);
+            return;
+        }
+
+        float carrotTheta =
+            theta +
+            direction *
+            losLookaheadM /
+            Mathf.Max(0.05f, circleRadiusM);
+
+        float targetX =
+            circleCenterWorld.x +
+            circleRadiusM * Mathf.Sin(carrotTheta);
+
+        float targetZ =
+            circleCenterWorld.z +
+            circleRadiusM * Mathf.Cos(carrotTheta);
+
+        RunGoToPoint(
+            targetX,
+            targetZ,
+            circleDepthM,
+            dt
+        );
+
+        float radialError =
+            Mathf.Abs(radiusNow - circleRadiusM);
+
+        losCrossTrackErrorM =
+            radialError;
+
+        losTrackingErrorM =
+            Mathf.Sqrt(
+                radialError * radialError +
+                depthErrorM * depthErrorM
+            );
+    }
+
+    private void ComputeAxisController(
+        float surgeSpeedRef,
+        float yawRefDeg,
+        float depthRef,
+        float dt)
+    {
+        UpdateMeasuredState();
+
+        surgeErrorMS =
+            surgeSpeedRef - surgeSpeedMS;
+
+        surgeIntegral += surgeErrorMS * dt;
+        surgeIntegral =
+            Mathf.Clamp(
+                surgeIntegral,
+                -surgeIntegralLimit,
+                surgeIntegralLimit
+            );
+
+        float surgeOut =
+            surgeSpeedKp * surgeErrorMS +
+            surgeSpeedKi * surgeIntegral;
+
+        surgeCmd =
+            Mathf.Clamp(
+                surgeOut,
+                -surgeCmdLimit,
+                surgeCmdLimit
+            );
+
+        yawErrorDeg =
+            Mathf.DeltaAngle(
+                yawDeg,
+                yawRefDeg
+            );
+
+        float yawErrorRad =
+            yawErrorDeg * Mathf.Deg2Rad;
+
+        float yawOut =
+            yawAngleKp * yawErrorRad -
+            yawRateKd * yawRateRadS;
+
+        yawCmd =
+            Mathf.Clamp(
+                yawOut,
+                -yawCmdLimit,
+                yawCmdLimit
+            );
+
+        depthErrorM =
+            depthRef - depthM;
+
+        depthIntegral += depthErrorM * dt;
+        depthIntegral =
+            Mathf.Clamp(
+                depthIntegral,
+                -depthIntegralLimit,
+                depthIntegralLimit
+            );
+
+        float depthOut =
+            depthKp * depthErrorM +
+            depthKi * depthIntegral -
+            depthKd * depthRateMS;
+
+        ballastCmd =
+            Mathf.Clamp(
+                depthOut,
+                -depthCmdLimit,
+                depthCmdLimit
+            );
+    }
+
+    private void SendMixedCommand(string source)
+    {
+        float s =
+            invertSurgeOutput
+                ? -surgeCmd
+                : surgeCmd;
+
+        float y =
+            invertYawOutput
+                ? -yawCmd
+                : yawCmd;
+
+        float b =
+            invertBallastOutput
+                ? -ballastCmd
+                : ballastCmd;
+
+        float left =
+            Mathf.Clamp(s + y, -1.0f, 1.0f);
+
+        float right =
+            Mathf.Clamp(s - y, -1.0f, 1.0f);
+
+        int leftInt =
+            Mathf.RoundToInt(
+                left * maxThrusterPwm
+            );
+
+        int rightInt =
+            Mathf.RoundToInt(
+                right * maxThrusterPwm
+            );
+
+        if (swapLeftRight)
+        {
+            int tmp =
+                leftInt;
+
+            leftInt =
+                rightInt;
+
+            rightInt =
+                tmp;
+        }
+
+        if (invertBothThrusters)
+        {
+            leftInt =
+                -leftInt;
+
+            rightInt =
+                -rightInt;
+        }
+
+        if (invertLeftThruster)
+        {
+            leftInt =
+                -leftInt;
+        }
+
+        if (invertRightThruster)
+        {
+            rightInt =
+                -rightInt;
+        }
+
+        int dc =
+            Mathf.RoundToInt(
+                b * maxBallastPwm
+            );
+
+        InjectMotorFrame(
+            (short)Mathf.Clamp(leftInt, -255, 255),
+            (short)Mathf.Clamp(rightInt, -255, 255),
+            (short)Mathf.Clamp(dc, -255, 255),
+            (short)Mathf.Clamp(dc, -255, 255),
+            source
+        );
+    }
+
+    private void InjectMotorFrame(
+        short left,
+        short right,
+        short dc1,
+        short dc2,
+        string source)
+    {
+        leftPwm =
+            left;
+
+        rightPwm =
+            right;
+
+        dcPortPwm =
+            dc1;
+
+        dcStarboardPwm =
+            dc2;
+
+        if (controlManager != null)
+        {
+            controlManager.InjectMotorFrame(
+                left,
+                right,
+                dc1,
+                dc2
+            );
+        }
+
+        if (unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.lastLeftThruster = left;
+            unityVirtualESP32.lastRightThruster = right;
+            unityVirtualESP32.lastDcPort = dc1;
+            unityVirtualESP32.lastDcStarboard = dc2;
+            unityVirtualESP32.motorRxConnected = true;
+            unityVirtualESP32.motorRxHz = 1.0f / Mathf.Max(Time.fixedDeltaTime, 0.0001f);
+        }
+
+        lastEvent =
+            source +
+            "_L_" +
+            left +
+            "_R_" +
+            right +
+            "_DC_" +
+            dc1;
+    }
+
+    private void UpdateMeasuredState()
+    {
+        if (rb == null)
+        {
+            return;
+        }
+
+        Vector3 v =
+            rb.linearVelocity;
+
+        surgeSpeedMS =
+            Vector3.Dot(
+                v,
+                transform.forward
+            );
+
+        depthRateMS =
+            depthPositiveDown
+                ? -v.y
+                : v.y;
+
+        depthM =
+            WorldYToDepth(
+                rb.position.y
+            );
+
+        yawDeg =
+            transform.eulerAngles.y;
+
+        yawRateRadS =
+            rb.angularVelocity.y;
+    }
+
+    private float WorldYToDepth(float worldY)
+    {
+        return depthPositiveDown
+            ? waterLevelY - worldY
+            : worldY - waterLevelY;
+    }
+
+    private float DepthToWorldY(float depth)
+    {
+        return depthPositiveDown
+            ? waterLevelY - depth
+            : waterLevelY + depth;
+    }
+
+    private void ResetIntegrators()
+    {
+        surgeIntegral = 0.0f;
+        depthIntegral = 0.0f;
+    }
+
+    private void DisableManualReceivers()
+    {
+        if (manualReceiverClassNames == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < manualReceiverClassNames.Length; i++)
+        {
+            DisableComponentByClassName(manualReceiverClassNames[i]);
+        }
+    }
+
+    private void DisableComponentByClassName(string className)
+    {
+        if (string.IsNullOrEmpty(className))
+        {
+            return;
+        }
+
+        Type t =
+            FindTypeByName(className);
+
+        if (t == null)
+        {
+            return;
+        }
+
+        Component c =
+            GetComponent(t);
+
+        Behaviour b =
+            c as Behaviour;
+
+        if (b != null && b != this)
+        {
+            b.enabled = false;
+        }
+    }
+
+    private Type FindTypeByName(string className)
+    {
+        Assembly[] assemblies =
+            AppDomain.CurrentDomain.GetAssemblies();
+
+        for (int a = 0; a < assemblies.Length; a++)
+        {
+            Type direct =
+                assemblies[a].GetType(className);
+
+            if (direct != null)
+            {
+                return direct;
+            }
+
+            Type[] types;
+
+            try
+            {
+                types =
+                    assemblies[a].GetTypes();
+            }
+            catch
+            {
+                continue;
+            }
+
+            for (int i = 0; i < types.Length; i++)
+            {
+                if (types[i].Name == className)
+                {
+                    return types[i];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private void CacheReflection()
+    {
+        if (controlManager != null &&
+            controlManagerStopReader == null)
+        {
+            controlManagerStopReader =
+                controlManager.GetType().GetMethod(
+                    "StopReader",
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+        }
+
+        if (unityVirtualESP32 != null &&
+            unityVirtualStopBridge == null)
+        {
+            unityVirtualStopBridge =
+                unityVirtualESP32.GetType().GetMethod(
+                    "StopBridge",
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+        }
+    }
+
+    private Transform FindDeepChild(
+        Transform root,
+        string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(
+                    root.GetChild(i),
+                    childName
+                );
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

@@ -1,0 +1,695 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVUDPGamepadReceiver : MonoBehaviour
+{
+    public enum GamepadAxisSource
+    {
+        None,
+        LeftStickX,
+        LeftStickY,
+        RightStickX,
+        RightStickY,
+        TriggerDifference
+    }
+
+    [Header("References")]
+    public MIMISKMiniROVCoreController coreController;
+    public MIMISKMiniROVMissionManager missionManager;
+
+    [Header("UDP")]
+    public bool receiverEnabled = true;
+
+    [Tooltip("Use 0.0.0.0 for all interfaces, or 127.0.0.1 for local-only.")]
+    public string listenAddress = "0.0.0.0";
+
+    [Tooltip("Direct Unity MiniROV UDP port. Separate from Raspberry/my_app port 54321.")]
+    public int listenPort = MIMISKNetworkPorts.MiniROVUnityDirectUdp;
+
+    public float inputTimeoutS = 0.75f;
+
+    [Header("Safety / Ownership")]
+    public bool requireMiniROVGamepadMissionState = true;
+
+    [Tooltip("Allows UDP control if the core controller is already UnityNative + GamepadManual, even if missionActive was not set correctly.")]
+    public bool allowIfCoreAlreadyGamepadManual = true;
+
+    [Tooltip("When active, this receiver forces the core controller into UnityNative + GamepadManual.")]
+    public bool forceCoreGamepadModeWhenActive = true;
+
+    public bool requireUnityNativeBackend = true;
+
+    [Header("Command Mapping")]
+    public bool useDirectCommandFields = true;
+
+    [Header("Raw pc_sender_new.py Compatibility")]
+    [Tooltip("When ON, ignore semantic surge/yaw/depth fields and derive commands from raw lx/ly/rx/ry/lt/rt, like the ESP/Raspberry sender.")]
+    public bool forceRawPcSenderMapping = true;
+
+    public GamepadAxisSource rawSurgeAxis = GamepadAxisSource.LeftStickY;
+    public GamepadAxisSource rawYawAxis = GamepadAxisSource.RightStickX;
+    public GamepadAxisSource rawDepthAxis = GamepadAxisSource.TriggerDifference;
+
+    [Tooltip("Most gamepads report stick-up as negative Y, so invert the selected Y axis for positive surge.")]
+    public bool invertRawSurgeAxis = true;
+
+    public bool invertRawYawAxis = false;
+    public bool invertRawDepthAxis = false;
+    public bool deriveFromRawAxes = true;
+
+    [Tooltip("Raw gamepad ly usually reports stick-up as negative, so default surge = -ly.")]
+    public bool rawLeftYUpIsForward = true;
+
+    public bool invertSurge = false;
+    public bool invertYaw = false;
+
+    public float surgeScale = 1.0f;
+    public float yawScale = 1.0f;
+    public float depthScale = 1.0f;
+
+    [Header("Runtime - UDP")]
+    public bool udpThreadRunning;
+    public bool connected;
+    public bool packetFresh;
+    public float lastPacketAge;
+    public int packetsReceived;
+    public string lastJson = "";
+    public string lastEvent = "idle";
+
+    [Header("Runtime - Parsed Raw")]
+    public float lx;
+    public float ly;
+    public float rx;
+    public float ry;
+    public float lt;
+    public float rt;
+    public int hatx;
+    public int haty;
+
+    [Header("Runtime - Commands")]
+    public float surge;
+    public float yaw;
+    public float depth;
+    public bool hold;
+    public bool returnHome;
+    public bool stop;
+
+    [Header("Runtime - Core Link")]
+    public bool missionGateAllowed;
+    public bool coreReferenceFound;
+    public bool coreReadyForUdpManual;
+    public bool sentManualCommandToCore;
+    public int setManualCommandCalls;
+
+    public float coreManualSurgeEcho;
+    public float coreManualYawEcho;
+    public float coreManualDepthEcho;
+    public string coreModeEcho = "unknown";
+    public string coreBackendEcho = "unknown";
+
+    private UdpClient udp;
+    private Thread thread;
+    private bool running;
+
+    private readonly object lockObj = new object();
+    private string latestJson = "";
+    private float lastPacketTime = -999.0f;
+
+    private bool previousReturnHome;
+    private bool previousStop;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void OnEnable()
+    {
+        StartReceiver();
+    }
+
+    private void OnDisable()
+    {
+        StopReceiver();
+        SendZeroToCore("receiver_disabled");
+    }
+
+    private void OnDestroy()
+    {
+        StopReceiver();
+    }
+
+    private void Update()
+    {
+        sentManualCommandToCore = false;
+
+        if (!receiverEnabled)
+        {
+            SendZeroToCore("receiver_disabled");
+            return;
+        }
+
+        AutoFindReferences();
+
+        string json = null;
+
+        lock (lockObj)
+        {
+            if (!string.IsNullOrEmpty(latestJson))
+            {
+                json = latestJson;
+                latestJson = "";
+            }
+        }
+
+        if (!string.IsNullOrEmpty(json))
+        {
+            lastJson = json;
+            lastPacketTime = Time.time;
+            connected = true;
+            packetsReceived++;
+            ParsePayload(json);
+        }
+
+        lastPacketAge = Time.time - lastPacketTime;
+        packetFresh = connected && lastPacketAge <= inputTimeoutS;
+
+        if (!packetFresh)
+        {
+            SendZeroToCore("udp_timeout_or_no_packet");
+            return;
+        }
+
+        missionGateAllowed = IsMissionAllowedToReceiveManualInput();
+
+        if (!missionGateAllowed)
+        {
+            SendZeroToCore("blocked_waiting_for_M_GamepadManualTest");
+            return;
+        }
+
+        coreReadyForUdpManual = EnsureCoreReadyForUdpManual();
+
+        if (!coreReadyForUdpManual)
+        {
+            SendZeroToCore("core_not_ready_for_udp_manual");
+            return;
+        }
+
+        if (hold)
+        {
+            surge = 0.0f;
+            yaw = 0.0f;
+            depth = 0.0f;
+        }
+
+        coreController.SetManualCommand(
+            surge,
+            yaw,
+            depth
+        );
+
+        setManualCommandCalls++;
+        sentManualCommandToCore = true;
+
+        coreManualSurgeEcho = coreController.manualSurge;
+        coreManualYawEcho = coreController.manualYaw;
+        coreManualDepthEcho = coreController.manualDepthNudge;
+        coreModeEcho = coreController.controlMode.ToString();
+        coreBackendEcho = coreController.backendMode.ToString();
+
+        HandleButtons();
+
+        if (lastEvent != "udp_requested_return_home" &&
+            lastEvent != "udp_requested_stop_recovery_ready")
+        {
+            lastEvent =
+                "sent_to_core_surge_" +
+                surge.ToString("F2") +
+                "_yaw_" +
+                yaw.ToString("F2") +
+                "_depth_" +
+                depth.ToString("F2");
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (coreController == null)
+        {
+            coreController = GetComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (missionManager == null)
+        {
+            missionManager = GetComponent<MIMISKMiniROVMissionManager>();
+        }
+
+        coreReferenceFound = coreController != null;
+    }
+
+    private bool EnsureCoreReadyForUdpManual()
+    {
+        if (coreController == null)
+        {
+            coreReferenceFound = false;
+            lastEvent = "missing_core_controller";
+            return false;
+        }
+
+        coreReferenceFound = true;
+
+        if (forceCoreGamepadModeWhenActive)
+        {
+            if (coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+            {
+                coreController.ActivateUnityNativeBackend();
+            }
+
+            if (!coreController.controllerEnabled)
+            {
+                coreController.controllerEnabled = true;
+            }
+
+            if (coreController.controlMode != MIMISKMiniROVCoreController.ControlMode.GamepadManual)
+            {
+                coreController.SetControlMode(MIMISKMiniROVCoreController.ControlMode.GamepadManual);
+            }
+        }
+
+        coreModeEcho = coreController.controlMode.ToString();
+        coreBackendEcho = coreController.backendMode.ToString();
+
+        if (requireUnityNativeBackend &&
+            coreController.backendMode != MIMISKMiniROVCoreController.BackendMode.UnityNative)
+        {
+            lastEvent = "blocked_backend_not_unity_native";
+            return false;
+        }
+
+        if (coreController.controlMode != MIMISKMiniROVCoreController.ControlMode.GamepadManual)
+        {
+            lastEvent = "blocked_core_not_gamepad_manual";
+            return false;
+        }
+
+        if (!coreController.controllerEnabled)
+        {
+            lastEvent = "blocked_core_controller_disabled";
+            return false;
+        }
+
+        return true;
+    }
+
+    [ContextMenu("Start Receiver")]
+    public void StartReceiver()
+    {
+        if (!receiverEnabled || running)
+        {
+            return;
+        }
+
+        try
+        {
+            IPAddress ip =
+                string.IsNullOrEmpty(listenAddress) ||
+                listenAddress == "0.0.0.0"
+                    ? IPAddress.Any
+                    : IPAddress.Parse(listenAddress);
+
+            udp = new UdpClient(new IPEndPoint(ip, listenPort));
+
+            running = true;
+            thread = new Thread(ReceiveLoop);
+            thread.IsBackground = true;
+            thread.Start();
+
+            udpThreadRunning = true;
+            lastEvent = "udp_receiver_started_" + listenAddress + ":" + listenPort;
+
+            Debug.Log("[MIMISK MiniROV UDP] Listening on " + listenAddress + ":" + listenPort);
+        }
+        catch (Exception e)
+        {
+            running = false;
+            udpThreadRunning = false;
+            lastEvent = "udp_start_failed_" + e.Message;
+            Debug.LogError("[MIMISK MiniROV UDP] " + lastEvent);
+        }
+    }
+
+    [ContextMenu("Stop Receiver")]
+    public void StopReceiver()
+    {
+        running = false;
+        udpThreadRunning = false;
+
+        try
+        {
+            if (udp != null)
+            {
+                udp.Close();
+                udp = null;
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            if (thread != null && thread.IsAlive)
+            {
+                thread.Join(100);
+            }
+        }
+        catch
+        {
+        }
+
+        thread = null;
+    }
+
+    private void ReceiveLoop()
+    {
+        IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+
+        while (running)
+        {
+            try
+            {
+                byte[] data = udp.Receive(ref remote);
+                string json = Encoding.UTF8.GetString(data);
+
+                lock (lockObj)
+                {
+                    latestJson = json;
+                }
+            }
+            catch
+            {
+                if (!running)
+                {
+                    break;
+                }
+            }
+        }
+
+        udpThreadRunning = false;
+    }
+
+    private void ParsePayload(string json)
+    {
+        lx = ExtractFloat(json, "lx", lx);
+        ly = ExtractFloat(json, "ly", ly);
+        rx = ExtractFloat(json, "rx", rx);
+        ry = ExtractFloat(json, "ry", ry);
+        lt = ExtractFloat(json, "lt", lt);
+        rt = ExtractFloat(json, "rt", rt);
+        hatx = Mathf.RoundToInt(ExtractFloat(json, "hatx", hatx));
+        haty = Mathf.RoundToInt(ExtractFloat(json, "haty", haty));
+
+        bool hasDirect =
+            !forceRawPcSenderMapping &&
+            (
+                HasField(json, "surge") ||
+                HasField(json, "yaw") ||
+                HasField(json, "depth")
+            );
+
+        if (useDirectCommandFields && hasDirect)
+        {
+            surge = ExtractFloat(json, "surge", 0.0f);
+            yaw = ExtractFloat(json, "yaw", 0.0f);
+            depth = ExtractFloat(json, "depth", 0.0f);
+
+            if (deriveFromRawAxes &&
+                Mathf.Abs(surge) < 0.0001f &&
+                Mathf.Abs(yaw) < 0.0001f &&
+                Mathf.Abs(depth) < 0.0001f)
+            {
+                DecodeFromRawAxes();
+            }
+        }
+        else
+        {
+            DecodeFromRawAxes();
+        }
+
+        if (invertSurge)
+        {
+            surge = -surge;
+        }
+
+        if (invertYaw)
+        {
+            yaw = -yaw;
+        }
+
+        surge = Mathf.Clamp(surge * surgeScale, -1.0f, 1.0f);
+        yaw = Mathf.Clamp(yaw * yawScale, -1.0f, 1.0f);
+        depth = Mathf.Clamp(depth * depthScale, -1.0f, 1.0f);
+
+        hold =
+            ExtractBool(json, "hold") ||
+            ExtractButton(json, "btn_south") ||
+            ExtractNestedButton(json, "BTN_SOUTH") ||
+            ExtractNestedButton(json, "BTN_A");
+
+        returnHome =
+            ExtractBool(json, "return_home") ||
+            ExtractButton(json, "btn_north") ||
+            ExtractNestedButton(json, "BTN_NORTH") ||
+            ExtractNestedButton(json, "BTN_Y");
+
+        stop =
+            ExtractBool(json, "stop") ||
+            ExtractButton(json, "btn_east") ||
+            ExtractNestedButton(json, "BTN_EAST") ||
+            ExtractNestedButton(json, "BTN_B");
+    }
+
+    private void DecodeFromRawAxes()
+    {
+        surge = ReadRawAxis(rawSurgeAxis);
+        yaw = ReadRawAxis(rawYawAxis);
+        depth = ReadRawAxis(rawDepthAxis);
+
+        if (invertRawSurgeAxis)
+        {
+            surge = -surge;
+        }
+
+        if (invertRawYawAxis)
+        {
+            yaw = -yaw;
+        }
+
+        if (invertRawDepthAxis)
+        {
+            depth = -depth;
+        }
+    }
+
+    private float ReadRawAxis(GamepadAxisSource source)
+    {
+        if (source == GamepadAxisSource.LeftStickX)
+        {
+            return lx;
+        }
+
+        if (source == GamepadAxisSource.LeftStickY)
+        {
+            return ly;
+        }
+
+        if (source == GamepadAxisSource.RightStickX)
+        {
+            return rx;
+        }
+
+        if (source == GamepadAxisSource.RightStickY)
+        {
+            return ry;
+        }
+
+        if (source == GamepadAxisSource.TriggerDifference)
+        {
+            return rt - lt;
+        }
+
+        return 0.0f;
+    }
+
+    private bool IsMissionAllowedToReceiveManualInput()
+    {
+        if (!requireMiniROVGamepadMissionState)
+        {
+            return true;
+        }
+
+        bool missionAllows =
+            missionManager != null &&
+            missionManager.missionActive &&
+            missionManager.missionState ==
+                MIMISKMiniROVMissionManager.MiniROVMissionState.RunningGamepadTest;
+
+        if (missionAllows)
+        {
+            return true;
+        }
+
+        bool coreAlreadyManual =
+            allowIfCoreAlreadyGamepadManual &&
+            coreController != null &&
+            coreController.controllerEnabled &&
+            coreController.backendMode ==
+                MIMISKMiniROVCoreController.BackendMode.UnityNative &&
+            coreController.controlMode ==
+                MIMISKMiniROVCoreController.ControlMode.GamepadManual;
+
+        if (coreAlreadyManual)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private void HandleButtons()
+    {
+        bool returnHomePressed = returnHome;
+        bool stopPressed = stop;
+
+        if (returnHomePressed && !previousReturnHome)
+        {
+            if (missionManager != null)
+            {
+                missionManager.RequestReturnToRecovery();
+                lastEvent = "udp_requested_return_home";
+            }
+        }
+
+        if (stopPressed && !previousStop)
+        {
+            if (missionManager != null)
+            {
+                missionManager.StopMissionAndSetRecoveryReady();
+                lastEvent = "udp_requested_stop_recovery_ready";
+            }
+        }
+
+        previousReturnHome = returnHomePressed;
+        previousStop = stopPressed;
+    }
+
+    private void SendZeroToCore(string reason)
+    {
+        surge = 0.0f;
+        yaw = 0.0f;
+        depth = 0.0f;
+        sentManualCommandToCore = false;
+        lastEvent = reason;
+
+        if (coreController != null)
+        {
+            coreController.SetManualCommand(0.0f, 0.0f, 0.0f);
+            coreManualSurgeEcho = coreController.manualSurge;
+            coreManualYawEcho = coreController.manualYaw;
+            coreManualDepthEcho = coreController.manualDepthNudge;
+        }
+    }
+
+    private bool HasField(string json, string name)
+    {
+        return Regex.IsMatch(
+            json,
+            "\\\"" + Regex.Escape(name) + "\\\"\\s*:",
+            RegexOptions.IgnoreCase
+        );
+    }
+
+    private float ExtractFloat(string json, string name, float fallback)
+    {
+        Match m = Regex.Match(
+            json,
+            "\\\"" + Regex.Escape(name) + "\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?)",
+            RegexOptions.IgnoreCase
+        );
+
+        if (!m.Success)
+        {
+            return fallback;
+        }
+
+        float value;
+
+        if (float.TryParse(
+                m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out value))
+        {
+            return value;
+        }
+
+        return fallback;
+    }
+
+    private bool ExtractBool(string json, string name)
+    {
+        Match m = Regex.Match(
+            json,
+            "\\\"" + Regex.Escape(name) + "\\\"\\s*:\\s*(true|false|0|1)",
+            RegexOptions.IgnoreCase
+        );
+
+        if (!m.Success)
+        {
+            return false;
+        }
+
+        string v = m.Groups[1].Value.ToLowerInvariant();
+        return v == "true" || v == "1";
+    }
+
+    private bool ExtractButton(string json, string name)
+    {
+        return Mathf.Abs(ExtractFloat(json, name, 0.0f)) > 0.5f;
+    }
+
+    private bool ExtractNestedButton(string json, string buttonName)
+    {
+        Match m = Regex.Match(
+            json,
+            "\\\"" + Regex.Escape(buttonName) + "\\\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)",
+            RegexOptions.IgnoreCase
+        );
+
+        if (!m.Success)
+        {
+            return false;
+        }
+
+        float value;
+
+        if (float.TryParse(
+                m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out value))
+        {
+            return Mathf.Abs(value) > 0.5f;
+        }
+
+        return false;
+    }
+}

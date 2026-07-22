@@ -1,0 +1,122 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneAquaLocSetup
+{
+    [MenuItem("MIMISK/Drone/Localization/Setup MIMISK-AquaLoc Robust Estimator")]
+    public static void SetupAquaLoc()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+            return;
+        }
+
+        MIMISKDroneAquaLocEstimator estimator =
+            drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+
+        if (estimator == null)
+        {
+            estimator = drone.AddComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        estimator.imu = drone.GetComponentInChildren<MIMISKDroneImuDevice>();
+        estimator.barometer = drone.GetComponentInChildren<MIMISKDroneBarometerDevice>();
+        estimator.magnetometer = drone.GetComponentInChildren<MIMISKDroneMagnetometerDevice>();
+        estimator.gnss = drone.GetComponentInChildren<MIMISKDroneGnssDevice>();
+        estimator.rangefinder = drone.GetComponentInChildren<MIMISKDroneRangefinderDevice>();
+        estimator.surfaceBuoyancy = drone.GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        estimator.batteryPower = drone.GetComponentInChildren<MIMISKDroneBatteryPowerDevice>();
+
+        estimator.estimatorEnabled = true;
+        estimator.resetOnStart = true;
+
+        estimator.initializeFromUnityPose = true;
+        estimator.initializationDelaySeconds = 0.25f;
+        estimator.useGnssLocalWorldAnchor = true;
+
+        estimator.landingApproachRangeM = 3.0f;
+        estimator.waterContactMinBuoyancyPoints = 1;
+        estimator.surfaceFloatMinBuoyancyPoints = 3;
+
+        estimator.useGyroPropagation = true;
+        estimator.accelerometerTiltGain = 1.5f;
+        estimator.magnetometerYawGain = 4.0f;
+        estimator.magnetometerYawSigmaDeg = 8.0f;
+        estimator.allowMagnetometerRelock = true;
+        estimator.magnetometerRelockErrorDeg = 45.0f;
+
+        estimator.gnssPositionGain = 2.0f;
+        estimator.gnssVelocityGain = 5.0f;
+        estimator.barometerAltitudeGain = 8.0f;
+        estimator.rangefinderAltitudeGain = 12.0f;
+        estimator.surfaceConstraintGain = 15.0f;
+
+        estimator.gnssHorizontalSigmaM = 1.5f;
+        estimator.gnssVerticalSigmaM = 2.5f;
+        estimator.gnssVelocitySigmaMS = 0.25f;
+        estimator.barometerSigmaM = 0.35f;
+        estimator.rangefinderSigmaM = 0.12f;
+
+        estimator.enableRobustGating = true;
+        estimator.softGate = 3.0f;
+        estimator.hardGate = 8.0f;
+
+        estimator.enableSurfaceConstraint = true;
+        estimator.waterSurfaceY = 0.0f;
+
+        // From your surface-float logs, the drone root is very close to water Y = 0.
+        estimator.surfaceFloatRootHeightM = 0.0f;
+
+        estimator.disableOpticalRangefinderWhenWet = true;
+        estimator.rangefinderMaxFusionRangeM = 6.0f;
+
+        EditorUtility.SetDirty(estimator);
+
+        MIMISKDroneAquaLocLogger logger =
+            drone.GetComponent<MIMISKDroneAquaLocLogger>();
+
+        if (logger == null)
+        {
+            logger = drone.AddComponent<MIMISKDroneAquaLocLogger>();
+        }
+
+        logger.estimator = estimator;
+        logger.enableLogging = true;
+        logger.logHz = 50.0f;
+        logger.flushEveryLine = false;
+
+        EditorUtility.SetDirty(logger);
+
+        MIMISKDroneFusedLocalization oldEstimator =
+            drone.GetComponent<MIMISKDroneFusedLocalization>();
+
+        if (oldEstimator != null)
+        {
+            oldEstimator.enabled = false;
+            EditorUtility.SetDirty(oldEstimator);
+        }
+
+        MIMISKDroneLocalizationLogger oldLogger =
+            drone.GetComponent<MIMISKDroneLocalizationLogger>();
+
+        if (oldLogger != null)
+        {
+            oldLogger.enabled = false;
+            EditorUtility.SetDirty(oldLogger);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] MIMISK-AquaLoc v3 estimator configured.");
+    }
+}

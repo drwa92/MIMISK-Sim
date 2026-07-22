@@ -1,0 +1,239 @@
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneDeploymentSurfaceAnchor : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKFinalMissionPlanner finalPlanner;
+    public MIMISKDroneCoreRotorController core;
+    public MIMISKDroneCoreFlightModeManager flightManager;
+    public Rigidbody rb;
+
+    [Header("Anchor")]
+    public bool anchorEnabled = true;
+
+    [Tooltip("Capture the actual landed Y when deployment begins. This avoids forcing an arbitrary water height.")]
+    public bool captureCurrentSurfacePose = true;
+
+    public bool cutMotorsWhileAnchored = true;
+    public bool forceSurfaceStableMode = true;
+
+    [Header("Soft Surface Hold")]
+    public float verticalKp = 45.0f;
+    public float verticalKd = 18.0f;
+    public float maxVerticalForceN = 160.0f;
+
+    public float horizontalDampingHz = 1.5f;
+    public float angularDampingHz = 2.5f;
+
+    [Header("Runtime")]
+    public bool anchorActive;
+    public bool anchorCaptured;
+    public float anchorY;
+    public string lastEvent = "idle";
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void FixedUpdate()
+    {
+        if (!anchorEnabled)
+        {
+            anchorActive = false;
+            return;
+        }
+
+        AutoFindReferences();
+
+        anchorActive = ShouldAnchorNow();
+
+        if (!anchorActive)
+        {
+            anchorCaptured = false;
+            return;
+        }
+
+        if (rb == null)
+        {
+            return;
+        }
+
+        if (!anchorCaptured)
+        {
+            anchorY = rb.position.y;
+            anchorCaptured = true;
+            lastEvent = "captured_surface_anchor_y_" + anchorY.ToString("F3");
+        }
+
+        if (forceSurfaceStableMode && flightManager != null)
+        {
+            flightManager.flightMode =
+                MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable;
+        }
+
+        if (cutMotorsWhileAnchored && core != null)
+        {
+            core.controlMode =
+                MIMISKDroneCoreRotorController.ControlMode.Disabled;
+
+            core.CutMotors();
+        }
+
+        ApplySoftSurfaceHold();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (finalPlanner == null)
+        {
+            finalPlanner = GetComponent<MIMISKFinalMissionPlanner>();
+        }
+
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        if (flightManager == null)
+        {
+            flightManager = GetComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+    }
+
+    private bool ShouldAnchorNow()
+    {
+        if (finalPlanner == null)
+        {
+            return false;
+        }
+
+        bool deploymentState =
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.SurfaceDeploymentReady ||
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.DeployingTether ||
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.MiniROVAtDeploymentDepth ||
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.MiniROVControlActive ||
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.RecoveringMiniROV ||
+            finalPlanner.state == MIMISKFinalMissionPlanner.FinalMissionState.Recovered;
+
+        bool missionReady = false;
+
+        if (finalPlanner.droneMission != null)
+        {
+            missionReady =
+                finalPlanner.droneMission.missionState ==
+                    MIMISKDroneCoreMissionManager.MissionState.ReadyForTetherDeployment ||
+                finalPlanner.droneMission.missionState ==
+                    MIMISKDroneCoreMissionManager.MissionState.Completed;
+        }
+        else
+        {
+            missionReady = finalPlanner.droneMissionReady;
+        }
+
+        bool surfaceReady = false;
+
+        if (flightManager != null)
+        {
+            surfaceReady =
+                flightManager.flightMode ==
+                    MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable ||
+                flightManager.flightMode ==
+                    MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold;
+        }
+        else
+        {
+            surfaceReady = finalPlanner.droneSurfaceStable;
+        }
+
+        // Critical safety rule:
+        // The surface anchor must never hold/cut motors during takeoff, flight,
+        // path tracking, or landing. It is allowed only after the drone has
+        // completed its aerial mission and is actually surface-stable.
+        return deploymentState && missionReady && surfaceReady;
+    }
+
+    private void ApplySoftSurfaceHold()
+    {
+        Vector3 v = rb.linearVelocity;
+
+        float yError =
+            anchorY - rb.position.y;
+
+        float fy =
+            rb.mass *
+            (
+                verticalKp * yError -
+                verticalKd * v.y
+            );
+
+        fy =
+            Mathf.Clamp(
+                fy,
+                -Mathf.Abs(maxVerticalForceN),
+                Mathf.Abs(maxVerticalForceN)
+            );
+
+        rb.AddForce(
+            Vector3.up * fy,
+            ForceMode.Force
+        );
+
+        float dt = Time.fixedDeltaTime;
+
+        float hAlpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, horizontalDampingHz) * dt);
+
+        Vector3 horizontalVelocity =
+            new Vector3(v.x, 0.0f, v.z);
+
+        horizontalVelocity =
+            Vector3.Lerp(
+                horizontalVelocity,
+                Vector3.zero,
+                hAlpha
+            );
+
+        rb.linearVelocity =
+            new Vector3(
+                horizontalVelocity.x,
+                rb.linearVelocity.y,
+                horizontalVelocity.z
+            );
+
+        float aAlpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, angularDampingHz) * dt);
+
+        rb.angularVelocity =
+            Vector3.Lerp(
+                rb.angularVelocity,
+                Vector3.zero,
+                aAlpha
+            );
+
+        lastEvent = "surface_anchor_active";
+    }
+
+    [ContextMenu("Recapture Current Surface Y")]
+    public void RecaptureCurrentSurfaceY()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (rb != null)
+        {
+            anchorY = rb.position.y;
+            anchorCaptured = true;
+            lastEvent = "manual_recapture_surface_y_" + anchorY.ToString("F3");
+        }
+    }
+}

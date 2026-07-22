@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mimisk_grpc_adapter</name>
+  <version>0.1.0</version>
+  <description>MIMISK Unity gRPC to ROS2 adapter.</description>
+  <maintainer email="waseem@example.com">Waseem</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>mimisk_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <exec_depend>python3-grpcio</exec_depend>
+  <exec_depend>python3-grpc-tools</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

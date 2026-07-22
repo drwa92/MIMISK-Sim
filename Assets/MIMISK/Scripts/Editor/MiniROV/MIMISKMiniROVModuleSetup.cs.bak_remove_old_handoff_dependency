@@ -1,0 +1,109 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKMiniROVModuleSetup
+{
+    [MenuItem("MIMISK/MiniROV/Setup Module 1 MiniROV Only")]
+    public static void SetupMiniROVModuleOnly()
+    {
+        GameObject miniRov =
+            GameObject.Find("MiniROV");
+
+        if (miniRov == null)
+        {
+            Debug.LogError("[MIMISK] Could not find MiniROV.");
+            return;
+        }
+
+        // Disable old MiniROV test/handoff scripts so there is only one owner.
+        DisableIfExists<MIMISKMiniROVStandaloneManualTest>(miniRov);
+        DisableIfExists<MIMISKMiniROVManualControlHandoff>(miniRov);
+
+        Rigidbody rb =
+            miniRov.GetComponent<Rigidbody>();
+
+        if (rb == null)
+        {
+            rb = miniRov.AddComponent<Rigidbody>();
+        }
+
+        rb.mass = 0.60f;
+        rb.isKinematic = true;
+        rb.useGravity = false;
+        EditorUtility.SetDirty(rb);
+
+        MIMISKMiniROVModule module =
+            miniRov.GetComponent<MIMISKMiniROVModule>();
+
+        if (module == null)
+        {
+            module = miniRov.AddComponent<MIMISKMiniROVModule>();
+        }
+
+        module.miniRovRoot = miniRov.transform;
+        module.miniRovRigidbody = rb;
+        module.rovTetherAnchor =
+            FindDeepChild(miniRov.transform, "ROV_TetherAnchor");
+
+        module.miniRovColliders =
+            miniRov.GetComponentsInChildren<Collider>(true);
+
+        module.miniRovMassKg = 0.60f;
+        module.requireExternalSerialBeforeControl = true;
+        module.unityEsp32SerialDevice = "/dev/unity_esp32";
+        module.useGravityInControl = true;
+        module.enableCollidersDuringControl = false;
+        module.keyboardTestEnabled = true;
+
+        module.AutoFindReferences();
+        module.SetPassiveKinematic();
+
+        EditorUtility.SetDirty(module);
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log(
+            "[MIMISK] Module 1 MiniROV-only setup complete. " +
+            "Play test: P passive, J free dynamic passive, I external control."
+        );
+    }
+
+    private static void DisableIfExists<T>(GameObject go) where T : Behaviour
+    {
+        T component = go.GetComponent<T>();
+
+        if (component != null)
+        {
+            component.enabled = false;
+            EditorUtility.SetDirty(component);
+        }
+    }
+
+    private static Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

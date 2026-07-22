@@ -1,0 +1,641 @@
+using System;
+using MIMISK.Common;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVAgent : MonoBehaviour, IMIMISKAgent
+{
+    [Header("Agent")]
+    public string agentName = "MiniROV";
+    public bool agentEnabled = true;
+    public bool autoFindOnAwake = true;
+
+    [Header("Validated MiniROV Stack References")]
+    public MIMISKMiniROVMissionManager missionManager;
+    public MIMISKMiniROVPathPlanner pathPlanner;
+    public MIMISKMiniROVPlantBasedController controller;
+    public Rigidbody rb;
+
+    [Header("Runtime")]
+    public string lastCommand = "none";
+    public string lastResult = "idle";
+    public string lastRejectReason = "";
+
+    public string AgentName
+    {
+        get { return agentName; }
+    }
+
+    public MIMISKAgentKind AgentKind
+    {
+        get { return MIMISKAgentKind.MiniROV; }
+    }
+
+    public event Action<MIMISKEvent> OnEvent;
+
+    private void Awake()
+    {
+        if (autoFindOnAwake)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (missionManager == null)
+        {
+            missionManager =
+                GetComponent<MIMISKMiniROVMissionManager>();
+        }
+
+        if (pathPlanner == null)
+        {
+            pathPlanner =
+                GetComponent<MIMISKMiniROVPathPlanner>();
+        }
+
+        if (controller == null)
+        {
+            controller =
+                GetComponent<MIMISKMiniROVPlantBasedController>();
+        }
+
+        if (rb == null)
+        {
+            rb =
+                GetComponent<Rigidbody>();
+        }
+    }
+
+    public MIMISKState GetState()
+    {
+        AutoFindReferences();
+
+        MIMISKState s =
+            new MIMISKState();
+
+        s.agentName = agentName;
+        s.agentKind = MIMISKAgentKind.MiniROV;
+        s.available =
+            agentEnabled &&
+            missionManager != null &&
+            pathPlanner != null &&
+            controller != null;
+
+        s.positionWorld =
+            rb != null
+                ? rb.position
+                : transform.position;
+
+        s.depthM =
+            controller != null
+                ? controller.depthM
+                : -s.positionWorld.y;
+
+        s.yawDeg =
+            controller != null
+                ? controller.yawDeg
+                : transform.eulerAngles.y;
+
+        s.speedMS =
+            missionManager != null
+                ? missionManager.currentSpeedMS
+                : (rb != null ? rb.linearVelocity.magnitude : 0.0f);
+
+        s.active =
+            missionManager != null &&
+            missionManager.missionActive;
+
+        s.recoveryReady =
+            missionManager != null &&
+            missionManager.recoveryReady;
+
+        s.fault =
+            missionManager != null &&
+            missionManager.missionState ==
+                MIMISKMiniROVMissionManager.MiniROVMissionState.Fault;
+
+        s.mode =
+            MapMode();
+
+        s.missionState =
+            missionManager != null
+                ? missionManager.missionState.ToString()
+                : "missing";
+
+        s.controllerMode =
+            controller != null
+                ? controller.controlMode.ToString()
+                : "missing";
+
+        s.selectedPathType =
+            pathPlanner != null
+                ? pathPlanner.selectedPathType.ToString()
+                : "missing";
+
+        s.selectedYawPolicy =
+            pathPlanner != null
+                ? pathPlanner.selectedYawPolicy.ToString()
+                : "missing";
+
+        s.distanceToHomeM =
+            missionManager != null
+                ? missionManager.distanceToHomeM
+                : float.NaN;
+
+        s.distanceToTargetM =
+            controller != null
+                ? controller.distanceToTargetM
+                : float.NaN;
+
+        s.lastEvent =
+            BuildLastEventString();
+
+        return s;
+    }
+
+    public bool CanAccept(MIMISKCommand command, out string reason)
+    {
+        AutoFindReferences();
+
+        reason = "ok";
+
+        if (!agentEnabled)
+        {
+            reason = "agent_disabled";
+            return false;
+        }
+
+        if (command == null)
+        {
+            reason = "null_command";
+            return false;
+        }
+
+        if (missionManager == null)
+        {
+            reason = "missing_mission_manager";
+            return false;
+        }
+
+        if (pathPlanner == null &&
+            RequiresPathPlanner(command.verb))
+        {
+            reason = "missing_path_planner";
+            return false;
+        }
+
+        if (controller == null &&
+            RequiresController(command.verb))
+        {
+            reason = "missing_controller";
+            return false;
+        }
+
+        if (!Application.isPlaying &&
+            RequiresPlayMode(command.verb))
+        {
+            reason = "requires_play_mode";
+            return false;
+        }
+
+        if (IsMissionStartCommand(command.verb) &&
+            !missionManager.CanStartMission())
+        {
+            reason =
+                "mission_manager_rejected_" +
+                missionManager.lastEvent;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    public MIMISKCommandResult Execute(MIMISKCommand command)
+    {
+        AutoFindReferences();
+
+        string reason;
+
+        if (!CanAccept(command, out reason))
+        {
+            lastRejectReason = reason;
+            EmitEvent("command_rejected", reason);
+            return MIMISKCommandResult.Rejected(reason, GetState());
+        }
+
+        try
+        {
+            lastCommand =
+                command.verb.ToString();
+
+            switch (command.verb)
+            {
+                case MIMISKCommandVerb.AutoFindReferences:
+                    AutoFindReferences();
+                    lastResult = "auto_find_completed";
+                    break;
+
+                case MIMISKCommandVerb.SetHome:
+                    missionManager.SetHomeHere();
+                    lastResult = "home_set";
+                    break;
+
+                case MIMISKCommandVerb.Hold:
+                    missionManager.HoldCurrentPose();
+                    lastResult = "hold_requested";
+                    break;
+
+                case MIMISKCommandVerb.StartSelectedMission:
+                    missionManager.StartSelectedMission();
+                    lastResult = "selected_mission_requested";
+                    break;
+
+                case MIMISKCommandVerb.StartMissionAction:
+                    ExecuteMissionAction(command);
+                    break;
+
+                case MIMISKCommandVerb.StartPath:
+                    ExecuteStartPath(command);
+                    break;
+
+                case MIMISKCommandVerb.GoToPoint:
+                    ExecuteGoToPoint(command);
+                    break;
+
+                case MIMISKCommandVerb.DwellAtCurrentPose:
+                    ExecuteDwell(command);
+                    break;
+
+                case MIMISKCommandVerb.ReturnHome:
+                    missionManager.ReturnHome();
+                    lastResult = "return_home_requested";
+                    break;
+
+                case MIMISKCommandVerb.AbortToHold:
+                    missionManager.AbortToHold();
+                    lastResult = "abort_to_hold_requested";
+                    break;
+
+                case MIMISKCommandVerb.Stop:
+                    missionManager.StopController();
+                    lastResult = "stop_controller_requested";
+                    break;
+
+                case MIMISKCommandVerb.ManualMode:
+                    missionManager.EnableManualDirectMode();
+                    lastResult = "manual_mode_requested";
+                    break;
+
+                case MIMISKCommandVerb.PrepareForRecovery:
+                    missionManager.PrepareForRecovery();
+                    lastResult = "prepare_for_recovery_requested";
+                    break;
+
+                default:
+                    reason = "unsupported_command_" + command.verb;
+                    lastRejectReason = reason;
+                    EmitEvent("command_rejected", reason);
+                    return MIMISKCommandResult.Rejected(reason, GetState());
+            }
+
+            EmitEvent("command_accepted", lastResult);
+            return MIMISKCommandResult.Accepted(lastResult, GetState());
+        }
+        catch (Exception ex)
+        {
+            reason =
+                "exception_" +
+                ex.GetType().Name +
+                "_" +
+                ex.Message;
+
+            lastResult = reason;
+
+            EmitEvent("command_failed", reason);
+
+            return MIMISKCommandResult.Failed(reason, GetState());
+        }
+    }
+
+    private void ExecuteMissionAction(MIMISKCommand command)
+    {
+        MIMISKMiniROVMissionManager.MiniROVMissionAction action;
+
+        if (!TryParseEnum(
+                command.actionName,
+                MIMISKMiniROVMissionManager.MiniROVMissionAction.None,
+                out action))
+        {
+            lastResult =
+                "invalid_action_" +
+                command.actionName;
+
+            throw new InvalidOperationException(lastResult);
+        }
+
+        missionManager.StartMissionAction(action);
+
+        lastResult =
+            "mission_action_requested_" +
+            action.ToString();
+    }
+
+    private void ExecuteStartPath(MIMISKCommand command)
+    {
+        MIMISKMiniROVPathPlanner.MiniROVPathType pathType;
+
+        if (!TryParseEnum(
+                command.pathTypeName,
+                MIMISKMiniROVPathPlanner.MiniROVPathType.StationHold,
+                out pathType))
+        {
+            lastResult =
+                "invalid_path_type_" +
+                command.pathTypeName;
+
+            throw new InvalidOperationException(lastResult);
+        }
+
+        pathPlanner.selectedPathType =
+            pathType;
+
+        missionManager.StartSelectedMission();
+
+        lastResult =
+            "path_requested_" +
+            pathType.ToString();
+    }
+
+    private void ExecuteGoToPoint(MIMISKCommand command)
+    {
+        pathPlanner.selectedPathType =
+            MIMISKMiniROVPathPlanner.MiniROVPathType.GoToPoint;
+
+        pathPlanner.goToPointWorld =
+            command.targetWorld;
+
+        if (!float.IsNaN(command.targetDepthM))
+        {
+            pathPlanner.goToPointDepthM =
+                command.targetDepthM;
+        }
+
+        missionManager.StartSelectedMission();
+
+        lastResult =
+            "go_to_point_requested";
+    }
+
+    private void ExecuteDwell(MIMISKCommand command)
+    {
+        if (command.dwellSeconds > 0.0f)
+        {
+            missionManager.dwellSeconds =
+                command.dwellSeconds;
+        }
+
+        MIMISKMiniROVMissionManager.DwellYawPolicy yawPolicy;
+
+        if (TryParseEnum(
+                command.dwellYawPolicyName,
+                MIMISKMiniROVMissionManager.DwellYawPolicy.CurrentYaw,
+                out yawPolicy))
+        {
+            missionManager.dwellYawPolicy =
+                yawPolicy;
+        }
+
+        missionManager.dwellFixedYawDeg =
+            command.dwellFixedYawDeg;
+
+        missionManager.dwellFacePointWorld =
+            command.dwellFacePointWorld;
+
+        missionManager.StartDwellAtCurrentPose();
+
+        lastResult =
+            "dwell_requested_" +
+            missionManager.dwellYawPolicy.ToString();
+    }
+
+    private bool TryParseEnum<T>(
+        string value,
+        T fallback,
+        out T result)
+        where T : struct
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            result = fallback;
+            return true;
+        }
+
+        return Enum.TryParse<T>(
+            value,
+            true,
+            out result
+        );
+    }
+
+    private MIMISKAgentMode MapMode()
+    {
+        if (missionManager == null)
+        {
+            return MIMISKAgentMode.Unknown;
+        }
+
+        switch (missionManager.missionState)
+        {
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.Idle:
+                return MIMISKAgentMode.Idle;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.ManualDirect:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.RunningGamepadTest:
+                return MIMISKAgentMode.Manual;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.StationHolding:
+                return MIMISKAgentMode.StationHolding;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.DwellSettling:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.Dwelling:
+                return MIMISKAgentMode.Dwell;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.ExecutingMission:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.StopAndLookMoving:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.StopAndLookSettling:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.StopAndLookDwelling:
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.StopAndLookComplete:
+                return MIMISKAgentMode.ExecutingMission;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.ReturningHome:
+                return MIMISKAgentMode.ReturningHome;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.RecoveryReady:
+                return MIMISKAgentMode.RecoveryReady;
+
+            case MIMISKMiniROVMissionManager.MiniROVMissionState.Fault:
+                return MIMISKAgentMode.Fault;
+
+            default:
+                return MIMISKAgentMode.Unknown;
+        }
+    }
+
+    private bool RequiresPathPlanner(MIMISKCommandVerb verb)
+    {
+        return
+            verb == MIMISKCommandVerb.SetHome ||
+            verb == MIMISKCommandVerb.StartSelectedMission ||
+            verb == MIMISKCommandVerb.StartPath ||
+            verb == MIMISKCommandVerb.GoToPoint ||
+            verb == MIMISKCommandVerb.ReturnHome;
+    }
+
+    private bool RequiresController(MIMISKCommandVerb verb)
+    {
+        return
+            verb == MIMISKCommandVerb.Hold ||
+            verb == MIMISKCommandVerb.StartSelectedMission ||
+            verb == MIMISKCommandVerb.StartPath ||
+            verb == MIMISKCommandVerb.GoToPoint ||
+            verb == MIMISKCommandVerb.DwellAtCurrentPose ||
+            verb == MIMISKCommandVerb.ReturnHome ||
+            verb == MIMISKCommandVerb.AbortToHold ||
+            verb == MIMISKCommandVerb.Stop;
+    }
+
+    private bool RequiresPlayMode(MIMISKCommandVerb verb)
+    {
+        return
+            verb == MIMISKCommandVerb.Hold ||
+            verb == MIMISKCommandVerb.StartSelectedMission ||
+            verb == MIMISKCommandVerb.StartMissionAction ||
+            verb == MIMISKCommandVerb.StartPath ||
+            verb == MIMISKCommandVerb.GoToPoint ||
+            verb == MIMISKCommandVerb.DwellAtCurrentPose ||
+            verb == MIMISKCommandVerb.ReturnHome ||
+            verb == MIMISKCommandVerb.AbortToHold ||
+            verb == MIMISKCommandVerb.Stop ||
+            verb == MIMISKCommandVerb.ManualMode ||
+            verb == MIMISKCommandVerb.PrepareForRecovery;
+    }
+
+    private bool IsMissionStartCommand(MIMISKCommandVerb verb)
+    {
+        return
+            verb == MIMISKCommandVerb.StartSelectedMission ||
+            verb == MIMISKCommandVerb.StartMissionAction ||
+            verb == MIMISKCommandVerb.StartPath ||
+            verb == MIMISKCommandVerb.GoToPoint ||
+            verb == MIMISKCommandVerb.DwellAtCurrentPose;
+    }
+
+    private string BuildLastEventString()
+    {
+        string mm =
+            missionManager != null
+                ? missionManager.lastEvent
+                : "mission_missing";
+
+        string pp =
+            pathPlanner != null
+                ? pathPlanner.lastEvent
+                : "planner_missing";
+
+        string cc =
+            controller != null
+                ? controller.lastEvent
+                : "controller_missing";
+
+        return
+            "mission=" + mm +
+            "; planner=" + pp +
+            "; controller=" + cc +
+            "; agent=" + lastResult;
+    }
+
+    private void EmitEvent(string eventType, string message)
+    {
+        MIMISKEvent e =
+            new MIMISKEvent
+            {
+                timeUtc = DateTime.UtcNow.ToString("o"),
+                agentName = agentName,
+                agentKind = MIMISKAgentKind.MiniROV,
+                eventType = eventType,
+                message = message,
+                state = GetState()
+            };
+
+        if (OnEvent != null)
+        {
+            OnEvent.Invoke(e);
+        }
+    }
+
+    [ContextMenu("Agent / Set Home")]
+    public void AgentSetHome()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.SetHome,
+            source = "inspector"
+        });
+    }
+
+    [ContextMenu("Agent / Hold")]
+    public void AgentHold()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.Hold,
+            source = "inspector"
+        });
+    }
+
+    [ContextMenu("Agent / Start Selected Mission")]
+    public void AgentStartSelectedMission()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.StartSelectedMission,
+            source = "inspector"
+        });
+    }
+
+    [ContextMenu("Agent / Dwell Current Yaw 3s")]
+    public void AgentDwellCurrentYaw3s()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.DwellAtCurrentPose,
+            dwellSeconds = 3.0f,
+            dwellYawPolicyName = "CurrentYaw",
+            source = "inspector"
+        });
+    }
+
+    [ContextMenu("Agent / Return Home")]
+    public void AgentReturnHome()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.ReturnHome,
+            source = "inspector"
+        });
+    }
+
+    [ContextMenu("Agent / Abort To Hold")]
+    public void AgentAbortToHold()
+    {
+        Execute(new MIMISKCommand
+        {
+            verb = MIMISKCommandVerb.AbortToHold,
+            source = "inspector"
+        });
+    }
+}

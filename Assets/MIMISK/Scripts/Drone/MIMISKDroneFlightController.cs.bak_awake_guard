@@ -1,0 +1,470 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[RequireComponent(typeof(Rigidbody))]
+public class MIMISKDroneFlightController : MonoBehaviour
+{
+    public enum DroneMode
+    {
+        Disarmed,
+        ArmedIdle,
+        Takeoff,
+        Hover,
+        ManualFlight,
+        LandingOnWater,
+        SurfaceStable,
+        EmergencyStop
+    }
+
+    [Header("Mode")]
+    public DroneMode mode = DroneMode.Disarmed;
+
+    [Header("References")]
+    public MIMISKDronePropellerAnimator propellerAnimator;
+
+    [Header("Physical Parameters")]
+    public float droneMassKg = 4.0f;
+    public float waterSurfaceY = 0.0f;
+    public float surfaceStableHeight = 0.35f;
+
+    [Header("Altitude Control")]
+    public float targetAltitude = 2.5f;
+    public float takeoffAltitude = 2.5f;
+    public float altitudeKp = 14.0f;
+    public float altitudeKd = 12.0f;
+    public float maxVerticalForce = 120.0f;
+
+    [Header("Horizontal Control")]
+    public float maxHorizontalSpeed = 3.0f;
+    public float horizontalVelocityKp = 10.0f;
+    public float horizontalDamping = 2.0f;
+    public float maxHorizontalForce = 80.0f;
+
+    [Header("Yaw Control")]
+    public float yawRateDegPerSec = 45.0f;
+    public float yawRateKp = 0.08f;
+    public float yawDamping = 0.08f;
+    public float maxYawTorque = 8.0f;
+
+    [Header("Attitude Stabilization")]
+    public bool keepLevel = true;
+    public float levelKp = 16.0f;
+    public float levelKd = 6.0f;
+    public float maxLevelTorque = 25.0f;
+
+    [Header("Keyboard Input")]
+    public bool enableKeyboardInput = true;
+
+    [Header("Manual Command")]
+    [Range(-1f, 1f)] public float forwardCommand;
+    [Range(-1f, 1f)] public float rightCommand;
+    [Range(-1f, 1f)] public float yawCommand;
+    [Range(-1f, 1f)] public float altitudeCommand;
+
+    [Header("Diagnostics")]
+    public float currentAltitude;
+    public float altitudeError;
+    public Vector3 velocityWorld;
+    public Vector3 desiredHorizontalVelocityWorld;
+    public float verticalForceCommand;
+    public Vector3 horizontalForceCommand;
+    public float yawTorqueCommand;
+    public Vector3 levelTorqueCommand;
+    public bool isKinematicHold;
+
+    private Rigidbody rb;
+    private Vector3 holdPosition;
+    private Quaternion holdRotation;
+
+    private void Awake()
+    {
+        rb = GetComponent<Rigidbody>();
+
+        if (propellerAnimator == null)
+        {
+            propellerAnimator = GetComponent<MIMISKDronePropellerAnimator>();
+        }
+
+        ConfigureRigidbody();
+    }
+
+    private void Start()
+    {
+        SetMode(mode);
+    }
+
+    private void Update()
+    {
+        if (enableKeyboardInput)
+        {
+            ReadKeyboardInput();
+        }
+
+        UpdatePropellerState();
+    }
+
+    private void FixedUpdate()
+    {
+        currentAltitude = transform.position.y;
+        velocityWorld = rb.linearVelocity;
+
+        switch (mode)
+        {
+            case DroneMode.Disarmed:
+            case DroneMode.ArmedIdle:
+            case DroneMode.SurfaceStable:
+            case DroneMode.EmergencyStop:
+                MaintainKinematicHold();
+                return;
+
+            case DroneMode.Takeoff:
+                targetAltitude = takeoffAltitude;
+                ApplyFlightControl();
+
+                if (Mathf.Abs(currentAltitude - takeoffAltitude) < 0.15f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.25f)
+                {
+                    SetMode(DroneMode.Hover);
+                }
+                return;
+
+            case DroneMode.Hover:
+                ApplyFlightControl();
+                return;
+
+            case DroneMode.ManualFlight:
+                ApplyManualAltitudeCommand();
+                ApplyFlightControl();
+                return;
+
+            case DroneMode.LandingOnWater:
+                targetAltitude = waterSurfaceY + surfaceStableHeight;
+                forwardCommand = 0f;
+                rightCommand = 0f;
+                yawCommand = 0f;
+                altitudeCommand = 0f;
+                ApplyFlightControl();
+
+                if (currentAltitude <= targetAltitude + 0.08f &&
+                    Mathf.Abs(rb.linearVelocity.y) < 0.20f)
+                {
+                    SetMode(DroneMode.SurfaceStable);
+                }
+                return;
+        }
+    }
+
+    private void ConfigureRigidbody()
+    {
+        rb.mass = droneMassKg;
+        rb.useGravity = false;
+        rb.isKinematic = true;
+        rb.linearDamping = 0.2f;
+        rb.angularDamping = 0.3f;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+    }
+
+    public void SetMode(DroneMode newMode)
+    {
+        mode = newMode;
+
+        if (mode == DroneMode.Disarmed ||
+            mode == DroneMode.ArmedIdle ||
+            mode == DroneMode.SurfaceStable ||
+            mode == DroneMode.EmergencyStop)
+        {
+            EnterKinematicHold();
+        }
+        else
+        {
+            EnterDynamicFlight();
+        }
+
+        if (mode == DroneMode.Takeoff)
+        {
+            targetAltitude = takeoffAltitude;
+        }
+
+        if (mode == DroneMode.ManualFlight)
+        {
+            targetAltitude = Mathf.Max(
+                transform.position.y,
+                waterSurfaceY + surfaceStableHeight + 0.20f
+            );
+        }
+
+        if (mode == DroneMode.LandingOnWater)
+        {
+            forwardCommand = 0f;
+            rightCommand = 0f;
+            yawCommand = 0f;
+            altitudeCommand = 0f;
+        }
+
+        if (mode == DroneMode.SurfaceStable)
+        {
+            Vector3 p = transform.position;
+            p.y = waterSurfaceY + surfaceStableHeight;
+            transform.position = p;
+            holdPosition = p;
+            holdRotation = transform.rotation;
+        }
+    }
+
+    private void EnterKinematicHold()
+    {
+        isKinematicHold = true;
+
+        holdPosition = transform.position;
+        holdRotation = transform.rotation;
+
+        // Unity does not allow velocity assignment while already kinematic.
+        if (rb.isKinematic)
+        {
+            rb.isKinematic = false;
+        }
+
+        rb.linearVelocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        rb.useGravity = false;
+        rb.isKinematic = true;
+    }
+
+    private void EnterDynamicFlight()
+    {
+        isKinematicHold = false;
+
+        rb.isKinematic = false;
+        rb.useGravity = true;
+        rb.mass = droneMassKg;
+        rb.linearDamping = 0.2f;
+        rb.angularDamping = 0.3f;
+        rb.WakeUp();
+    }
+
+    private void MaintainKinematicHold()
+    {
+        if (!rb.isKinematic)
+        {
+            EnterKinematicHold();
+        }
+
+        transform.position = holdPosition;
+        transform.rotation = holdRotation;
+    }
+
+    private void ReadKeyboardInput()
+    {
+        Keyboard keyboard = Keyboard.current;
+
+        if (keyboard == null)
+        {
+            return;
+        }
+
+        if (keyboard.digit1Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.ArmedIdle);
+        }
+
+        if (keyboard.digit2Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.Takeoff);
+        }
+
+        if (keyboard.digit3Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.LandingOnWater);
+        }
+
+        if (keyboard.digit4Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.Hover);
+        }
+
+        if (keyboard.digit0Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.Disarmed);
+        }
+
+        if (keyboard.digit9Key.wasPressedThisFrame)
+        {
+            SetMode(DroneMode.EmergencyStop);
+        }
+
+        forwardCommand = 0f;
+        rightCommand = 0f;
+        yawCommand = 0f;
+        altitudeCommand = 0f;
+
+        if (keyboard.wKey.isPressed) forwardCommand += 1f;
+        if (keyboard.sKey.isPressed) forwardCommand -= 1f;
+        if (keyboard.dKey.isPressed) rightCommand += 1f;
+        if (keyboard.aKey.isPressed) rightCommand -= 1f;
+        if (keyboard.eKey.isPressed) yawCommand += 1f;
+        if (keyboard.qKey.isPressed) yawCommand -= 1f;
+        if (keyboard.rKey.isPressed) altitudeCommand += 1f;
+        if (keyboard.fKey.isPressed) altitudeCommand -= 1f;
+
+        bool hasManualInput =
+            Mathf.Abs(forwardCommand) > 0.02f ||
+            Mathf.Abs(rightCommand) > 0.02f ||
+            Mathf.Abs(yawCommand) > 0.02f ||
+            Mathf.Abs(altitudeCommand) > 0.02f;
+
+        if (hasManualInput &&
+            (mode == DroneMode.Takeoff ||
+             mode == DroneMode.Hover ||
+             mode == DroneMode.ManualFlight))
+        {
+            if (mode != DroneMode.ManualFlight)
+            {
+                SetMode(DroneMode.ManualFlight);
+            }
+        }
+    }
+
+    private void ApplyManualAltitudeCommand()
+    {
+        targetAltitude += altitudeCommand * 1.0f * Time.fixedDeltaTime;
+
+        float minAltitude = waterSurfaceY + surfaceStableHeight + 0.15f;
+        targetAltitude = Mathf.Max(targetAltitude, minAltitude);
+    }
+
+    private void ApplyFlightControl()
+    {
+        ApplyAltitudeControl();
+        ApplyHorizontalVelocityControl();
+        ApplyYawControl();
+
+        if (keepLevel)
+        {
+            ApplyLevelStabilization();
+        }
+    }
+
+    private void ApplyAltitudeControl()
+    {
+        altitudeError = targetAltitude - currentAltitude;
+
+        float gravityCompensation = rb.mass * Mathf.Abs(Physics.gravity.y);
+        float pidForce = altitudeKp * altitudeError - altitudeKd * rb.linearVelocity.y;
+
+        verticalForceCommand = Mathf.Clamp(
+            gravityCompensation + pidForce,
+            0.0f,
+            maxVerticalForce
+        );
+
+        rb.AddForce(Vector3.up * verticalForceCommand, ForceMode.Force);
+    }
+
+    private void ApplyHorizontalVelocityControl()
+    {
+        // Use yaw-only heading for horizontal movement.
+        // This avoids problems if the model mesh or visual body has unusual pitch/roll orientation.
+        float yawDeg = transform.eulerAngles.y;
+        Quaternion yawRotation = Quaternion.Euler(0f, yawDeg, 0f);
+
+        Vector3 forward = yawRotation * Vector3.forward;
+        Vector3 right = yawRotation * Vector3.right;
+
+        desiredHorizontalVelocityWorld =
+            (forward * forwardCommand + right * rightCommand) * maxHorizontalSpeed;
+
+        Vector3 horizontalVelocity =
+            new Vector3(rb.linearVelocity.x, 0f, rb.linearVelocity.z);
+
+        Vector3 velocityError = desiredHorizontalVelocityWorld - horizontalVelocity;
+
+        horizontalForceCommand =
+            velocityError * horizontalVelocityKp
+            - horizontalVelocity * horizontalDamping;
+
+        horizontalForceCommand =
+            Vector3.ClampMagnitude(horizontalForceCommand, maxHorizontalForce);
+
+        rb.AddForce(horizontalForceCommand, ForceMode.Force);
+    }
+
+    private void ApplyYawControl()
+    {
+        float desiredYawRateRad = yawCommand * yawRateDegPerSec * Mathf.Deg2Rad;
+        float yawRateError = desiredYawRateRad - rb.angularVelocity.y;
+
+        yawTorqueCommand =
+            yawRateError * yawRateKp
+            - rb.angularVelocity.y * yawDamping;
+
+        yawTorqueCommand =
+            Mathf.Clamp(yawTorqueCommand, -maxYawTorque, maxYawTorque);
+
+        rb.AddTorque(Vector3.up * yawTorqueCommand, ForceMode.Force);
+    }
+
+    private void ApplyLevelStabilization()
+    {
+        Vector3 localAngularVelocity =
+            transform.InverseTransformDirection(rb.angularVelocity);
+
+        Vector3 euler = transform.localEulerAngles;
+
+        float pitch = NormalizeAngle(euler.x);
+        float roll = NormalizeAngle(euler.z);
+
+        Vector3 localTorque = new Vector3(
+            -pitch * Mathf.Deg2Rad * levelKp - localAngularVelocity.x * levelKd,
+            0f,
+            -roll * Mathf.Deg2Rad * levelKp - localAngularVelocity.z * levelKd
+        );
+
+        localTorque = Vector3.ClampMagnitude(localTorque, maxLevelTorque);
+
+        levelTorqueCommand = transform.TransformDirection(localTorque);
+
+        rb.AddTorque(levelTorqueCommand, ForceMode.Force);
+    }
+
+    private void UpdatePropellerState()
+    {
+        if (propellerAnimator == null)
+        {
+            return;
+        }
+
+        switch (mode)
+        {
+            case DroneMode.Disarmed:
+                propellerAnimator.SetState(MIMISKDronePropellerAnimator.DroneRotorState.Disarmed);
+                break;
+
+            case DroneMode.ArmedIdle:
+                propellerAnimator.SetState(MIMISKDronePropellerAnimator.DroneRotorState.ArmedIdle);
+                break;
+
+            case DroneMode.Takeoff:
+            case DroneMode.Hover:
+            case DroneMode.ManualFlight:
+            case DroneMode.LandingOnWater:
+                propellerAnimator.SetState(MIMISKDronePropellerAnimator.DroneRotorState.Flying);
+                break;
+
+            case DroneMode.SurfaceStable:
+                propellerAnimator.SetState(MIMISKDronePropellerAnimator.DroneRotorState.WaterSurfaceStable);
+                break;
+
+            case DroneMode.EmergencyStop:
+                propellerAnimator.SetState(MIMISKDronePropellerAnimator.DroneRotorState.EmergencyStop);
+                break;
+        }
+    }
+
+    private float NormalizeAngle(float angle)
+    {
+        while (angle > 180f) angle -= 360f;
+        while (angle < -180f) angle += 360f;
+        return angle;
+    }
+}

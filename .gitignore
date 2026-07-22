@@ -1,0 +1,73 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+Recordings/
+
+# Unity generated solution/cache files
+*.csproj
+*.sln
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+sysinfo.txt
+
+# IDE files
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ROS2 generated folders
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Validation / paper outputs
+Analysis/
+Logs/
+Backups/
+_release/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+*.log
+str.txt
+
+# Large local media / datasets
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.bag
+*.db3

@@ -1,0 +1,145 @@
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreRotorAnimator : MonoBehaviour
+{
+    [Header("References")]
+    public MIMISKDroneCoreRotorController core;
+
+    [Tooltip("Optional. Used only to copy rotor visual transforms from the old rotor model. The old rotor model should stay disabled so it does not apply forces.")]
+    public MIMISKDroneRotorModel legacyRotorModel;
+
+    [Header("Rotor Visuals in Core Order: FL, FR, RL, RR")]
+    public Transform rotorFL;
+    public Transform rotorFR;
+    public Transform rotorRL;
+    public Transform rotorRR;
+
+    [Header("Animation")]
+    public bool animate = true;
+
+    [Tooltip("Old Drone V1 propellers usually spin around local Z.")]
+    public Vector3 localSpinAxis = Vector3.forward;
+
+    public float idleRpm = 500.0f;
+    public float maxRpm = 5200.0f;
+    public float rpmResponseHz = 14.0f;
+
+    [Header("Debug")]
+    public Vector4 rpmFL_FR_RL_RR;
+
+    private Vector4 rpmState;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        AutoBindFromLegacyRotorModel();
+    }
+
+    private void Update()
+    {
+        if (!animate || core == null)
+        {
+            return;
+        }
+
+        float dt = Time.deltaTime;
+        float maxThrust = Mathf.Max(0.001f, core.maxThrustPerRotorN);
+
+        Vector4 thrust = core.motorThrustActualN;
+
+        Vector4 targetRpm = new Vector4(
+            RpmFromThrust(thrust.x, maxThrust),
+            RpmFromThrust(thrust.y, maxThrust),
+            RpmFromThrust(thrust.z, maxThrust),
+            RpmFromThrust(thrust.w, maxThrust)
+        );
+
+        float alpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, rpmResponseHz) * dt);
+
+        rpmState = Vector4.Lerp(rpmState, targetRpm, alpha);
+        rpmFL_FR_RL_RR = rpmState;
+
+        Vector4 spin = core.rotorSpinSigns;
+
+        Spin(rotorFL, rpmState.x, spin.x, dt);
+        Spin(rotorFR, rpmState.y, spin.y, dt);
+        Spin(rotorRL, rpmState.z, spin.z, dt);
+        Spin(rotorRR, rpmState.w, spin.w, dt);
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        if (legacyRotorModel == null)
+        {
+            legacyRotorModel = GetComponent<MIMISKDroneRotorModel>();
+        }
+    }
+
+    [ContextMenu("Auto Bind From Legacy Rotor Model")]
+    public void AutoBindFromLegacyRotorModel()
+    {
+        AutoFindReferences();
+
+        if (legacyRotorModel == null)
+        {
+            return;
+        }
+
+        // Legacy order:
+        // motor1_RR, motor2_FR, motor3_RL, motor4_FL.
+        // Core order:
+        // FL, FR, RL, RR.
+        if (legacyRotorModel.motor4_FL != null)
+        {
+            rotorFL = legacyRotorModel.motor4_FL.rotorTransform;
+        }
+
+        if (legacyRotorModel.motor2_FR != null)
+        {
+            rotorFR = legacyRotorModel.motor2_FR.rotorTransform;
+        }
+
+        if (legacyRotorModel.motor3_RL != null)
+        {
+            rotorRL = legacyRotorModel.motor3_RL.rotorTransform;
+        }
+
+        if (legacyRotorModel.motor1_RR != null)
+        {
+            rotorRR = legacyRotorModel.motor1_RR.rotorTransform;
+        }
+
+        if (legacyRotorModel.motor4_FL != null &&
+            legacyRotorModel.motor4_FL.localSpinAxis.sqrMagnitude > 0.0001f)
+        {
+            localSpinAxis = legacyRotorModel.motor4_FL.localSpinAxis;
+        }
+    }
+
+    private float RpmFromThrust(float thrustN, float maxThrustN)
+    {
+        float u = Mathf.Clamp01(thrustN / maxThrustN);
+        return Mathf.Lerp(idleRpm, maxRpm, Mathf.Sqrt(u));
+    }
+
+    private void Spin(Transform rotor, float rpm, float spinSign, float dt)
+    {
+        if (rotor == null)
+        {
+            return;
+        }
+
+        float deg =
+            spinSign * rpm * 360.0f * dt / 60.0f;
+
+        rotor.Rotate(localSpinAxis.normalized, deg, Space.Self);
+    }
+}

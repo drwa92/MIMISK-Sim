@@ -1,0 +1,139 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneAquaLocSetup
+{
+    [MenuItem("MIMISK/Drone/Localization/Setup MIMISK-AquaLoc Robust Estimator")]
+    public static void SetupAquaLoc()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+            return;
+        }
+
+        MIMISKDroneAquaLocEstimator e =
+            drone.GetComponent<MIMISKDroneAquaLocEstimator>();
+
+        if (e == null)
+        {
+            e = drone.AddComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        e.imu = drone.GetComponentInChildren<MIMISKDroneImuDevice>();
+        e.barometer = drone.GetComponentInChildren<MIMISKDroneBarometerDevice>();
+        e.magnetometer = drone.GetComponentInChildren<MIMISKDroneMagnetometerDevice>();
+        e.gnss = drone.GetComponentInChildren<MIMISKDroneGnssDevice>();
+        e.rangefinder = drone.GetComponentInChildren<MIMISKDroneRangefinderDevice>();
+        e.surfaceBuoyancy = drone.GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        e.batteryPower = drone.GetComponentInChildren<MIMISKDroneBatteryPowerDevice>();
+
+        e.estimatorEnabled = true;
+        e.resetOnStart = true;
+
+        e.initializeFromUnityPose = true;
+        e.initializationDelaySeconds = 0.25f;
+        e.useGnssLocalWorldAnchor = true;
+
+        e.calibrateGnssOriginAtStartup = true;
+        e.requireGnssOriginReadyForFusion = true;
+        e.gnssOriginCalibrationSeconds = 2.0f;
+
+        e.landingApproachRangeM = 3.0f;
+        e.waterContactMinBuoyancyPoints = 1;
+        e.surfaceFloatMinBuoyancyPoints = 3;
+
+        e.gyroNoiseQ = 1.0e-6f;
+        e.gyroNoiseR = 2.5e-5f;
+        e.accelNoiseQ = 2.0e-4f;
+        e.accelNoiseR = 2.0e-3f;
+        e.magYawNoiseQ = 0.02f;
+        e.magYawNoiseR = 6.0f;
+
+        e.rollPitchGyroAlpha = 0.985f;
+        e.yawCorrectionGain = 3.5f;
+        e.yawGyroSign = 1.0f;
+        e.pitchGyroSign = 1.0f;
+        e.rollGyroSign = 1.0f;
+        e.magYawOffsetDeg = 0.0f;
+
+        e.accelTiltGateMS2 = 2.5f;
+        e.reduceMagTrustDuringHighCurrent = true;
+        e.highCurrentThresholdA = 15.0f;
+        e.highCurrentMagTrustScale = 0.45f;
+
+        e.accelPredictionScale = 0.15f;
+        e.horizontalAccelPredictionScale = 0.20f;
+        e.verticalAccelPredictionScale = 0.08f;
+
+        e.qHorizontalPosition = 0.015f;
+        e.qHorizontalVelocity = 0.045f;
+        e.qVerticalPosition = 0.008f;
+        e.qVerticalVelocity = 0.035f;
+
+        e.gnssHorizontalSigmaM = 1.5f;
+        e.gnssVerticalSigmaM = 2.5f;
+        e.gnssVelocitySigmaMS = 0.25f;
+        e.barometerSigmaM = 0.35f;
+        e.rangefinderSigmaM = 0.12f;
+        e.magnetometerYawSigmaDeg = 8.0f;
+
+        e.enableRobustGating = true;
+        e.softGate = 3.0f;
+        e.hardGate = 9.0f;
+
+        e.enableSurfaceConstraint = true;
+        e.waterSurfaceY = 0.0f;
+        e.surfaceFloatRootHeightM = 0.0f;
+        e.disableOpticalRangefinderWhenWet = true;
+        e.rangefinderMaxFusionRangeM = 6.0f;
+
+        EditorUtility.SetDirty(e);
+
+        MIMISKDroneAquaLocLogger logger =
+            drone.GetComponent<MIMISKDroneAquaLocLogger>();
+
+        if (logger == null)
+        {
+            logger = drone.AddComponent<MIMISKDroneAquaLocLogger>();
+        }
+
+        logger.estimator = e;
+        logger.enableLogging = true;
+        logger.logHz = 50.0f;
+        logger.flushEveryLine = false;
+
+        EditorUtility.SetDirty(logger);
+
+        MIMISKDroneFusedLocalization oldEstimator =
+            drone.GetComponent<MIMISKDroneFusedLocalization>();
+
+        if (oldEstimator != null)
+        {
+            oldEstimator.enabled = false;
+            EditorUtility.SetDirty(oldEstimator);
+        }
+
+        MIMISKDroneLocalizationLogger oldLogger =
+            drone.GetComponent<MIMISKDroneLocalizationLogger>();
+
+        if (oldLogger != null)
+        {
+            oldLogger.enabled = false;
+            EditorUtility.SetDirty(oldLogger);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] MIMISK-AquaLoc v5 cascaded Kalman/complementary estimator configured.");
+    }
+}

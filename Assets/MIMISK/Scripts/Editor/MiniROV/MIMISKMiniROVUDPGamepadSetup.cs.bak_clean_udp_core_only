@@ -1,0 +1,108 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKMiniROVUDPGamepadSetup
+{
+    [MenuItem("MIMISK/MiniROV/Setup MiniROV UDP Gamepad Control")]
+    public static void SetupMiniROVUDPGamepadControl()
+    {
+        GameObject miniRov =
+            GameObject.Find("MiniROV");
+
+        if (miniRov == null)
+        {
+            Debug.LogError("[MIMISK] Could not find MiniROV.");
+            return;
+        }
+
+        MIMISKMiniROVCoreController core =
+            miniRov.GetComponent<MIMISKMiniROVCoreController>();
+
+        if (core == null)
+        {
+            core = miniRov.AddComponent<MIMISKMiniROVCoreController>();
+        }
+
+        MIMISKMiniROVMissionManager mission =
+            miniRov.GetComponent<MIMISKMiniROVMissionManager>();
+
+        if (mission == null)
+        {
+            mission = miniRov.AddComponent<MIMISKMiniROVMissionManager>();
+        }
+
+        mission.selectedMissionAction =
+            MIMISKMiniROVMissionManager.MiniROVMissionAction.GamepadManualTest;
+
+        mission.allowStandaloneKeyboard = false;
+        mission.missionEnabled = true;
+
+        EditorUtility.SetDirty(mission);
+
+        MIMISKMiniROVUDPGamepadReceiver udp =
+            miniRov.GetComponent<MIMISKMiniROVUDPGamepadReceiver>();
+
+        if (udp == null)
+        {
+            udp = miniRov.AddComponent<MIMISKMiniROVUDPGamepadReceiver>();
+        }
+
+        udp.coreController = core;
+        udp.controlManager = miniRov.GetComponent<ControlManager>();
+        udp.rb = miniRov.GetComponent<Rigidbody>();
+        udp.missionManager = mission;
+        udp.receiverEnabled = true;
+        udp.directInjectToControlManager = true;
+        udp.alsoSendToCoreController = true;
+        udp.stopControlManagerSerialReader = true;
+        udp.autoConfigureControlManager = true;
+        udp.maxThrusterPwm = 190;
+        udp.maxBallastDcPwm = 160;
+        udp.mapDepthToBallastDc = false;
+        udp.swapLeftRight = false;
+        udp.invertLeftThruster = false;
+        udp.invertRightThruster = false;
+        udp.listenAddress = "127.0.0.1";
+        udp.listenPort = 54331;
+        udp.inputTimeoutS = 0.35f;
+
+        udp.requireMiniROVGamepadMissionState = true;
+        udp.forceCoreGamepadModeWhenActive = true;
+        udp.requireUnityNativeBackend = true;
+
+        udp.useDirectCommandFields = true;
+        udp.deriveFromRawAxes = true;
+        udp.invertSurge = false;
+        udp.invertYaw = false;
+        udp.surgeScale = 1.0f;
+        udp.yawScale = 1.0f;
+        udp.depthScale = 1.0f;
+
+        EditorUtility.SetDirty(udp);
+
+        MIMISKMiniROVGamepadReceiver local =
+            miniRov.GetComponent<MIMISKMiniROVGamepadReceiver>();
+
+        if (local != null)
+        {
+            local.receiverEnabled = false;
+            EditorUtility.SetDirty(local);
+        }
+
+        MIMISKCommunicationBridge bridge =
+            UnityEngine.Object.FindAnyObjectByType<MIMISKCommunicationBridge>();
+
+        if (bridge != null)
+        {
+            bridge.miniRovMission = mission;
+            bridge.startMiniRovMissionKey = UnityEngine.InputSystem.Key.M;
+            EditorUtility.SetDirty(bridge);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log("[MIMISK] MiniROV UDP gamepad control configured. Run Python sender on UDP 127.0.0.1:54331, then use P/U/M.");
+    }
+}

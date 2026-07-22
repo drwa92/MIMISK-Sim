@@ -1,0 +1,972 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+[RequireComponent(typeof(Rigidbody))]
+public class MIMISKDroneBaseRotorController : MonoBehaviour
+{
+    public enum ControlMode
+    {
+        Disabled,
+        ManualGamepad,
+        PositionHold,
+        PathTracking,
+        ExternalReference
+    }
+
+    public enum StateSource
+    {
+        GroundTruth,
+        AquaLoc
+    }
+
+    public enum PathKind
+    {
+        Circle,
+        Square,
+        Spiral
+    }
+
+    [Header("References")]
+    public Rigidbody rb;
+    public MIMISKDroneAquaLocEstimator aquaLoc;
+    public MIMISKDroneUdpGamepadReceiver udpReceiver;
+    public MIMISKDroneModelController legacyModelController;
+
+    [Header("Base Controller")]
+    public bool baseControllerEnabled = true;
+    public ControlMode controlMode = ControlMode.ManualGamepad;
+    public StateSource stateSource = StateSource.GroundTruth;
+
+    [Tooltip("Disable the previous MIMISKDroneModelController so this controller owns the Rigidbody.")]
+    public bool disableLegacyModelController = true;
+
+    [Tooltip("Keep UDP receiver enabled so this controller can read the gamepad raw command.")]
+    public bool keepUdpReceiverEnabled = true;
+
+    [Header("Keyboard")]
+    public Key manualKey = Key.M;
+    public Key holdKey = Key.H;
+    public Key pathKey = Key.N;
+    public Key abortKey = Key.B;
+
+    [Header("Manual Gamepad Reference Generator")]
+    public float manualMaxHorizontalSpeedMS = 0.75f;
+    public float manualAltitudeRateMS = 0.45f;
+    public float manualYawRateDegS = 35.0f;
+    public float manualReferenceResponseHz = 5.0f;
+    public float manualDeadzone = 0.05f;
+
+    [Header("Path Tracking")]
+    public PathKind pathKind = PathKind.Circle;
+    public float missionDurationS = 40.0f;
+
+    public float circleRadiusM = 1.4f;
+    public float circleOmegaRadS = 0.23f;
+
+    public float squareSideM = 2.4f;
+    public float squareSpeedMS = 0.32f;
+
+    public float spiralOmegaRadS = 0.28f;
+    public float spiralInitialRadiusM = 0.25f;
+    public float spiralFinalRadiusM = 1.25f;
+    public float spiralDurationS = 36.0f;
+    public float spiralAltitudeRiseM = 0.35f;
+
+    [Header("Outer Position PID")]
+    public float kpXZ = 1.25f;
+    public float kdXZ = 2.15f;
+    public float kiXZ = 0.04f;
+
+    public float kpY = 1.8f;
+    public float kdY = 1.7f;
+    public float kiY = 0.15f;
+
+    public Vector3 integralLimitXYZ = new Vector3(0.8f, 0.6f, 0.8f);
+    public float maxTiltDeg = 22.0f;
+
+    [Header("Inner Attitude Controller")]
+    public Vector3 attitudeKpNmPerRad = new Vector3(8.0f, 1.2f, 8.0f);
+    public Vector3 rateKdNmPerRadS = new Vector3(4.6f, 0.8f, 4.6f);
+    public Vector3 torqueLimitNm = new Vector3(8.0f, 0.36f, 8.0f);
+
+    [Header("Rotor / Drone Parameters")]
+    public bool useRigidbodyMass = true;
+    public float massKg = 4.0f;
+    public float gravity = 9.80665f;
+
+    public float armX_M = 0.58f;
+    public float armZ_M = 0.50f;
+    public float maxThrustPerRotorN = 18.0f;
+    public float motorTimeConstantS = 0.12f;
+
+    [Tooltip("Yaw reaction torque coefficient in Nm per Newton of rotor thrust.")]
+    public float yawTorqueCoeffNmPerN = 0.010f;
+
+    [Header("Rotor Spin Signs: FL, FR, RL, RR")]
+    public Vector4 rotorSpinSigns = new Vector4(1.0f, -1.0f, -1.0f, 1.0f);
+
+    [Header("Runtime State")]
+    public Vector3 missionStartWorld;
+    public float missionStartYawDeg;
+    public float missionTimerS;
+
+    public Vector3 estimatedPositionWorld;
+    public Vector3 estimatedVelocityWorld;
+    public float estimatedYawDeg;
+
+    public Vector3 referencePositionWorld;
+    public Vector3 referenceVelocityWorld;
+    public Vector3 referenceAccelerationWorld;
+    public float referenceYawDeg;
+
+    public Vector3 positionErrorWorld;
+    public Vector3 velocityErrorWorld;
+    public Vector3 integralErrorWorld;
+
+    public Vector3 commandedAccelerationWorld;
+    public Quaternion desiredAttitudeWorld;
+    public Vector3 attitudeErrorBodyRad;
+    public Vector3 angularVelocityBodyRadS;
+    public Vector3 torqueCommandBodyNm;
+
+    public float totalThrustCommandN;
+
+    public Vector4 motorThrustCommandN;
+    public Vector4 motorThrustActualN;
+
+    public Vector4 latestGamepadCommand;
+    public float trackingErrorM;
+    public string lastEvent = "idle";
+
+    [Header("Logging")]
+    public bool enableLogging = true;
+    public float logHz = 50.0f;
+    public bool flushEveryLine = false;
+    public string currentLogPath;
+    public int logLines;
+
+    private StreamWriter writer;
+    private float logTimer;
+    private Matrix4x4 allocation;
+    private Matrix4x4 allocationInv;
+    private FieldInfo gamepadRawCommandField;
+    private bool legacyWasEnabled;
+    private bool cachedLegacyState;
+
+    private static readonly CultureInfo Culture = CultureInfo.InvariantCulture;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        BuildAllocationMatrix();
+    }
+
+    private void Start()
+    {
+        if (rb != null)
+        {
+            rb.useGravity = true;
+            rb.isKinematic = false;
+        }
+
+        CacheAndDisableLegacyIfNeeded();
+
+        UpdateState();
+
+        referencePositionWorld = estimatedPositionWorld;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = estimatedYawDeg;
+
+        float m = useRigidbodyMass && rb != null ? rb.mass : massKg;
+        float hoverPerRotorN = Mathf.Clamp(m * gravity / 4.0f, 0.0f, maxThrustPerRotorN);
+
+        motorThrustCommandN = new Vector4(hoverPerRotorN, hoverPerRotorN, hoverPerRotorN, hoverPerRotorN);
+        motorThrustActualN = motorThrustCommandN;
+    }
+
+    private void Update()
+    {
+        if (Keyboard.current == null)
+        {
+            return;
+        }
+
+        if (Keyboard.current[manualKey].wasPressedThisFrame)
+        {
+            SetManualGamepadMode();
+        }
+
+        if (Keyboard.current[holdKey].wasPressedThisFrame)
+        {
+            CapturePositionHold();
+        }
+
+        if (Keyboard.current[pathKey].wasPressedThisFrame)
+        {
+            StartPathTracking(pathKind);
+        }
+
+        if (Keyboard.current[abortKey].wasPressedThisFrame)
+        {
+            SetManualGamepadMode();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!baseControllerEnabled || controlMode == ControlMode.Disabled)
+        {
+            return;
+        }
+
+        CacheAndDisableLegacyIfNeeded();
+
+        if (!UpdateState())
+        {
+            return;
+        }
+
+        float dt = Time.fixedDeltaTime;
+
+        if (controlMode == ControlMode.ManualGamepad)
+        {
+            UpdateManualReference(dt);
+        }
+        else if (controlMode == ControlMode.PositionHold)
+        {
+            referenceVelocityWorld = Vector3.zero;
+            referenceAccelerationWorld = Vector3.zero;
+        }
+        else if (controlMode == ControlMode.PathTracking)
+        {
+            missionTimerS += dt;
+            EvaluatePathReference(missionTimerS, out referencePositionWorld, out referenceVelocityWorld, out referenceAccelerationWorld);
+
+            if (missionTimerS >= GetPathDuration())
+            {
+                CapturePositionHold();
+                lastEvent = "path_completed_hold";
+            }
+        }
+        else if (controlMode == ControlMode.ExternalReference)
+        {
+            // Reference is supplied externally through SetExternalReference().
+        }
+
+        ComputeOuterPathPid(dt);
+        ComputeDesiredAttitudeAndThrust();
+        ComputeAttitudeTorque();
+        AllocateAndApplyRotorForces(dt);
+
+        trackingErrorM = Vector3.Distance(estimatedPositionWorld, referencePositionWorld);
+
+        WriteLogIfDue(dt);
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (aquaLoc == null)
+        {
+            aquaLoc = GetComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        if (udpReceiver == null)
+        {
+            udpReceiver = GetComponent<MIMISKDroneUdpGamepadReceiver>();
+        }
+
+        if (legacyModelController == null)
+        {
+            legacyModelController = GetComponent<MIMISKDroneModelController>();
+        }
+
+        CacheGamepadField();
+    }
+
+    private void CacheGamepadField()
+    {
+        if (udpReceiver == null)
+        {
+            return;
+        }
+
+        gamepadRawCommandField =
+            udpReceiver.GetType().GetField(
+                "rawCommandForwardRightYawAlt",
+                BindingFlags.Instance | BindingFlags.Public
+            );
+    }
+
+    private void CacheAndDisableLegacyIfNeeded()
+    {
+        if (!disableLegacyModelController || legacyModelController == null)
+        {
+            return;
+        }
+
+        if (!cachedLegacyState)
+        {
+            legacyWasEnabled = legacyModelController.enabled;
+            cachedLegacyState = true;
+        }
+
+        if (legacyModelController.enabled)
+        {
+            legacyModelController.ClearExternalCommand();
+            legacyModelController.enabled = false;
+        }
+
+        if (keepUdpReceiverEnabled && udpReceiver != null && !udpReceiver.enabled)
+        {
+            udpReceiver.enabled = true;
+        }
+    }
+
+    public void RestoreLegacyController()
+    {
+        if (legacyModelController != null && cachedLegacyState)
+        {
+            legacyModelController.enabled = legacyWasEnabled;
+        }
+
+        cachedLegacyState = false;
+    }
+
+    public void SetManualGamepadMode()
+    {
+        UpdateState();
+
+        controlMode = ControlMode.ManualGamepad;
+        referencePositionWorld = estimatedPositionWorld;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = estimatedYawDeg;
+        integralErrorWorld = Vector3.zero;
+        missionTimerS = 0.0f;
+        lastEvent = "manual_gamepad";
+        OpenLog();
+    }
+
+    public void CapturePositionHold()
+    {
+        UpdateState();
+
+        controlMode = ControlMode.PositionHold;
+        referencePositionWorld = estimatedPositionWorld;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = estimatedYawDeg;
+        integralErrorWorld = Vector3.zero;
+        missionTimerS = 0.0f;
+        lastEvent = "position_hold";
+        OpenLog();
+    }
+
+    public void StartPathTracking(PathKind kind)
+    {
+        UpdateState();
+
+        pathKind = kind;
+        controlMode = ControlMode.PathTracking;
+        missionStartWorld = estimatedPositionWorld;
+        missionStartYawDeg = estimatedYawDeg;
+        referenceYawDeg = estimatedYawDeg;
+        missionTimerS = 0.0f;
+        integralErrorWorld = Vector3.zero;
+        lastEvent = "path_tracking_" + kind.ToString();
+        OpenLog();
+    }
+
+    public void SetExternalReference(
+        Vector3 positionWorld,
+        Vector3 velocityWorld,
+        Vector3 accelerationWorld,
+        float yawDeg)
+    {
+        controlMode = ControlMode.ExternalReference;
+        referencePositionWorld = positionWorld;
+        referenceVelocityWorld = velocityWorld;
+        referenceAccelerationWorld = accelerationWorld;
+        referenceYawDeg = yawDeg;
+    }
+
+    private bool UpdateState()
+    {
+        if (stateSource == StateSource.AquaLoc &&
+            aquaLoc != null &&
+            aquaLoc.estimatorReady)
+        {
+            estimatedPositionWorld = aquaLoc.estimatedPositionWorld;
+            estimatedVelocityWorld = aquaLoc.estimatedVelocityWorld;
+            estimatedYawDeg = aquaLoc.estimatedYawDeg;
+            return true;
+        }
+
+        if (rb == null)
+        {
+            return false;
+        }
+
+        estimatedPositionWorld = rb.position;
+        estimatedVelocityWorld = rb.linearVelocity;
+        estimatedYawDeg = rb.rotation.eulerAngles.y;
+        return true;
+    }
+
+    private Vector4 ReadGamepadCommand()
+    {
+        if (udpReceiver == null)
+        {
+            return Vector4.zero;
+        }
+
+        if (gamepadRawCommandField == null)
+        {
+            CacheGamepadField();
+        }
+
+        if (gamepadRawCommandField == null)
+        {
+            return Vector4.zero;
+        }
+
+        object value = gamepadRawCommandField.GetValue(udpReceiver);
+
+        if (value is Vector4 command)
+        {
+            return command;
+        }
+
+        return Vector4.zero;
+    }
+
+    private void UpdateManualReference(float dt)
+    {
+        latestGamepadCommand = ReadGamepadCommand();
+
+        float forward = ApplyDeadzone(latestGamepadCommand.x);
+        float right = ApplyDeadzone(latestGamepadCommand.y);
+        float yaw = ApplyDeadzone(latestGamepadCommand.z);
+        float altitude = ApplyDeadzone(latestGamepadCommand.w);
+
+        Quaternion yawRotation = Quaternion.Euler(0.0f, referenceYawDeg, 0.0f);
+
+        Vector3 bodyVelocityCommand =
+            new Vector3(right, 0.0f, forward) * manualMaxHorizontalSpeedMS;
+
+        Vector3 worldVelocityCommand =
+            yawRotation * bodyVelocityCommand;
+
+        Vector3 desiredReferenceVelocity =
+            new Vector3(
+                worldVelocityCommand.x,
+                altitude * manualAltitudeRateMS,
+                worldVelocityCommand.z
+            );
+
+        float alpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, manualReferenceResponseHz) * dt);
+
+        referenceVelocityWorld =
+            Vector3.Lerp(referenceVelocityWorld, desiredReferenceVelocity, alpha);
+
+        referencePositionWorld += referenceVelocityWorld * dt;
+        referenceYawDeg += yaw * manualYawRateDegS * dt;
+
+        while (referenceYawDeg >= 360.0f) referenceYawDeg -= 360.0f;
+        while (referenceYawDeg < 0.0f) referenceYawDeg += 360.0f;
+
+        referenceAccelerationWorld = Vector3.zero;
+    }
+
+    private float ApplyDeadzone(float value)
+    {
+        return Mathf.Abs(value) < manualDeadzone ? 0.0f : value;
+    }
+
+    private float GetPathDuration()
+    {
+        if (pathKind == PathKind.Square)
+        {
+            return 4.0f * squareSideM / Mathf.Max(0.05f, squareSpeedMS);
+        }
+
+        if (pathKind == PathKind.Spiral)
+        {
+            return Mathf.Max(missionDurationS, spiralDurationS);
+        }
+
+        return missionDurationS;
+    }
+
+    private void EvaluatePathReference(
+        float t,
+        out Vector3 p,
+        out Vector3 v,
+        out Vector3 a)
+    {
+        if (pathKind == PathKind.Circle)
+        {
+            float R = circleRadiusM;
+            float w = circleOmegaRadS;
+            float wt = w * t;
+
+            p = missionStartWorld + new Vector3(
+                R * (Mathf.Cos(wt) - 1.0f),
+                0.0f,
+                R * Mathf.Sin(wt)
+            );
+
+            v = new Vector3(
+                -R * w * Mathf.Sin(wt),
+                0.0f,
+                R * w * Mathf.Cos(wt)
+            );
+
+            a = new Vector3(
+                -R * w * w * Mathf.Cos(wt),
+                0.0f,
+                -R * w * w * Mathf.Sin(wt)
+            );
+
+            return;
+        }
+
+        if (pathKind == PathKind.Spiral)
+        {
+            float T = Mathf.Max(0.1f, spiralDurationS);
+            float s = Mathf.Clamp01(t / T);
+            float r = Mathf.Lerp(spiralInitialRadiusM, spiralFinalRadiusM, s);
+            float rDot = t <= T ? (spiralFinalRadiusM - spiralInitialRadiusM) / T : 0.0f;
+            float w = spiralOmegaRadS;
+            float th = w * t;
+
+            p = missionStartWorld + new Vector3(
+                r * Mathf.Cos(th) - spiralInitialRadiusM,
+                spiralAltitudeRiseM * s,
+                r * Mathf.Sin(th)
+            );
+
+            v = new Vector3(
+                rDot * Mathf.Cos(th) - r * w * Mathf.Sin(th),
+                spiralAltitudeRiseM / T,
+                rDot * Mathf.Sin(th) + r * w * Mathf.Cos(th)
+            );
+
+            a = new Vector3(
+                -2.0f * rDot * w * Mathf.Sin(th) - r * w * w * Mathf.Cos(th),
+                0.0f,
+                2.0f * rDot * w * Mathf.Cos(th) - r * w * w * Mathf.Sin(th)
+            );
+
+            return;
+        }
+
+        EvaluateSquareReference(t, out p, out v, out a);
+    }
+
+    private void EvaluateSquareReference(float t, out Vector3 p, out Vector3 v, out Vector3 a)
+    {
+        float side = Mathf.Max(0.1f, squareSideM);
+        float speed = Mathf.Max(0.05f, squareSpeedMS);
+        float segTime = side / speed;
+        float totalTime = 4.0f * segTime;
+        float tau = Mathf.Repeat(t, totalTime);
+
+        Vector3 p0 = missionStartWorld;
+        Vector3 p1 = missionStartWorld + new Vector3(side, 0.0f, 0.0f);
+        Vector3 p2 = missionStartWorld + new Vector3(side, 0.0f, side);
+        Vector3 p3 = missionStartWorld + new Vector3(0.0f, 0.0f, side);
+
+        Vector3 a0;
+        Vector3 b0;
+
+        if (tau < segTime)
+        {
+            a0 = p0;
+            b0 = p1;
+        }
+        else if (tau < 2.0f * segTime)
+        {
+            a0 = p1;
+            b0 = p2;
+            tau -= segTime;
+        }
+        else if (tau < 3.0f * segTime)
+        {
+            a0 = p2;
+            b0 = p3;
+            tau -= 2.0f * segTime;
+        }
+        else
+        {
+            a0 = p3;
+            b0 = p0;
+            tau -= 3.0f * segTime;
+        }
+
+        float u = Mathf.Clamp01(tau / segTime);
+        p = Vector3.Lerp(a0, b0, u);
+        v = (b0 - a0).normalized * speed;
+        a = Vector3.zero;
+    }
+
+    private void ComputeOuterPathPid(float dt)
+    {
+        positionErrorWorld = referencePositionWorld - estimatedPositionWorld;
+        velocityErrorWorld = referenceVelocityWorld - estimatedVelocityWorld;
+
+        integralErrorWorld += positionErrorWorld * dt;
+
+        integralErrorWorld.x = Mathf.Clamp(integralErrorWorld.x, -integralLimitXYZ.x, integralLimitXYZ.x);
+        integralErrorWorld.y = Mathf.Clamp(integralErrorWorld.y, -integralLimitXYZ.y, integralLimitXYZ.y);
+        integralErrorWorld.z = Mathf.Clamp(integralErrorWorld.z, -integralLimitXYZ.z, integralLimitXYZ.z);
+
+        commandedAccelerationWorld = new Vector3(
+            referenceAccelerationWorld.x + kpXZ * positionErrorWorld.x + kdXZ * velocityErrorWorld.x + kiXZ * integralErrorWorld.x,
+            referenceAccelerationWorld.y + kpY  * positionErrorWorld.y + kdY  * velocityErrorWorld.y + kiY  * integralErrorWorld.y,
+            referenceAccelerationWorld.z + kpXZ * positionErrorWorld.z + kdXZ * velocityErrorWorld.z + kiXZ * integralErrorWorld.z
+        );
+
+        float maxHorizontalAccel = gravity * Mathf.Tan(maxTiltDeg * Mathf.Deg2Rad);
+
+        Vector2 horizontalAccel = new Vector2(
+            commandedAccelerationWorld.x,
+            commandedAccelerationWorld.z
+        );
+
+        if (horizontalAccel.magnitude > maxHorizontalAccel)
+        {
+            horizontalAccel = horizontalAccel.normalized * maxHorizontalAccel;
+            commandedAccelerationWorld.x = horizontalAccel.x;
+            commandedAccelerationWorld.z = horizontalAccel.y;
+        }
+    }
+
+    private void ComputeDesiredAttitudeAndThrust()
+    {
+        float m = useRigidbodyMass && rb != null ? rb.mass : massKg;
+
+        Vector3 requiredSpecificForce = new Vector3(
+            commandedAccelerationWorld.x,
+            gravity + commandedAccelerationWorld.y,
+            commandedAccelerationWorld.z
+        );
+
+        if (requiredSpecificForce.y < gravity * 0.25f)
+        {
+            requiredSpecificForce.y = gravity * 0.25f;
+        }
+
+        totalThrustCommandN =
+            Mathf.Clamp(
+                m * requiredSpecificForce.magnitude,
+                0.0f,
+                4.0f * maxThrustPerRotorN
+            );
+
+        Vector3 bodyYDesired = requiredSpecificForce.normalized;
+
+        Vector3 headingForward =
+            Quaternion.Euler(0.0f, referenceYawDeg, 0.0f) * Vector3.forward;
+
+        Vector3 bodyZDesired =
+            Vector3.ProjectOnPlane(headingForward, bodyYDesired);
+
+        if (bodyZDesired.sqrMagnitude < 1e-6f)
+        {
+            bodyZDesired =
+                Vector3.ProjectOnPlane(Vector3.forward, bodyYDesired);
+        }
+
+        bodyZDesired.Normalize();
+
+        Vector3 bodyXDesired =
+            Vector3.Cross(bodyYDesired, bodyZDesired).normalized;
+
+        bodyZDesired =
+            Vector3.Cross(bodyXDesired, bodyYDesired).normalized;
+
+        desiredAttitudeWorld =
+            Quaternion.LookRotation(bodyZDesired, bodyYDesired);
+    }
+
+    private void ComputeAttitudeTorque()
+    {
+        Quaternion qErr =
+            desiredAttitudeWorld * Quaternion.Inverse(rb.rotation);
+
+        if (qErr.w < 0.0f)
+        {
+            qErr.x = -qErr.x;
+            qErr.y = -qErr.y;
+            qErr.z = -qErr.z;
+            qErr.w = -qErr.w;
+        }
+
+        qErr.ToAngleAxis(out float angleDeg, out Vector3 axisWorld);
+
+        if (angleDeg > 180.0f)
+        {
+            angleDeg -= 360.0f;
+        }
+
+        if (float.IsNaN(axisWorld.x) || axisWorld.sqrMagnitude < 1e-8f)
+        {
+            axisWorld = Vector3.zero;
+            angleDeg = 0.0f;
+        }
+
+        Vector3 axisBody =
+            rb.transform.InverseTransformDirection(axisWorld.normalized);
+
+        attitudeErrorBodyRad =
+            axisBody * (angleDeg * Mathf.Deg2Rad);
+
+        angularVelocityBodyRadS =
+            rb.transform.InverseTransformDirection(rb.angularVelocity);
+
+        torqueCommandBodyNm = new Vector3(
+            attitudeKpNmPerRad.x * attitudeErrorBodyRad.x - rateKdNmPerRadS.x * angularVelocityBodyRadS.x,
+            attitudeKpNmPerRad.y * attitudeErrorBodyRad.y - rateKdNmPerRadS.y * angularVelocityBodyRadS.y,
+            attitudeKpNmPerRad.z * attitudeErrorBodyRad.z - rateKdNmPerRadS.z * angularVelocityBodyRadS.z
+        );
+
+        torqueCommandBodyNm.x = Mathf.Clamp(torqueCommandBodyNm.x, -torqueLimitNm.x, torqueLimitNm.x);
+        torqueCommandBodyNm.y = Mathf.Clamp(torqueCommandBodyNm.y, -torqueLimitNm.y, torqueLimitNm.y);
+        torqueCommandBodyNm.z = Mathf.Clamp(torqueCommandBodyNm.z, -torqueLimitNm.z, torqueLimitNm.z);
+    }
+
+    private void BuildAllocationMatrix()
+    {
+        Vector3[] r = new Vector3[]
+        {
+            new Vector3(-armX_M, 0.0f, -armZ_M),
+            new Vector3( armX_M, 0.0f, -armZ_M),
+            new Vector3(-armX_M, 0.0f,  armZ_M),
+            new Vector3( armX_M, 0.0f,  armZ_M)
+        };
+
+        float[] spin = new float[]
+        {
+            rotorSpinSigns.x,
+            rotorSpinSigns.y,
+            rotorSpinSigns.z,
+            rotorSpinSigns.w
+        };
+
+        allocation = Matrix4x4.zero;
+
+        for (int i = 0; i < 4; i++)
+        {
+            allocation[0, i] = 1.0f;
+            allocation[1, i] = -r[i].z;
+            allocation[2, i] = spin[i] * yawTorqueCoeffNmPerN;
+            allocation[3, i] = r[i].x;
+        }
+
+        allocationInv = allocation.inverse;
+    }
+
+    private void AllocateAndApplyRotorForces(float dt)
+    {
+        Vector4 wrench = new Vector4(
+            totalThrustCommandN,
+            torqueCommandBodyNm.x,
+            torqueCommandBodyNm.y,
+            torqueCommandBodyNm.z
+        );
+
+        motorThrustCommandN = allocationInv * wrench;
+
+        motorThrustCommandN.x = Mathf.Clamp(motorThrustCommandN.x, 0.0f, maxThrustPerRotorN);
+        motorThrustCommandN.y = Mathf.Clamp(motorThrustCommandN.y, 0.0f, maxThrustPerRotorN);
+        motorThrustCommandN.z = Mathf.Clamp(motorThrustCommandN.z, 0.0f, maxThrustPerRotorN);
+        motorThrustCommandN.w = Mathf.Clamp(motorThrustCommandN.w, 0.0f, maxThrustPerRotorN);
+
+        float alpha =
+            1.0f - Mathf.Exp(-dt / Mathf.Max(0.001f, motorTimeConstantS));
+
+        motorThrustActualN =
+            Vector4.Lerp(motorThrustActualN, motorThrustCommandN, alpha);
+
+        ApplyRotorForce(new Vector3(-armX_M, 0.0f, -armZ_M), motorThrustActualN.x, rotorSpinSigns.x);
+        ApplyRotorForce(new Vector3( armX_M, 0.0f, -armZ_M), motorThrustActualN.y, rotorSpinSigns.y);
+        ApplyRotorForce(new Vector3(-armX_M, 0.0f,  armZ_M), motorThrustActualN.z, rotorSpinSigns.z);
+        ApplyRotorForce(new Vector3( armX_M, 0.0f,  armZ_M), motorThrustActualN.w, rotorSpinSigns.w);
+    }
+
+    private void ApplyRotorForce(Vector3 localPosition, float thrustN, float spinSign)
+    {
+        Vector3 worldPosition =
+            rb.transform.TransformPoint(localPosition);
+
+        Vector3 forceWorld =
+            rb.transform.up * thrustN;
+
+        rb.AddForceAtPosition(forceWorld, worldPosition, ForceMode.Force);
+
+        Vector3 yawTorqueWorld =
+            rb.transform.up * (spinSign * yawTorqueCoeffNmPerN * thrustN);
+
+        rb.AddTorque(yawTorqueWorld, ForceMode.Force);
+    }
+
+    private void OpenLog()
+    {
+        if (!enableLogging)
+        {
+            return;
+        }
+
+        if (writer != null)
+        {
+            return;
+        }
+
+        string projectRoot = Directory.GetParent(Application.dataPath).FullName;
+        string logDir = Path.Combine(projectRoot, "Logs", "MIMISKDrone");
+        Directory.CreateDirectory(logDir);
+
+        string fileName =
+            "drone_base_rotor_" +
+            controlMode.ToString().ToLowerInvariant() + "_" +
+            stateSource.ToString().ToLowerInvariant() + "_" +
+            DateTime.Now.ToString("yyyyMMdd_HHmmss") +
+            ".csv";
+
+        currentLogPath = Path.Combine(logDir, fileName);
+        writer = new StreamWriter(currentLogPath);
+
+        writer.WriteLine(
+            "time,mode,state_source,event," +
+            "ref_x,ref_y,ref_z,ref_vx,ref_vy,ref_vz,ref_ax,ref_ay,ref_az,ref_yaw," +
+            "est_x,est_y,est_z,est_vx,est_vy,est_vz,est_yaw," +
+            "true_x,true_y,true_z,true_vx,true_vy,true_vz,true_yaw," +
+            "err_x,err_y,err_z,err_norm," +
+            "cmd_ax,cmd_ay,cmd_az,total_thrust," +
+            "tau_x,tau_y,tau_z," +
+            "m_FL_cmd,m_FR_cmd,m_RL_cmd,m_RR_cmd," +
+            "m_FL,m_FR,m_RL,m_RR," +
+            "gp_fwd,gp_right,gp_yaw,gp_alt"
+        );
+
+        writer.Flush();
+        logLines = 0;
+        logTimer = 0.0f;
+    }
+
+    private void WriteLogIfDue(float dt)
+    {
+        if (!enableLogging)
+        {
+            return;
+        }
+
+        if (writer == null)
+        {
+            OpenLog();
+        }
+
+        if (writer == null)
+        {
+            return;
+        }
+
+        logTimer += dt;
+
+        float period = 1.0f / Mathf.Max(1.0f, logHz);
+
+        if (logTimer < period)
+        {
+            return;
+        }
+
+        logTimer -= period;
+
+        Vector3 trueP = rb != null ? rb.position : Vector3.zero;
+        Vector3 trueV = rb != null ? rb.linearVelocity : Vector3.zero;
+        float trueYaw = rb != null ? rb.rotation.eulerAngles.y : 0.0f;
+
+        string line = string.Join(",",
+            F(Time.time),
+            controlMode.ToString(),
+            stateSource.ToString(),
+            lastEvent,
+
+            F(referencePositionWorld.x), F(referencePositionWorld.y), F(referencePositionWorld.z),
+            F(referenceVelocityWorld.x), F(referenceVelocityWorld.y), F(referenceVelocityWorld.z),
+            F(referenceAccelerationWorld.x), F(referenceAccelerationWorld.y), F(referenceAccelerationWorld.z),
+            F(referenceYawDeg),
+
+            F(estimatedPositionWorld.x), F(estimatedPositionWorld.y), F(estimatedPositionWorld.z),
+            F(estimatedVelocityWorld.x), F(estimatedVelocityWorld.y), F(estimatedVelocityWorld.z),
+            F(estimatedYawDeg),
+
+            F(trueP.x), F(trueP.y), F(trueP.z),
+            F(trueV.x), F(trueV.y), F(trueV.z),
+            F(trueYaw),
+
+            F(positionErrorWorld.x), F(positionErrorWorld.y), F(positionErrorWorld.z),
+            F(trackingErrorM),
+
+            F(commandedAccelerationWorld.x), F(commandedAccelerationWorld.y), F(commandedAccelerationWorld.z),
+            F(totalThrustCommandN),
+
+            F(torqueCommandBodyNm.x), F(torqueCommandBodyNm.y), F(torqueCommandBodyNm.z),
+
+            F(motorThrustCommandN.x), F(motorThrustCommandN.y), F(motorThrustCommandN.z), F(motorThrustCommandN.w),
+            F(motorThrustActualN.x), F(motorThrustActualN.y), F(motorThrustActualN.z), F(motorThrustActualN.w),
+
+            F(latestGamepadCommand.x), F(latestGamepadCommand.y), F(latestGamepadCommand.z), F(latestGamepadCommand.w)
+        );
+
+        writer.WriteLine(line);
+        logLines++;
+
+        if (flushEveryLine)
+        {
+            writer.Flush();
+        }
+    }
+
+    private string F(float value)
+    {
+        return value.ToString("G9", Culture);
+    }
+
+    private void CloseLog()
+    {
+        if (writer == null)
+        {
+            return;
+        }
+
+        writer.Flush();
+        writer.Close();
+        writer.Dispose();
+        writer = null;
+    }
+
+    private void OnDisable()
+    {
+        CloseLog();
+    }
+
+    private void OnApplicationQuit()
+    {
+        CloseLog();
+    }
+}

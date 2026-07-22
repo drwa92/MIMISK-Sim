@@ -1,0 +1,628 @@
+using System;
+using System.Reflection;
+using UnityEngine;
+
+using MimiskCommand = MIMISK.Grpc.MIMISKCommand;
+using MimiskCommandBatch = MIMISK.Grpc.CommandBatch;
+using MimiskCommandBatchRequest = MIMISK.Grpc.CommandBatchRequest;
+
+[DefaultExecutionOrder(2600)]
+[DisallowMultipleComponent]
+public class MIMISKGrpcCommandBridge : MonoBehaviour
+{
+    [Header("Connection")]
+    public MIMISKGrpcConnection connection;
+    public bool commandBridgeEnabled = true;
+    public float pollHz = 10.0f;
+    public string simId = "mimisk_unity_v2";
+
+    [Header("Agents")]
+    public MonoBehaviour droneAgent;
+    public MonoBehaviour tetherAgent;
+    public MonoBehaviour miniRovAgent;
+
+    [Header("Managers / Planners")]
+    public MonoBehaviour droneFlightManager;
+    public MonoBehaviour droneMissionManager;
+    public MonoBehaviour droneTrajectoryPlanner;
+
+    public MonoBehaviour unifiedTetherManager;
+    public MonoBehaviour smartWinchController;
+
+    public MonoBehaviour miniRovMissionManager;
+    public MonoBehaviour miniRovPathPlanner;
+
+    [Header("Runtime")]
+    public bool autoFindReferences = true;
+    public bool pollInProgress;
+    public int commandsReceived;
+    public int commandsExecuted;
+    public int commandsRejected;
+    public string lastCommand = "none";
+    public string lastResult = "idle";
+
+    private float timerS;
+
+    private void Awake()
+    {
+        if (autoFindReferences)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    private void Start()
+    {
+        if (connection == null)
+        {
+            connection = GetComponent<MIMISKGrpcConnection>();
+        }
+
+        if (connection == null)
+        {
+            connection = FindFirstObjectByType<MIMISKGrpcConnection>();
+        }
+
+        if (autoFindReferences)
+        {
+            AutoFindReferences();
+        }
+    }
+
+    private void Update()
+    {
+        if (!commandBridgeEnabled)
+        {
+            return;
+        }
+
+        if (connection == null ||
+            connection.Client == null ||
+            !connection.isConnected)
+        {
+            return;
+        }
+
+        timerS += Time.deltaTime;
+
+        float period =
+            1.0f / Mathf.Max(1.0f, pollHz);
+
+        if (timerS >= period)
+        {
+            timerS -= period;
+            PollCommands();
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (connection == null)
+        {
+            connection = GetComponent<MIMISKGrpcConnection>();
+
+            if (connection == null)
+            {
+                connection = FindFirstObjectByType<MIMISKGrpcConnection>();
+            }
+        }
+
+        if (droneAgent == null)
+        {
+            droneAgent = FindBehaviourByTypeName("MIMISKDroneAgent");
+        }
+
+        if (tetherAgent == null)
+        {
+            tetherAgent = FindBehaviourByTypeName("MIMISKTetherAgent");
+        }
+
+        if (miniRovAgent == null)
+        {
+            miniRovAgent = FindBehaviourByTypeName("MIMISKMiniROVAgent");
+        }
+
+        if (droneFlightManager == null)
+        {
+            droneFlightManager = FindBehaviourByTypeName("MIMISKDroneCoreFlightModeManager");
+        }
+
+        if (droneMissionManager == null)
+        {
+            droneMissionManager = FindBehaviourByTypeName("MIMISKDroneCoreMissionManager");
+        }
+
+        if (droneTrajectoryPlanner == null)
+        {
+            droneTrajectoryPlanner = FindBehaviourByTypeName("MIMISKDroneCoreTrajectoryPlanner");
+        }
+
+        if (unifiedTetherManager == null)
+        {
+            unifiedTetherManager = FindBehaviourByTypeName("MIMISKUnifiedTetherManager");
+        }
+
+        if (smartWinchController == null)
+        {
+            smartWinchController = FindBehaviourByTypeName("MIMISKTetherSmartWinchController");
+        }
+
+        if (miniRovMissionManager == null)
+        {
+            miniRovMissionManager = FindBehaviourByTypeName("MIMISKMiniROVMissionManager");
+        }
+
+        if (miniRovPathPlanner == null)
+        {
+            miniRovPathPlanner = FindBehaviourByTypeName("MIMISKMiniROVPathPlanner");
+        }
+    }
+
+    [ContextMenu("Poll Commands Once")]
+    public async void PollCommands()
+    {
+        if (pollInProgress)
+        {
+            return;
+        }
+
+        if (connection == null ||
+            connection.Client == null ||
+            !connection.isConnected)
+        {
+            lastResult = "not_connected";
+            return;
+        }
+
+        pollInProgress = true;
+
+        try
+        {
+            MimiskCommandBatch batch =
+                await connection.Client.GetPendingCommandsAsync(
+                    new MimiskCommandBatchRequest
+                    {
+                        SimId = simId
+                    }
+                );
+
+            if (batch == null || batch.Commands == null || batch.Commands.Count == 0)
+            {
+                return;
+            }
+
+            commandsReceived += batch.Commands.Count;
+
+            foreach (MimiskCommand command in batch.Commands)
+            {
+                ExecuteCommand(command);
+            }
+        }
+        catch (Exception ex)
+        {
+            lastResult =
+                ex.GetType().Name + ": " + ex.Message;
+
+            Debug.LogWarning(
+                "[MIMISK gRPC] Command polling failed: " +
+                lastResult
+            );
+
+            if (connection != null)
+            {
+                connection.isConnected = false;
+            }
+        }
+        finally
+        {
+            pollInProgress = false;
+        }
+    }
+
+    private void ExecuteCommand(MimiskCommand command)
+    {
+        if (command == null)
+        {
+            commandsRejected++;
+            lastResult = "null_command";
+            return;
+        }
+
+        if (autoFindReferences)
+        {
+            AutoFindReferences();
+        }
+
+        string target =
+            Normalize(command.TargetAgent);
+
+        string verb =
+            Normalize(command.Verb);
+
+        string arg =
+            command.StringArg ?? "";
+
+        lastCommand =
+            target + "/" + verb + "/" + arg;
+
+        bool ok = false;
+
+        switch (target)
+        {
+            case "drone":
+                ok = ExecuteDroneCommand(verb, arg, command.NumericArg);
+                break;
+
+            case "tether":
+                ok = ExecuteTetherCommand(verb, arg, command.NumericArg);
+                break;
+
+            case "minirov":
+            case "rov":
+                ok = ExecuteMiniRovCommand(verb, arg, command.NumericArg);
+                break;
+
+            default:
+                ok = false;
+                lastResult = "unknown_target_" + target;
+                break;
+        }
+
+        if (ok)
+        {
+            commandsExecuted++;
+            lastResult = "executed_" + lastCommand;
+            Debug.Log("[MIMISK gRPC] Executed command: " + lastCommand);
+        }
+        else
+        {
+            commandsRejected++;
+            if (string.IsNullOrEmpty(lastResult))
+            {
+                lastResult = "rejected_" + lastCommand;
+            }
+
+            Debug.LogWarning("[MIMISK gRPC] Rejected command: " + lastCommand + " | " + lastResult);
+        }
+    }
+
+    private bool ExecuteDroneCommand(string verb, string arg, double numericArg)
+    {
+        switch (verb)
+        {
+            case "land_surface":
+            case "land":
+                return
+                    CallFirst(droneAgent, "AgentLandOnSurface", "AgentSurfaceHold") ||
+                    CallFirst(droneFlightManager, "StartLandingOnSurface", "EnterSurfaceHold");
+
+            case "takeoff":
+                return
+                    CallFirst(droneAgent, "AgentTakeoff") ||
+                    CallFirst(droneFlightManager, "StartTakeoff");
+
+            case "hold":
+                return
+                    CallFirst(droneAgent, "AgentHold") ||
+                    CallFirst(droneFlightManager, "CapturePositionHold", "EnterSurfaceHold");
+
+            case "start_mission":
+            case "start_selected_mission":
+                return
+                    CallFirst(droneAgent, "AgentStartDroneMission", "AgentStartSelectedMission") ||
+                    CallFirst(droneMissionManager, "StartMission");
+
+            case "set_trajectory":
+                if (string.IsNullOrWhiteSpace(arg))
+                {
+                    lastResult = "set_trajectory_requires_string_arg";
+                    return false;
+                }
+
+                bool plannerOk =
+                    SetEnumFieldOrProperty(droneTrajectoryPlanner, "trajectoryType", arg);
+
+                SetEnumFieldOrProperty(droneMissionManager, "surveyTrajectory", arg);
+
+                return plannerOk;
+
+            default:
+                lastResult = "unsupported_drone_command_" + verb;
+                return false;
+        }
+    }
+
+    private bool ExecuteTetherCommand(string verb, string arg, double numericArg)
+    {
+        switch (verb)
+        {
+            case "attach_rov":
+            case "attach":
+                return
+                    CallFirst(tetherAgent, "AgentAttachRovToCableEnd") ||
+                    CallFirst(unifiedTetherManager, "AttachRovToCableEnd");
+
+            case "deploy_rov":
+            case "deploy":
+                return
+                    CallFirst(tetherAgent, "AgentDeployRov") ||
+                    CallFirst(unifiedTetherManager, "StartDeployment");
+
+            case "activate_rov_control":
+            case "activate_rov":
+                return
+                    CallFirst(tetherAgent, "AgentActivateRovControl") ||
+                    CallFirst(unifiedTetherManager, "ActivateRovControl");
+
+            case "enable_smart_tms":
+            case "start_smart_tms":
+                return
+                    CallFirst(tetherAgent, "AgentEnableSmartTms") ||
+                    CallFirst(smartWinchController, "EnableSmartTms");
+
+            case "disable_smart_tms":
+            case "stop_smart_tms":
+                return
+                    CallFirst(tetherAgent, "AgentDisableSmartTms") ||
+                    CallFirst(smartWinchController, "DisableSmartTms");
+
+            case "recover_rov":
+            case "recover":
+                return
+                    CallFirst(tetherAgent, "AgentRecoverRov") ||
+                    CallFirst(unifiedTetherManager, "RequestRecovery");
+
+            case "hold_winch":
+            case "hold":
+                return
+                    CallFirst(tetherAgent, "AgentHoldWinch") ||
+                    CallFirst(unifiedTetherManager, "HoldWinch");
+
+            default:
+                lastResult = "unsupported_tether_command_" + verb;
+                return false;
+        }
+    }
+
+    private bool ExecuteMiniRovCommand(string verb, string arg, double numericArg)
+    {
+        switch (verb)
+        {
+            case "set_path":
+            case "set_path_type":
+                if (string.IsNullOrWhiteSpace(arg))
+                {
+                    lastResult = "set_path_requires_string_arg";
+                    return false;
+                }
+
+                bool pathOk =
+                    SetEnumFieldOrProperty(miniRovPathPlanner, "selectedPathType", arg);
+
+                SetBoolFieldOrProperty(miniRovMissionManager, "usePathPlannerSelectedPath", true);
+
+                return pathOk;
+
+            case "start_mission":
+            case "start_selected_mission":
+                return
+                    CallFirst(miniRovAgent, "AgentStartSelectedMission", "AgentStartCurrentPath", "AgentStartMission") ||
+                    CallFirst(miniRovMissionManager, "StartSelectedMission", "StartMission");
+
+            case "station_hold":
+            case "hold":
+                return
+                    CallFirst(miniRovAgent, "AgentHold", "AgentStationHold") ||
+                    CallFirst(miniRovMissionManager, "StartStationHold", "StationHold");
+
+            case "return_home":
+                return
+                    CallFirst(miniRovAgent, "AgentReturnHome") ||
+                    CallFirst(miniRovMissionManager, "ReturnHome");
+
+            case "dwell":
+            case "dwell_at_current_pose":
+                return
+                    CallFirst(miniRovAgent, "AgentDwellAtCurrentPose", "AgentDwell") ||
+                    CallFirst(miniRovMissionManager, "DwellAtCurrentPose", "StartDwellAtCurrentPose");
+
+            case "abort_to_hold":
+            case "abort":
+            case "stop":
+                return
+                    CallFirst(miniRovAgent, "AgentAbortToHold", "AgentStop") ||
+                    CallFirst(miniRovMissionManager, "AbortToHold", "StopMission", "StationHold");
+
+            default:
+                lastResult = "unsupported_minirov_command_" + verb;
+                return false;
+        }
+    }
+
+    private bool CallFirst(object target, params string[] methodNames)
+    {
+        if (target == null)
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        for (int i = 0; i < methodNames.Length; i++)
+        {
+            MethodInfo method =
+                type.GetMethod(
+                    methodNames[i],
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+
+            if (method == null || method.GetParameters().Length != 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                method.Invoke(target, null);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                lastResult =
+                    "method_exception_" +
+                    methodNames[i] +
+                    "_" +
+                    ex.GetType().Name;
+
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private bool SetEnumFieldOrProperty(object target, string memberName, string enumName)
+    {
+        if (target == null || string.IsNullOrWhiteSpace(memberName) || string.IsNullOrWhiteSpace(enumName))
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(
+                memberName,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (field != null && field.FieldType.IsEnum)
+        {
+            try
+            {
+                object value =
+                    Enum.Parse(field.FieldType, enumName, true);
+
+                field.SetValue(target, value);
+                return true;
+            }
+            catch
+            {
+                lastResult = "failed_parse_enum_" + memberName + "_" + enumName;
+                return false;
+            }
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(
+                memberName,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (prop != null && prop.CanWrite && prop.PropertyType.IsEnum)
+        {
+            try
+            {
+                object value =
+                    Enum.Parse(prop.PropertyType, enumName, true);
+
+                prop.SetValue(target, value, null);
+                return true;
+            }
+            catch
+            {
+                lastResult = "failed_parse_enum_" + memberName + "_" + enumName;
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private bool SetBoolFieldOrProperty(object target, string memberName, bool value)
+    {
+        if (target == null || string.IsNullOrWhiteSpace(memberName))
+        {
+            return false;
+        }
+
+        Type type = target.GetType();
+
+        FieldInfo field =
+            type.GetField(
+                memberName,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (field != null && field.FieldType == typeof(bool))
+        {
+            field.SetValue(target, value);
+            return true;
+        }
+
+        PropertyInfo prop =
+            type.GetProperty(
+                memberName,
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (prop != null && prop.CanWrite && prop.PropertyType == typeof(bool))
+        {
+            prop.SetValue(target, value, null);
+            return true;
+        }
+
+        return false;
+    }
+
+    private MonoBehaviour FindBehaviourByTypeName(string typeName)
+    {
+        MonoBehaviour[] behaviours =
+            Resources.FindObjectsOfTypeAll<MonoBehaviour>();
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour b =
+                behaviours[i];
+
+            if (b == null ||
+                b.gameObject == null ||
+                !b.gameObject.scene.IsValid())
+            {
+                continue;
+            }
+
+            if (b.GetType().Name == typeName)
+            {
+                return b;
+            }
+        }
+
+        return null;
+    }
+
+    private string Normalize(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "";
+        }
+
+        return
+            value.Trim()
+                 .Replace("-", "_")
+                 .Replace(" ", "_")
+                 .ToLowerInvariant();
+    }
+}

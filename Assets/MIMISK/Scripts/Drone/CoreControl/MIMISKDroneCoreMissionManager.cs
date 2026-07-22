@@ -1,0 +1,584 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreMissionManager : MonoBehaviour
+{
+    public enum MissionState
+    {
+        Idle,
+        TakeoffIdle,
+        Takeoff,
+        HoldAfterTakeoff,
+        TransitToSurveyArea,
+        SurveyPattern,
+        DeploymentApproach,
+        PrecisionHold,
+        LandingOnSurface,
+        SurfaceStable,
+        ReadyForTetherDeployment,
+        Completed,
+        Failsafe,
+        Aborted
+    }
+
+    [Header("References")]
+    public MIMISKDroneCoreRotorController core;
+    public MIMISKDroneCoreFlightModeManager flightManager;
+    public MIMISKDroneCoreTrajectoryPlanner trajectoryPlanner;
+    public MIMISKDroneCorePropellerAnimationBridge propellerBridge;
+    public MIMISKDroneSurfaceBuoyancy surfaceBuoyancy;
+    public Rigidbody rb;
+
+    [Header("Mission Enable")]
+    public bool missionEnabled = true;
+    public bool runOnStart = false;
+
+    [Header("Keyboard")]
+    public bool acceptKeyboardMissionCommands = true;
+    public Key startMissionKey = Key.P;
+    public Key abortMissionKey = Key.O;
+
+    [Header("Mission Path Types")]
+    public MIMISKDroneCoreTrajectoryPlanner.TrajectoryType transitTrajectory =
+        MIMISKDroneCoreTrajectoryPlanner.TrajectoryType.DeploymentApproach;
+
+    public MIMISKDroneCoreTrajectoryPlanner.TrajectoryType surveyTrajectory =
+        MIMISKDroneCoreTrajectoryPlanner.TrajectoryType.Lawnmower;
+
+    public MIMISKDroneCoreTrajectoryPlanner.TrajectoryType deploymentTrajectory =
+        MIMISKDroneCoreTrajectoryPlanner.TrajectoryType.DeploymentApproach;
+
+    [Header("Transit Settings")]
+    public float transitDistanceM = 3.0f;
+    public float transitSpeedMS = 0.35f;
+
+    [Header("Survey Settings")]
+    public float surveyLengthM = 4.0f;
+    public float surveyWidthM = 2.5f;
+    public int surveyLanes = 4;
+    public float surveySpeedMS = 0.35f;
+
+    [Header("Deployment Approach Settings")]
+    public float deploymentApproachDistanceM = 1.5f;
+    public float deploymentApproachSpeedMS = 0.22f;
+    public float deploymentFinalHoldSeconds = 2.0f;
+
+    [Header("Timing")]
+    public float takeoffIdleSeconds = 2.0f;
+    public float holdAfterTakeoffSeconds = 3.0f;
+    public float precisionHoldSeconds = 5.0f;
+    public float readyForTetherSeconds = 5.0f;
+
+    [Header("Tether Handoff")]
+    public bool holdAtReadyForTetherDeployment = true;
+
+    [Header("Surface-Based Tether Readiness")]
+    [Tooltip("If ON, any SurfaceStable/SurfaceHold landing is enough to allow tether deployment, even if the full mission was not run.")]
+    public bool surfaceStableImpliesReadyForTether = true;
+
+    [Tooltip("Optional: if ON, missionState is promoted to ReadyForTetherDeployment when the drone is surface-stable without a running mission.")]
+    public bool syncMissionStateToReadyWhenSurfaceStable = false;
+
+    public bool readyForTetherDeployment;
+    public string readyForTetherReason = "not_ready";
+
+    public float maxTakeoffSeconds = 30.0f;
+    public float maxTransitSeconds = 80.0f;
+    public float maxSurveySeconds = 120.0f;
+    public float maxDeploymentApproachSeconds = 60.0f;
+    public float maxLandingSeconds = 90.0f;
+
+    [Header("Runtime")]
+    public bool missionActive;
+    public MissionState missionState = MissionState.Idle;
+
+    public float missionTimerS;
+    public float stateTimerS;
+    public int missionStepIndex;
+
+    public string lastMissionEvent = "idle";
+
+    public Vector3 missionStartPositionWorld;
+    public float missionStartYawDeg;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        if (runOnStart)
+        {
+            StartMission();
+        }
+    }
+
+    private void Update()
+    {
+        if (!missionEnabled)
+        {
+            return;
+        }
+
+        if (Keyboard.current == null)
+        {
+            return;
+        }
+
+        if (!acceptKeyboardMissionCommands)
+        {
+            return;
+        }
+
+        if (Keyboard.current[startMissionKey].wasPressedThisFrame)
+        {
+            StartMission();
+        }
+
+        if (Keyboard.current[abortMissionKey].wasPressedThisFrame)
+        {
+            AbortMission();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!missionEnabled)
+        {
+            return;
+        }
+
+        RefreshTetherReadiness();
+
+        if (!missionActive)
+        {
+            return;
+        }
+
+        float dt = Time.fixedDeltaTime;
+
+        missionTimerS += dt;
+        stateTimerS += dt;
+
+        UpdateMission();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        if (flightManager == null)
+        {
+            flightManager = GetComponent<MIMISKDroneCoreFlightModeManager>();
+        }
+
+        if (trajectoryPlanner == null)
+        {
+            trajectoryPlanner = GetComponent<MIMISKDroneCoreTrajectoryPlanner>();
+        }
+
+        if (propellerBridge == null)
+        {
+            propellerBridge = GetComponent<MIMISKDroneCorePropellerAnimationBridge>();
+        }
+
+        if (surfaceBuoyancy == null)
+        {
+            surfaceBuoyancy = GetComponent<MIMISKDroneSurfaceBuoyancy>();
+        }
+
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+    }
+
+    [ContextMenu("Start MIMISK Mission")]
+    public void StartMission()
+    {
+        AutoFindReferences();
+
+        if (core == null || flightManager == null || trajectoryPlanner == null)
+        {
+            Debug.LogError("[MIMISK] Mission cannot start: core, flight manager, or trajectory planner missing.");
+            return;
+        }
+
+        missionActive = true;
+        missionTimerS = 0.0f;
+        stateTimerS = 0.0f;
+        missionStepIndex = 0;
+
+        missionStartPositionWorld = GetCurrentPosition();
+        missionStartYawDeg = GetCurrentYawDeg();
+
+        flightManager.EnterTakeoffIdle();
+
+        EnterState(MissionState.TakeoffIdle, "mission_started_takeoff_idle");
+
+        Debug.Log("[MIMISK] Core MIMISK mission started.");
+    }
+
+    [ContextMenu("Abort MIMISK Mission")]
+    public void AbortMission()
+    {
+        missionActive = false;
+
+        if (flightManager != null)
+        {
+            flightManager.EnterFailsafe();
+        }
+
+        EnterState(MissionState.Aborted, "mission_aborted");
+
+        Debug.Log("[MIMISK] Core MIMISK mission aborted.");
+    }
+
+    private void UpdateMission()
+    {
+        if (flightManager == null)
+        {
+            return;
+        }
+
+        if (missionState == MissionState.TakeoffIdle)
+        {
+            if (stateTimerS >= takeoffIdleSeconds)
+            {
+                flightManager.StartTakeoff();
+                EnterState(MissionState.Takeoff, "takeoff_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.Takeoff)
+        {
+            bool completed =
+                flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.PositionHold &&
+                stateTimerS > 1.0f;
+
+            bool timeout =
+                stateTimerS >= maxTakeoffSeconds;
+
+            if (completed || timeout)
+            {
+                flightManager.CapturePositionHold();
+                EnterState(
+                    MissionState.HoldAfterTakeoff,
+                    completed ? "takeoff_completed_hold" : "takeoff_timeout_hold"
+                );
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.HoldAfterTakeoff)
+        {
+            if (stateTimerS >= holdAfterTakeoffSeconds)
+            {
+                ConfigureTransitTrajectory();
+                StartPlannerPath();
+                EnterState(MissionState.TransitToSurveyArea, "transit_to_survey_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.TransitToSurveyArea)
+        {
+            if (PathFinished() || stateTimerS >= maxTransitSeconds)
+            {
+                ConfigureSurveyTrajectory();
+                StartPlannerPath();
+                EnterState(MissionState.SurveyPattern, "survey_pattern_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.SurveyPattern)
+        {
+            if (PathFinished() || stateTimerS >= maxSurveySeconds)
+            {
+                ConfigureDeploymentApproachTrajectory();
+                StartPlannerPath();
+                EnterState(MissionState.DeploymentApproach, "deployment_approach_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.DeploymentApproach)
+        {
+            if (PathFinished() || stateTimerS >= maxDeploymentApproachSeconds)
+            {
+                flightManager.CapturePositionHold();
+                EnterState(MissionState.PrecisionHold, "precision_hold_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.PrecisionHold)
+        {
+            if (stateTimerS >= precisionHoldSeconds)
+            {
+                flightManager.StartLandingOnSurface();
+                EnterState(MissionState.LandingOnSurface, "landing_on_surface_started");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.LandingOnSurface)
+        {
+            bool landed =
+                flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable ||
+                flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold;
+
+            bool timeout =
+                stateTimerS >= maxLandingSeconds;
+
+            if (landed)
+            {
+                EnterState(MissionState.SurfaceStable, "surface_stable_reached");
+            }
+            else if (timeout)
+            {
+                bool safeSurfaceStable =
+                    flightManager != null &&
+                    flightManager.TryEnterSurfaceStableFromMission(
+                        "landing_timeout_safe_surface_stable"
+                    );
+
+                if (safeSurfaceStable)
+                {
+                    EnterState(
+                        MissionState.SurfaceStable,
+                        "landing_timeout_but_safe_surface_stable"
+                    );
+                }
+                else
+                {
+                    flightManager.EnterFailsafe();
+                    EnterState(MissionState.Failsafe, "landing_timeout_failsafe");
+                }
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.SurfaceStable)
+        {
+            if (stateTimerS >= 1.0f)
+            {
+                EnterState(MissionState.ReadyForTetherDeployment, "ready_for_tether_deployment");
+            }
+
+            return;
+        }
+
+        if (missionState == MissionState.ReadyForTetherDeployment)
+        {
+            if (holdAtReadyForTetherDeployment)
+            {
+                // Stay here until the tether / MiniROV deployment system takes over.
+                return;
+            }
+
+            if (stateTimerS >= readyForTetherSeconds)
+            {
+                missionActive = false;
+                EnterState(MissionState.Completed, "mission_completed_ready_for_tether");
+            }
+
+            return;
+        }
+    }
+
+    private void ConfigureTransitTrajectory()
+    {
+        trajectoryPlanner.trajectoryType = transitTrajectory;
+
+        trajectoryPlanner.deploymentForwardDistanceM = transitDistanceM;
+        trajectoryPlanner.deploymentSpeedMS = transitSpeedMS;
+        trajectoryPlanner.deploymentFinalHoldSeconds = 0.5f;
+
+        trajectoryPlanner.yawAlongPath = false;
+    }
+
+    private void ConfigureSurveyTrajectory()
+    {
+        trajectoryPlanner.trajectoryType = surveyTrajectory;
+
+        trajectoryPlanner.lawnmowerLengthM = surveyLengthM;
+        trajectoryPlanner.lawnmowerWidthM = surveyWidthM;
+        trajectoryPlanner.lawnmowerLanes = surveyLanes;
+        trajectoryPlanner.lawnmowerSpeedMS = surveySpeedMS;
+
+        trajectoryPlanner.circleRadiusM = 1.4f;
+        trajectoryPlanner.circleOmegaRadS = 0.23f;
+        trajectoryPlanner.circleDurationS = 40.0f;
+
+        trajectoryPlanner.spiralInitialRadiusM = 0.25f;
+        trajectoryPlanner.spiralFinalRadiusM = 1.25f;
+        trajectoryPlanner.spiralDurationS = 36.0f;
+        trajectoryPlanner.spiralOmegaRadS = 0.28f;
+
+        trajectoryPlanner.yawAlongPath = false;
+    }
+
+    private void ConfigureDeploymentApproachTrajectory()
+    {
+        trajectoryPlanner.trajectoryType = deploymentTrajectory;
+
+        trajectoryPlanner.deploymentForwardDistanceM = deploymentApproachDistanceM;
+        trajectoryPlanner.deploymentSpeedMS = deploymentApproachSpeedMS;
+        trajectoryPlanner.deploymentFinalHoldSeconds = deploymentFinalHoldSeconds;
+
+        trajectoryPlanner.yawAlongPath = false;
+    }
+
+    private void StartPlannerPath()
+    {
+        if (flightManager == null)
+        {
+            return;
+        }
+
+        flightManager.useTrajectoryPlanner = true;
+        flightManager.trajectoryPlanner = trajectoryPlanner;
+
+        flightManager.StartPathTracking(
+            MIMISKDroneCoreFlightModeManager.PathKind.Circle
+        );
+    }
+
+    private bool PathFinished()
+    {
+        if (flightManager == null)
+        {
+            return false;
+        }
+
+        return flightManager.flightMode == MIMISKDroneCoreFlightModeManager.FlightMode.PositionHold &&
+               stateTimerS > 2.0f;
+    }
+
+    private Vector3 GetCurrentPosition()
+    {
+        if (core != null)
+        {
+            return core.estimatedPositionWorld;
+        }
+
+        if (rb != null)
+        {
+            return rb.position;
+        }
+
+        return transform.position;
+    }
+
+    private float GetCurrentYawDeg()
+    {
+        if (core != null)
+        {
+            return core.estimatedYawDeg;
+        }
+
+        if (rb != null)
+        {
+            return rb.rotation.eulerAngles.y;
+        }
+
+        return transform.eulerAngles.y;
+    }
+
+    public bool IsSurfaceStableForTether()
+    {
+        AutoFindReferences();
+
+        return
+            flightManager != null &&
+            (flightManager.flightMode ==
+                MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceStable ||
+             flightManager.flightMode ==
+                MIMISKDroneCoreFlightModeManager.FlightMode.SurfaceHold);
+    }
+
+    public bool IsMissionStateReadyForTether()
+    {
+        return
+            missionState == MissionState.ReadyForTetherDeployment ||
+            missionState == MissionState.Completed;
+    }
+
+    public bool IsReadyForTetherDeployment()
+    {
+        RefreshTetherReadiness();
+        return readyForTetherDeployment;
+    }
+
+    [ContextMenu("Refresh Tether Readiness")]
+    public void RefreshTetherReadiness()
+    {
+        bool surfaceReady =
+            IsSurfaceStableForTether();
+
+        bool missionReady =
+            IsMissionStateReadyForTether();
+
+        readyForTetherDeployment =
+            surfaceReady &&
+            (missionReady ||
+             (surfaceStableImpliesReadyForTether && surfaceReady));
+
+        if (readyForTetherDeployment)
+        {
+            readyForTetherReason =
+                missionReady
+                    ? "mission_ready_and_surface_stable"
+                    : "surface_stable_without_full_mission";
+
+            if (syncMissionStateToReadyWhenSurfaceStable &&
+                !missionActive &&
+                missionState != MissionState.ReadyForTetherDeployment &&
+                missionState != MissionState.Completed)
+            {
+                EnterState(
+                    MissionState.ReadyForTetherDeployment,
+                    "surface_stable_implies_ready_for_tether"
+                );
+            }
+        }
+        else
+        {
+            if (!surfaceReady)
+            {
+                readyForTetherReason = "not_surface_stable";
+            }
+            else
+            {
+                readyForTetherReason = "surface_ready_but_policy_not_ready";
+            }
+        }
+    }
+
+    private void EnterState(MissionState newState, string eventText)
+    {
+        missionState = newState;
+        stateTimerS = 0.0f;
+        missionStepIndex++;
+        lastMissionEvent = eventText;
+
+        Debug.Log("[MIMISK] Mission state: " + newState + " / " + eventText);
+    }
+}

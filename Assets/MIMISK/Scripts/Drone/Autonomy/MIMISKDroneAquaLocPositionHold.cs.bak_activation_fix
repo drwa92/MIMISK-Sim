@@ -1,0 +1,413 @@
+using UnityEngine;
+
+[RequireComponent(typeof(MIMISKDroneModelController))]
+public class MIMISKDroneAquaLocPositionHold : MonoBehaviour
+{
+    public enum GuidanceMode
+    {
+        Disabled,
+        HoldCurrent,
+        HoldTarget,
+        GoToTarget,
+        LandOnWaterAtTarget
+    }
+
+    [Header("References")]
+    public MIMISKDroneAquaLocEstimator aquaLoc;
+    public MIMISKDroneModelController controller;
+    public MIMISKDroneUdpGamepadReceiver udpReceiver;
+
+    [Header("Enable")]
+    public bool enableGuidance = false;
+    public GuidanceMode guidanceMode = GuidanceMode.Disabled;
+    public bool takeControlOfDrone = true;
+
+    [Tooltip("When autonomous hold is active, disable the manual UDP receiver so gamepad commands do not fight the hold controller.")]
+    public bool suppressManualUdpInputWhenActive = true;
+
+    [Header("Target")]
+    public Vector3 targetPositionWorld;
+    public float targetYawDeg;
+    public bool holdYawAtActivation = true;
+
+    [Header("Horizontal Position Hold")]
+    public float horizontalKp = 0.75f;
+    public float horizontalKd = 0.55f;
+    public float horizontalKi = 0.06f;
+    public float horizontalIntegralLimitM = 1.5f;
+
+    public float maxHorizontalSpeedMS = 0.85f;
+    public float maxCommandMagnitude = 0.85f;
+
+    [Header("Disturbance Observer")]
+    public bool enableDisturbanceObserver = true;
+
+    [Tooltip("Only learn slow drift when near the target. This avoids learning normal commanded motion as disturbance.")]
+    public float disturbanceLearningRadiusM = 1.5f;
+
+    public float disturbanceObserverResponse = 0.7f;
+    public float disturbanceCompensationGain = 0.85f;
+    public float maxDisturbanceVelocityMS = 0.6f;
+
+    [Header("Arrival")]
+    public float positionArrivalRadiusM = 0.20f;
+    public float velocityArrivalThresholdMS = 0.10f;
+
+    [Header("Command Filtering")]
+    public float commandResponse = 6.0f;
+
+    [Header("Altitude / Yaw")]
+    public float minTargetAltitudeM = 0.6f;
+    public float maxTargetAltitudeM = 12.0f;
+    public bool useAquaLocYawForBodyFrame = true;
+
+    [Header("Debug")]
+    public bool hasValidLocalization;
+    public bool targetReached;
+
+    public Vector3 estimatedPositionWorld;
+    public Vector3 estimatedVelocityWorld;
+    public float estimatedYawDeg;
+
+    public Vector3 positionErrorWorld;
+    public Vector3 horizontalIntegralWorld;
+    public Vector3 desiredVelocityWorld;
+    public Vector3 desiredVelocityBody;
+    public Vector3 disturbanceVelocityEstimateWorld;
+
+    public Vector4 rawCommandForwardRightYawAlt;
+    public Vector4 filteredCommandForwardRightYawAlt;
+
+    public float distanceToTargetM;
+    public float horizontalSpeedMS;
+
+    private bool targetInitialized;
+    private bool udpWasEnabledBeforeSuppression;
+    private bool udpStateCached;
+
+    private void Awake()
+    {
+        if (controller == null)
+        {
+            controller = GetComponent<MIMISKDroneModelController>();
+        }
+
+        if (aquaLoc == null)
+        {
+            aquaLoc = GetComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        if (udpReceiver == null)
+        {
+            udpReceiver = GetComponent<MIMISKDroneUdpGamepadReceiver>();
+        }
+    }
+
+    private void Start()
+    {
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            SetTargetToCurrentAquaLocEstimate();
+        }
+        else
+        {
+            targetPositionWorld = transform.position;
+            targetYawDeg = transform.eulerAngles.y;
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!enableGuidance || guidanceMode == GuidanceMode.Disabled)
+        {
+            ReleaseAutonomousControl();
+            return;
+        }
+
+        if (aquaLoc == null || controller == null || !aquaLoc.estimatorReady)
+        {
+            hasValidLocalization = false;
+            return;
+        }
+
+        hasValidLocalization = true;
+
+        CacheAndSuppressManualInput();
+
+        estimatedPositionWorld = aquaLoc.estimatedPositionWorld;
+        estimatedVelocityWorld = aquaLoc.estimatedVelocityWorld;
+        estimatedYawDeg = aquaLoc.estimatedYawDeg;
+
+        if (!targetInitialized || guidanceMode == GuidanceMode.HoldCurrent)
+        {
+            SetTargetToCurrentAquaLocEstimate();
+            guidanceMode = GuidanceMode.HoldTarget;
+        }
+
+        if (guidanceMode == GuidanceMode.LandOnWaterAtTarget)
+        {
+            controller.SetMode(MIMISKDroneModelController.DroneMode.LandingOnWater);
+        }
+        else
+        {
+            if (controller.mode == MIMISKDroneModelController.DroneMode.Takeoff ||
+                controller.mode == MIMISKDroneModelController.DroneMode.AltitudeHold ||
+                controller.mode == MIMISKDroneModelController.DroneMode.ManualAttitude)
+            {
+                controller.SetMode(MIMISKDroneModelController.DroneMode.ManualAttitude);
+            }
+        }
+
+        targetPositionWorld.y = Mathf.Clamp(
+            targetPositionWorld.y,
+            controller.waterSurfaceY + minTargetAltitudeM,
+            controller.waterSurfaceY + maxTargetAltitudeM
+        );
+
+        controller.targetAltitudeM = targetPositionWorld.y;
+        controller.targetYawDeg = targetYawDeg;
+
+        ComputeGuidanceCommand(Time.fixedDeltaTime);
+
+        if (takeControlOfDrone)
+        {
+            controller.SetExternalCommand(
+                filteredCommandForwardRightYawAlt.x,
+                filteredCommandForwardRightYawAlt.y,
+                filteredCommandForwardRightYawAlt.z,
+                filteredCommandForwardRightYawAlt.w
+            );
+        }
+    }
+
+    private void ComputeGuidanceCommand(float dt)
+    {
+        positionErrorWorld = targetPositionWorld - estimatedPositionWorld;
+
+        Vector3 horizontalError = new Vector3(
+            positionErrorWorld.x,
+            0.0f,
+            positionErrorWorld.z
+        );
+
+        Vector3 horizontalVelocity = new Vector3(
+            estimatedVelocityWorld.x,
+            0.0f,
+            estimatedVelocityWorld.z
+        );
+
+        distanceToTargetM = horizontalError.magnitude;
+        horizontalSpeedMS = horizontalVelocity.magnitude;
+
+        horizontalIntegralWorld += horizontalError * dt;
+
+        if (horizontalIntegralWorld.magnitude > horizontalIntegralLimitM)
+        {
+            horizontalIntegralWorld =
+                horizontalIntegralWorld.normalized * horizontalIntegralLimitM;
+        }
+
+        Vector3 baseDesiredVelocity =
+            horizontalKp * horizontalError
+            + horizontalKi * horizontalIntegralWorld
+            - horizontalKd * horizontalVelocity;
+
+        if (enableDisturbanceObserver && distanceToTargetM < disturbanceLearningRadiusM)
+        {
+            Vector3 residualVelocity =
+                horizontalVelocity - baseDesiredVelocity;
+
+            residualVelocity.y = 0.0f;
+
+            float alpha =
+                1.0f - Mathf.Exp(-Mathf.Max(0.001f, disturbanceObserverResponse) * dt);
+
+            disturbanceVelocityEstimateWorld =
+                Vector3.Lerp(
+                    disturbanceVelocityEstimateWorld,
+                    residualVelocity,
+                    alpha
+                );
+
+            if (disturbanceVelocityEstimateWorld.magnitude > maxDisturbanceVelocityMS)
+            {
+                disturbanceVelocityEstimateWorld =
+                    disturbanceVelocityEstimateWorld.normalized * maxDisturbanceVelocityMS;
+            }
+        }
+
+        desiredVelocityWorld =
+            baseDesiredVelocity
+            - disturbanceCompensationGain * disturbanceVelocityEstimateWorld;
+
+        desiredVelocityWorld.y = 0.0f;
+
+        if (desiredVelocityWorld.magnitude > maxHorizontalSpeedMS)
+        {
+            desiredVelocityWorld =
+                desiredVelocityWorld.normalized * maxHorizontalSpeedMS;
+        }
+
+        float yawForBody = useAquaLocYawForBodyFrame
+            ? estimatedYawDeg
+            : transform.eulerAngles.y;
+
+        Quaternion yawRotation = Quaternion.Euler(0.0f, yawForBody, 0.0f);
+        desiredVelocityBody =
+            Quaternion.Inverse(yawRotation) * desiredVelocityWorld;
+
+        float maxSpeed =
+            Mathf.Max(0.1f, controller.maxManualHorizontalSpeedMS);
+
+        float desiredForwardMS =
+            controller.forwardVelocityAxisSign * desiredVelocityBody.z;
+
+        float desiredRightMS =
+            controller.rightVelocityAxisSign * desiredVelocityBody.x;
+
+        rawCommandForwardRightYawAlt = new Vector4(
+            Mathf.Clamp(desiredForwardMS / maxSpeed, -maxCommandMagnitude, maxCommandMagnitude),
+            Mathf.Clamp(desiredRightMS / maxSpeed, -maxCommandMagnitude, maxCommandMagnitude),
+            0.0f,
+            0.0f
+        );
+
+        float commandAlpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, commandResponse) * dt);
+
+        filteredCommandForwardRightYawAlt =
+            Vector4.Lerp(
+                filteredCommandForwardRightYawAlt,
+                rawCommandForwardRightYawAlt,
+                commandAlpha
+            );
+
+        targetReached =
+            distanceToTargetM < positionArrivalRadiusM &&
+            horizontalSpeedMS < velocityArrivalThresholdMS;
+    }
+
+    private void CacheAndSuppressManualInput()
+    {
+        if (!suppressManualUdpInputWhenActive || udpReceiver == null)
+        {
+            return;
+        }
+
+        if (!udpStateCached)
+        {
+            udpWasEnabledBeforeSuppression = udpReceiver.enabled;
+            udpStateCached = true;
+        }
+
+        if (udpReceiver.enabled)
+        {
+            udpReceiver.enabled = false;
+        }
+    }
+
+    private void ReleaseAutonomousControl()
+    {
+        targetInitialized = false;
+        horizontalIntegralWorld = Vector3.zero;
+        disturbanceVelocityEstimateWorld = Vector3.zero;
+        rawCommandForwardRightYawAlt = Vector4.zero;
+        filteredCommandForwardRightYawAlt = Vector4.zero;
+
+        if (controller != null)
+        {
+            controller.ClearExternalCommand();
+        }
+
+        if (udpReceiver != null && udpStateCached)
+        {
+            udpReceiver.enabled = udpWasEnabledBeforeSuppression;
+            udpStateCached = false;
+        }
+    }
+
+    [ContextMenu("Set Target To Current AquaLoc Estimate")]
+    public void SetTargetToCurrentAquaLocEstimate()
+    {
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            targetPositionWorld = aquaLoc.estimatedPositionWorld;
+            targetYawDeg = holdYawAtActivation
+                ? aquaLoc.estimatedYawDeg
+                : targetYawDeg;
+        }
+        else
+        {
+            targetPositionWorld = transform.position;
+            targetYawDeg = transform.eulerAngles.y;
+        }
+
+        horizontalIntegralWorld = Vector3.zero;
+        disturbanceVelocityEstimateWorld = Vector3.zero;
+        targetInitialized = true;
+    }
+
+    [ContextMenu("Enable Hold Current Position")]
+    public void EnableHoldCurrentPosition()
+    {
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.HoldCurrent;
+    }
+
+    [ContextMenu("Set Target 3m Forward")]
+    public void SetTargetThreeMetersForward()
+    {
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            float yaw = aquaLoc.estimatedYawDeg;
+            Vector3 forward =
+                Quaternion.Euler(0.0f, yaw, 0.0f) * Vector3.forward;
+
+            targetPositionWorld =
+                aquaLoc.estimatedPositionWorld + forward * 3.0f;
+
+            targetYawDeg = yaw;
+        }
+        else
+        {
+            targetPositionWorld =
+                transform.position + transform.forward * 3.0f;
+
+            targetYawDeg = transform.eulerAngles.y;
+        }
+
+        targetInitialized = true;
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.GoToTarget;
+    }
+
+    [ContextMenu("Land On Water At Target")]
+    public void LandOnWaterAtTarget()
+    {
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.LandOnWaterAtTarget;
+    }
+
+    [ContextMenu("Disable AquaHold")]
+    public void DisableAquaHold()
+    {
+        enableGuidance = false;
+        guidanceMode = GuidanceMode.Disabled;
+        ReleaseAutonomousControl();
+    }
+
+    private void OnDisable()
+    {
+        ReleaseAutonomousControl();
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(targetPositionWorld, 0.35f);
+        Gizmos.DrawLine(transform.position, targetPositionWorld);
+
+        Gizmos.color = targetReached ? Color.green : Color.yellow;
+        Gizmos.DrawWireSphere(targetPositionWorld, positionArrivalRadiusM);
+    }
+}

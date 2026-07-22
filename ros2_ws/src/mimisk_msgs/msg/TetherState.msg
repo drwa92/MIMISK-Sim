@@ -1,0 +1,14 @@
+std_msgs/Header header
+string unified_state
+string low_level_state
+float64 deployed_length_m
+float64 target_length_m
+float64 winch_rate_m_s
+float64 straight_distance_m
+float64 slack_m
+float64 stretch_m
+float64 tension_n
+geometry_msgs/Vector3 tether_start
+geometry_msgs/Vector3 tether_end
+bool drone_motion_allowed
+bool safe_to_deploy

@@ -1,0 +1,221 @@
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+
+public static class MIMISKDroneCoreTetherSetup
+{
+    [MenuItem("MIMISK/Drone/Tether/Setup Phase 3 Core Tether Manager")]
+    public static void SetupTetherManager()
+    {
+        GameObject drone = Selection.activeGameObject;
+
+        if (drone == null || drone.GetComponent<Rigidbody>() == null)
+        {
+            drone = GameObject.Find("Drone");
+        }
+
+        if (drone == null)
+        {
+            Debug.LogError("[MIMISK] Could not find Drone root.");
+            return;
+        }
+
+        MIMISKDroneCoreTetherManager tether =
+            drone.GetComponent<MIMISKDroneCoreTetherManager>();
+
+        if (tether == null)
+        {
+            tether = drone.AddComponent<MIMISKDroneCoreTetherManager>();
+        }
+
+        tether.missionManager =
+            drone.GetComponent<MIMISKDroneCoreMissionManager>();
+
+        tether.flightManager =
+            drone.GetComponent<MIMISKDroneCoreFlightModeManager>();
+
+        tether.surfaceBuoyancy =
+            drone.GetComponent<MIMISKDroneSurfaceBuoyancy>();
+
+        tether.droneRigidbody =
+            drone.GetComponent<Rigidbody>();
+
+        tether.winchPoint =
+            FindDeepChild(drone.transform, "WinchPoint");
+
+        tether.tetherAnchor =
+            FindDeepChild(drone.transform, "TetherAnchor");
+
+        tether.fairleadLineStart =
+            FindDeepChild(drone.transform, "WinchFairlead_for_Unity_LineRenderer_Start");
+
+        tether.movingTetherEndVisual =
+            FindDeepChild(drone.transform, "small_dark_open_deployment_hook_for_miniROV");
+
+        tether.staticShortDeploymentCableMesh =
+            FindDeepChild(drone.transform, "real_mesh_short_yellow_deployment_cable_to_hook");
+
+        tether.miniRovCarrySlot =
+            FindDeepChild(drone.transform, "MiniROV_CarrySlot");
+
+        tether.winchSpoolPivot =
+            FindDeepChild(drone.transform, "Winch_Reel_spin_pivot_Unity_rotate_local_X");
+
+        if (tether.winchSpoolPivot == null)
+        {
+            tether.winchSpoolPivot =
+                FindDeepChild(drone.transform, "centered_winch_spool_dark_core_inside_integrated_bracket");
+        }
+
+        tether.leftCheekPlate =
+            FindDeepChild(drone.transform, "centered_winch_left_rotating_cheek_plate");
+
+        tether.rightCheekPlate =
+            FindDeepChild(drone.transform, "centered_winch_right_rotating_cheek_plate");
+
+        Transform lineObject =
+            FindDeepChild(drone.transform, "TetherLine");
+
+        if (lineObject == null)
+        {
+            GameObject tetherSystem = FindChildGameObject(drone.transform, "TetherSystem");
+
+            GameObject lineGo = new GameObject("TetherLine");
+
+            if (tetherSystem != null)
+            {
+                lineGo.transform.SetParent(tetherSystem.transform, false);
+            }
+            else
+            {
+                lineGo.transform.SetParent(drone.transform, false);
+            }
+
+            lineObject = lineGo.transform;
+        }
+
+        LineRenderer lr =
+            lineObject.GetComponent<LineRenderer>();
+
+        if (lr == null)
+        {
+            lr = lineObject.gameObject.AddComponent<LineRenderer>();
+        }
+
+        lr.positionCount = 16;
+        lr.widthMultiplier = 0.018f;
+        lr.useWorldSpace = true;
+
+        if (lr.sharedMaterial == null)
+        {
+            Shader shader = Shader.Find("Sprites/Default");
+
+            if (shader != null)
+            {
+                Material mat = new Material(shader);
+                mat.color = new Color(1.0f, 0.78f, 0.05f, 1.0f);
+                lr.sharedMaterial = mat;
+            }
+        }
+
+        tether.tetherLineRenderer = lr;
+
+        tether.tetherSystemEnabled = true;
+        tether.requireSurfaceStable = true;
+        tether.allowManualDeploymentWhenSurfaceStable = true;
+
+        tether.minimumLengthM = 0.15f;
+        tether.maximumLengthM = 12.0f;
+        tether.targetDeployLengthM = 3.0f;
+        tether.payoutSpeedMS = 0.25f;
+        tether.recoverySpeedMS = 0.30f;
+
+        tether.useVirtualEndpointWhenNoMiniRov = true;
+        tether.moveHookVisualWithTether = true;
+        tether.hideStaticShortCableMeshWhenDynamic = true;
+
+        tether.enableTetherForceWhenMiniRovAttached = true;
+        tether.tetherStiffnessNPerM = 45.0f;
+        tether.tetherDampingNPerMS = 8.0f;
+        tether.maximumSafeTensionN = 25.0f;
+
+        tether.lineSegments = 16;
+        tether.tetherLineWidthM = 0.018f;
+        tether.slackSagScale = 0.25f;
+        tether.maxSagM = 0.60f;
+
+        tether.localWinchSpinAxis = Vector3.right;
+        tether.spoolRadiusM = 0.055f;
+        tether.visualSpinSign = 1.0f;
+
+        EditorUtility.SetDirty(tether);
+        EditorUtility.SetDirty(lr);
+
+        MIMISKDroneCoreTetherLogger logger =
+            drone.GetComponent<MIMISKDroneCoreTetherLogger>();
+
+        if (logger == null)
+        {
+            logger = drone.AddComponent<MIMISKDroneCoreTetherLogger>();
+        }
+
+        logger.tether = tether;
+        logger.missionManager = tether.missionManager;
+        logger.flightManager = tether.flightManager;
+        logger.surfaceBuoyancy = tether.surfaceBuoyancy;
+        logger.enableLogging = true;
+        logger.logHz = 50.0f;
+        logger.flushEveryLine = false;
+
+        EditorUtility.SetDirty(logger);
+
+        MIMISKDroneCoreMissionManager mission =
+            drone.GetComponent<MIMISKDroneCoreMissionManager>();
+
+        if (mission != null)
+        {
+            mission.holdAtReadyForTetherDeployment = true;
+            EditorUtility.SetDirty(mission);
+        }
+
+        EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+        AssetDatabase.SaveAssets();
+
+        Debug.Log(
+            "[MIMISK] Phase 3 tether manager configured. " +
+            "Press U to deploy, R to recover, K to stop, F to reset fault."
+        );
+    }
+
+    private static Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static GameObject FindChildGameObject(Transform root, string childName)
+    {
+        Transform t = FindDeepChild(root, childName);
+        return t != null ? t.gameObject : null;
+    }
+}

@@ -1,0 +1,456 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVMissionManager : MonoBehaviour
+{
+    public enum MiniROVMissionState
+    {
+        Idle,
+        Ready,
+        Starting,
+        RunningTrajectory,
+        ReturningToRecoveryPoint,
+        RecoveryReady,
+        Completed,
+        Fault
+    }
+
+    [Header("References")]
+    public MIMISKMiniROVModule miniRovModule;
+    public MIMISKMiniROVTrajectoryPlanner trajectoryPlanner;
+    public MIMISKMiniROVCoreController coreController;
+
+    public Rigidbody miniRovRigidbody;
+    public Transform miniRovRoot;
+    public Transform rovTetherAnchor;
+
+    [Header("Mission")]
+    public bool missionEnabled = true;
+    public bool allowStandaloneKeyboard = false;
+    public Key startMissionKey = Key.M;
+    public Key stopMissionKey = Key.N;
+
+    [Tooltip("If the ROV is still cable-owned, release it before starting the mission.")]
+    public bool releaseToWorldOnStart = true;
+
+    [Tooltip("Trajectory origin is the recovery point captured by the communication bridge.")]
+    public bool useRecoveryPointAsMissionOrigin = true;
+
+    [Header("Completion")]
+    public float pathCompleteRadiusM = 0.35f;
+    public float recoveryRadiusM = 0.45f;
+    public float lowSpeedThresholdMS = 0.20f;
+    public float holdAtRecoverySeconds = 1.0f;
+
+    [Header("Runtime")]
+    public MiniROVMissionState missionState = MiniROVMissionState.Idle;
+    public bool missionActive;
+    public bool recoveryReady;
+
+    public Vector3 missionOriginWorld;
+    public Vector3 recoveryPointWorld;
+    public MIMISKMiniROVReference activeReference;
+
+    public float missionTimerS;
+    public float recoveryHoldTimerS;
+    public float distanceToReferenceM;
+    public float distanceToRecoveryM;
+
+    public string lastEvent = "idle";
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        LoadTrajectory();
+    }
+
+    private void Update()
+    {
+        if (!allowStandaloneKeyboard || Keyboard.current == null)
+        {
+            return;
+        }
+
+        if (Keyboard.current[startMissionKey].wasPressedThisFrame)
+        {
+            StartMissionStandalone();
+        }
+
+        if (Keyboard.current[stopMissionKey].wasPressedThisFrame)
+        {
+            StopMissionAndSetRecoveryReady();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!missionEnabled || !missionActive)
+        {
+            return;
+        }
+
+        if (missionState == MiniROVMissionState.RunningTrajectory)
+        {
+            UpdateTrajectoryMission(Time.fixedDeltaTime);
+        }
+        else if (missionState == MiniROVMissionState.ReturningToRecoveryPoint)
+        {
+            UpdateReturnToRecovery(Time.fixedDeltaTime);
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (miniRovModule == null)
+        {
+            miniRovModule = GetComponent<MIMISKMiniROVModule>();
+        }
+
+        if (trajectoryPlanner == null)
+        {
+            trajectoryPlanner = GetComponent<MIMISKMiniROVTrajectoryPlanner>();
+        }
+
+        if (trajectoryPlanner == null)
+        {
+            trajectoryPlanner = gameObject.AddComponent<MIMISKMiniROVTrajectoryPlanner>();
+        }
+
+        if (coreController == null)
+        {
+            coreController = GetComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (coreController == null)
+        {
+            coreController = gameObject.AddComponent<MIMISKMiniROVCoreController>();
+        }
+
+        if (miniRovRigidbody == null)
+        {
+            miniRovRigidbody = GetComponent<Rigidbody>();
+        }
+
+        if (miniRovRoot == null)
+        {
+            miniRovRoot = transform;
+        }
+
+        if (rovTetherAnchor == null)
+        {
+            rovTetherAnchor = FindDeepChild(transform, "ROV_TetherAnchor");
+        }
+
+        if (rovTetherAnchor == null)
+        {
+            rovTetherAnchor = FindDeepChild(transform, "MiniROV_TetherPoint");
+        }
+
+        if (rovTetherAnchor == null)
+        {
+            rovTetherAnchor = FindDeepChild(transform, "TetherPoint");
+        }
+    }
+
+    [ContextMenu("Load Trajectory")]
+    public void LoadTrajectory()
+    {
+        AutoFindReferences();
+
+        if (trajectoryPlanner != null)
+        {
+            trajectoryPlanner.LoadTrajectory();
+
+            missionState =
+                trajectoryPlanner.trajectoryLoaded
+                    ? MiniROVMissionState.Ready
+                    : MiniROVMissionState.Idle;
+
+            lastEvent =
+                trajectoryPlanner.lastEvent;
+        }
+    }
+
+    public bool CanStartMission()
+    {
+        if (!missionEnabled)
+        {
+            lastEvent = "cannot_start_mission_disabled";
+            return false;
+        }
+
+        if (missionActive)
+        {
+            lastEvent = "cannot_start_mission_already_active";
+            return false;
+        }
+
+        AutoFindReferences();
+
+        if (trajectoryPlanner == null)
+        {
+            lastEvent = "cannot_start_missing_trajectory_planner";
+            return false;
+        }
+
+        if (!trajectoryPlanner.IsReady())
+        {
+            lastEvent = "cannot_start_trajectory_not_ready_" + trajectoryPlanner.lastEvent;
+            return false;
+        }
+
+        if (coreController == null)
+        {
+            lastEvent = "cannot_start_missing_core_controller";
+            return false;
+        }
+
+        if (miniRovRigidbody == null)
+        {
+            lastEvent = "cannot_start_missing_rigidbody";
+            return false;
+        }
+
+        return true;
+    }
+
+    [ContextMenu("Start Mission Standalone")]
+    public void StartMissionStandalone()
+    {
+        Vector3 recovery =
+            rovTetherAnchor != null
+                ? rovTetherAnchor.position
+                : transform.position;
+
+        StartMissionFromBridge(recovery);
+    }
+
+    public void StartMissionFromBridge(Vector3 recoveryPoint)
+    {
+        AutoFindReferences();
+
+        if (!CanStartMission())
+        {
+            missionState = MiniROVMissionState.Fault;
+            missionActive = false;
+            return;
+        }
+
+        recoveryPointWorld = recoveryPoint;
+
+        missionOriginWorld =
+            useRecoveryPointAsMissionOrigin
+                ? recoveryPointWorld
+                : transform.position;
+
+        missionTimerS = 0.0f;
+        recoveryHoldTimerS = 0.0f;
+        recoveryReady = false;
+        missionActive = true;
+
+        missionState = MiniROVMissionState.Starting;
+
+        if (releaseToWorldOnStart && miniRovModule != null)
+        {
+            miniRovModule.ReleaseToWorldPassiveDynamic();
+        }
+
+        coreController.ActivateUnityNativeBackend();
+
+        missionState = MiniROVMissionState.RunningTrajectory;
+        lastEvent = "mission_started_using_planner_and_core_controller";
+
+        Debug.Log("[MIMISK] MiniROV mission started: trajectory planner + core controller.");
+    }
+
+    private void UpdateTrajectoryMission(float dt)
+    {
+        missionTimerS += dt;
+
+        activeReference =
+            trajectoryPlanner.Evaluate(
+                missionTimerS,
+                missionOriginWorld
+            );
+
+        if (!activeReference.valid)
+        {
+            missionState = MiniROVMissionState.Fault;
+            missionActive = false;
+            lastEvent = "fault_invalid_reference";
+            coreController.ClearReferenceAndStop();
+            return;
+        }
+
+        coreController.SetReference(activeReference);
+
+        distanceToReferenceM =
+            Vector3.Distance(
+                miniRovRigidbody.position,
+                activeReference.positionWorld
+            );
+
+        if (trajectoryPlanner.IsComplete(missionTimerS) &&
+            distanceToReferenceM <= pathCompleteRadiusM)
+        {
+            missionState = MiniROVMissionState.ReturningToRecoveryPoint;
+            lastEvent = "trajectory_complete_returning_to_recovery";
+        }
+    }
+
+    private void UpdateReturnToRecovery(float dt)
+    {
+        activeReference =
+            trajectoryPlanner.MakeRecoveryReference(
+                recoveryPointWorld,
+                missionTimerS
+            );
+
+        coreController.SetReference(activeReference);
+
+        Vector3 p =
+            rovTetherAnchor != null
+                ? rovTetherAnchor.position
+                : miniRovRigidbody.position;
+
+        distanceToRecoveryM =
+            Vector3.Distance(
+                p,
+                recoveryPointWorld
+            );
+
+        float speed =
+            miniRovRigidbody != null
+                ? miniRovRigidbody.linearVelocity.magnitude
+                : 999.0f;
+
+        if (distanceToRecoveryM <= recoveryRadiusM &&
+            speed <= lowSpeedThresholdMS)
+        {
+            recoveryHoldTimerS += dt;
+        }
+        else
+        {
+            recoveryHoldTimerS = 0.0f;
+        }
+
+        if (recoveryHoldTimerS >= holdAtRecoverySeconds)
+        {
+            missionActive = false;
+            recoveryReady = true;
+            missionState = MiniROVMissionState.RecoveryReady;
+            coreController.ClearReferenceAndStop();
+
+            if (miniRovRigidbody != null)
+            {
+                miniRovRigidbody.linearVelocity = Vector3.zero;
+                miniRovRigidbody.angularVelocity = Vector3.zero;
+            }
+
+            lastEvent = "recovery_ready";
+            Debug.Log("[MIMISK] MiniROV mission recovery-ready.");
+        }
+    }
+
+    [ContextMenu("Stop Mission And Set Recovery Ready")]
+    public void StopMissionAndSetRecoveryReady()
+    {
+        missionActive = false;
+        recoveryReady = true;
+        missionState = MiniROVMissionState.RecoveryReady;
+
+        if (coreController != null)
+        {
+            coreController.ClearReferenceAndStop();
+        }
+
+        if (miniRovRigidbody != null)
+        {
+            miniRovRigidbody.linearVelocity = Vector3.zero;
+            miniRovRigidbody.angularVelocity = Vector3.zero;
+        }
+
+        lastEvent = "manual_stop_recovery_ready";
+    }
+
+    public void PrepareForRecovery()
+    {
+        missionActive = false;
+        recoveryReady = true;
+        missionState = MiniROVMissionState.RecoveryReady;
+
+        if (coreController != null)
+        {
+            coreController.ClearReferenceAndStop();
+        }
+
+        if (miniRovRigidbody != null)
+        {
+            miniRovRigidbody.linearVelocity = Vector3.zero;
+            miniRovRigidbody.angularVelocity = Vector3.zero;
+        }
+
+        if (miniRovModule != null)
+        {
+            miniRovModule.SetPassiveKinematic();
+        }
+
+        lastEvent = "prepared_for_recovery_by_bridge";
+    }
+
+    [ContextMenu("Reset Mission")]
+    public void ResetMission()
+    {
+        missionActive = false;
+        recoveryReady = false;
+        missionTimerS = 0.0f;
+        recoveryHoldTimerS = 0.0f;
+        distanceToReferenceM = 0.0f;
+        distanceToRecoveryM = 999.0f;
+        activeReference = new MIMISKMiniROVReference();
+
+        if (coreController != null)
+        {
+            coreController.ClearReferenceAndStop();
+        }
+
+        missionState =
+            trajectoryPlanner != null && trajectoryPlanner.IsReady()
+                ? MiniROVMissionState.Ready
+                : MiniROVMissionState.Idle;
+
+        lastEvent = "mission_reset";
+    }
+
+    private Transform FindDeepChild(Transform root, string childName)
+    {
+        if (root == null)
+        {
+            return null;
+        }
+
+        if (root.name == childName)
+        {
+            return root;
+        }
+
+        for (int i = 0; i < root.childCount; i++)
+        {
+            Transform found =
+                FindDeepChild(root.GetChild(i), childName);
+
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+}

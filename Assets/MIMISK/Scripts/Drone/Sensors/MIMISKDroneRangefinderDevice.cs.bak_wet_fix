@@ -1,0 +1,349 @@
+using UnityEngine;
+
+public class MIMISKDroneRangefinderDevice : MonoBehaviour
+{
+    public enum RangefinderModel
+    {
+        TFminiS,
+        RadarAltimeter
+    }
+
+    public enum ReturnSource
+    {
+        None,
+        WaterPlane,
+        PhysicsCollider
+    }
+
+    [Header("Device")]
+    public RangefinderModel rangefinderModel = RangefinderModel.TFminiS;
+    public string deviceName = "TFmini-S Downward Rangefinder";
+    public Transform sensorFrame;
+    public Rigidbody droneRigidbody;
+
+    [Header("Sampling")]
+    public float sampleRateHz = 50.0f;
+    public bool enableNoise = true;
+    public bool enableBias = true;
+
+    [Header("Ray Direction")]
+    public Vector3 localRayDirection = Vector3.down;
+
+    [Header("Range Limits")]
+    public float minRangeM = 0.10f;
+    public float maxRangeM = 12.0f;
+
+    [Header("Water Surface Model")]
+    public bool detectWaterPlane = true;
+    public float waterLevelY = 0.0f;
+    public bool simulateWaterReflectivityDropout = false;
+    [Range(0.0f, 1.0f)] public float waterReturnProbability = 0.98f;
+
+    [Header("Physics Raycast")]
+    public bool usePhysicsRaycast = true;
+    public LayerMask raycastMask = ~0;
+
+    [Header("Noise / Bias")]
+    public float rangeNoiseStdM = 0.03f;
+    public float rangeBiasM = 0.0f;
+    public float rangeBiasRandomWalkMPerSqrtS = 0.0005f;
+
+    [Header("Signal Quality")]
+    [Range(0.0f, 1.0f)] public float baseSignalStrength = 0.85f;
+    public float signalNoiseStd = 0.03f;
+
+    [Header("Outputs")]
+    public bool hasNewSample;
+    public bool validReturn;
+    public ReturnSource returnSource;
+    public float rangeM;
+    public float verticalDistanceM;
+    public float signalStrength;
+    public Vector3 hitPointWorld;
+    public Vector3 hitNormalWorld;
+
+    [Header("Truth Debug")]
+    public bool truthHasReturn;
+    public ReturnSource truthReturnSource;
+    public float truthRangeM;
+    public float truthVerticalDistanceM;
+    public Vector3 rayOriginWorld;
+    public Vector3 rayDirectionWorld;
+
+    private float sampleTimer;
+
+    private void Reset()
+    {
+        AutoFindReferences();
+        ConfigureModelDefaults();
+    }
+
+    private void Awake()
+    {
+        AutoFindReferences();
+        ConfigureModelDefaults();
+    }
+
+    private void FixedUpdate()
+    {
+        hasNewSample = false;
+
+        sampleTimer += Time.fixedDeltaTime;
+
+        float period = 1.0f / Mathf.Max(sampleRateHz, 1.0f);
+
+        if (sampleTimer >= period)
+        {
+            sampleTimer -= period;
+            Sample(period);
+        }
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (sensorFrame == null)
+        {
+            sensorFrame = transform;
+        }
+
+        if (droneRigidbody == null)
+        {
+            droneRigidbody = GetComponentInParent<Rigidbody>();
+        }
+    }
+
+    [ContextMenu("Configure Model Defaults")]
+    public void ConfigureModelDefaults()
+    {
+        if (rangefinderModel == RangefinderModel.TFminiS)
+        {
+            deviceName = "TFmini-S Downward Rangefinder";
+            minRangeM = 0.10f;
+            maxRangeM = 12.0f;
+            sampleRateHz = 50.0f;
+            rangeNoiseStdM = 0.03f;
+        }
+        else
+        {
+            deviceName = "Short-Range Radar Altimeter";
+            minRangeM = 0.05f;
+            maxRangeM = 20.0f;
+            sampleRateHz = 50.0f;
+            rangeNoiseStdM = 0.02f;
+        }
+    }
+
+    private void Sample(float dt)
+    {
+        if (sensorFrame == null)
+        {
+            return;
+        }
+
+        rayOriginWorld = sensorFrame.position;
+        rayDirectionWorld = sensorFrame.TransformDirection(localRayDirection.normalized);
+
+        truthHasReturn = FindTruthReturn(
+            rayOriginWorld,
+            rayDirectionWorld,
+            out truthRangeM,
+            out truthVerticalDistanceM,
+            out truthReturnSource,
+            out hitPointWorld,
+            out hitNormalWorld
+        );
+
+        validReturn = false;
+        returnSource = ReturnSource.None;
+        rangeM = maxRangeM;
+        verticalDistanceM = maxRangeM;
+        signalStrength = 0.0f;
+
+        if (!truthHasReturn)
+        {
+            hasNewSample = true;
+            return;
+        }
+
+        if (truthRangeM < minRangeM || truthRangeM > maxRangeM)
+        {
+            hasNewSample = true;
+            return;
+        }
+
+        if (truthReturnSource == ReturnSource.WaterPlane &&
+            simulateWaterReflectivityDropout &&
+            Random.value > waterReturnProbability)
+        {
+            hasNewSample = true;
+            return;
+        }
+
+        if (enableBias && dt > 0.0f)
+        {
+            rangeBiasM += Gaussian(0.0f, rangeBiasRandomWalkMPerSqrtS * Mathf.Sqrt(dt));
+        }
+
+        float measuredRange = truthRangeM;
+
+        if (enableBias)
+        {
+            measuredRange += rangeBiasM;
+        }
+
+        if (enableNoise)
+        {
+            measuredRange += Gaussian(0.0f, rangeNoiseStdM);
+        }
+
+        measuredRange = Mathf.Clamp(measuredRange, minRangeM, maxRangeM);
+
+        rangeM = measuredRange;
+
+        float verticalFactor = Mathf.Abs(Vector3.Dot(rayDirectionWorld.normalized, Vector3.down));
+        verticalFactor = Mathf.Max(0.05f, verticalFactor);
+
+        verticalDistanceM = measuredRange * verticalFactor;
+
+        float normalizedRange = Mathf.Clamp01(measuredRange / maxRangeM);
+        signalStrength = baseSignalStrength * (1.0f - 0.45f * normalizedRange);
+
+        if (enableNoise)
+        {
+            signalStrength += Gaussian(0.0f, signalNoiseStd);
+        }
+
+        signalStrength = Mathf.Clamp01(signalStrength);
+
+        validReturn = true;
+        returnSource = truthReturnSource;
+        hasNewSample = true;
+    }
+
+    private bool FindTruthReturn(
+        Vector3 origin,
+        Vector3 direction,
+        out float bestRange,
+        out float verticalDistance,
+        out ReturnSource source,
+        out Vector3 bestPoint,
+        out Vector3 bestNormal)
+    {
+        bestRange = float.PositiveInfinity;
+        verticalDistance = float.PositiveInfinity;
+        source = ReturnSource.None;
+        bestPoint = Vector3.zero;
+        bestNormal = Vector3.up;
+
+        bool found = false;
+
+        if (detectWaterPlane && Mathf.Abs(direction.y) > 0.0001f)
+        {
+            float t = (waterLevelY - origin.y) / direction.y;
+
+            if (t > 0.0f && t < bestRange)
+            {
+                bestRange = t;
+                bestPoint = origin + direction * t;
+                bestNormal = Vector3.up;
+                source = ReturnSource.WaterPlane;
+                found = true;
+            }
+        }
+
+        if (usePhysicsRaycast)
+        {
+            RaycastHit[] hits = Physics.RaycastAll(
+                origin,
+                direction,
+                maxRangeM,
+                raycastMask,
+                QueryTriggerInteraction.Ignore
+            );
+
+            foreach (RaycastHit hit in hits)
+            {
+                if (hit.distance <= 0.0f)
+                {
+                    continue;
+                }
+
+                if (IsOwnCollider(hit.collider))
+                {
+                    continue;
+                }
+
+                if (hit.distance < bestRange)
+                {
+                    bestRange = hit.distance;
+                    bestPoint = hit.point;
+                    bestNormal = hit.normal;
+                    source = ReturnSource.PhysicsCollider;
+                    found = true;
+                }
+            }
+        }
+
+        if (!found)
+        {
+            bestRange = maxRangeM;
+            verticalDistance = maxRangeM;
+            return false;
+        }
+
+        float verticalFactor = Mathf.Abs(Vector3.Dot(direction.normalized, Vector3.down));
+        verticalFactor = Mathf.Max(0.05f, verticalFactor);
+
+        verticalDistance = bestRange * verticalFactor;
+
+        return true;
+    }
+
+    private bool IsOwnCollider(Collider col)
+    {
+        if (col == null || droneRigidbody == null)
+        {
+            return false;
+        }
+
+        if (col.attachedRigidbody == droneRigidbody)
+        {
+            return true;
+        }
+
+        if (col.transform.IsChildOf(droneRigidbody.transform))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private float Gaussian(float mean, float std)
+    {
+        float u1 = Mathf.Clamp(Random.value, 1e-6f, 1.0f);
+        float u2 = Mathf.Clamp(Random.value, 1e-6f, 1.0f);
+
+        float n =
+            Mathf.Sqrt(-2.0f * Mathf.Log(u1)) *
+            Mathf.Sin(2.0f * Mathf.PI * u2);
+
+        return mean + std * n;
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Transform frame = sensorFrame != null ? sensorFrame : transform;
+        Vector3 origin = frame.position;
+        Vector3 dir = frame.TransformDirection(localRayDirection.normalized);
+
+        Gizmos.color = validReturn ? Color.green : Color.red;
+        Gizmos.DrawLine(origin, origin + dir * Mathf.Min(rangeM, maxRangeM));
+
+        if (validReturn)
+        {
+            Gizmos.DrawSphere(hitPointWorld, 0.04f);
+        }
+    }
+}

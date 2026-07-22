@@ -1,0 +1,721 @@
+using System;
+using System.Reflection;
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVCoreController : MonoBehaviour
+{
+    public enum BackendMode
+    {
+        UnityNative,
+        ESP_Raspberry_HIL
+    }
+
+    [Header("References")]
+    public Rigidbody rb;
+    public ControlManager controlManager;
+
+    [Tooltip("Optional. Found by name/type. Used through reflection so the stack can still compile if the script is absent.")]
+    public Behaviour ballastDepthController;
+
+    public Behaviour unityVirtualESP32;
+    public Behaviour mimiskWaterInteraction;
+    public Behaviour simpleRovBuoyancy;
+    public Behaviour sensorManager;
+
+    [Header("Backend")]
+    public BackendMode backendMode = BackendMode.UnityNative;
+    public bool controllerEnabled = true;
+
+    [Tooltip("Unity-native autonomy injects motor frames directly into ControlManager.")]
+    public bool injectMotorFramesToControlManager = true;
+
+    [Tooltip("Disable ESP/Raspberry bridge during Unity-native autonomy.")]
+    public bool disableESPBridgeInUnityNative = true;
+
+    [Tooltip("Disable ControlManager serial reader by setting autoOpenOnStart false.")]
+    public bool disableControlManagerSerialReaderInUnityNative = true;
+
+    [Header("Reference")]
+    public bool hasReference;
+    public MIMISKMiniROVReference currentReference;
+
+    [Header("Horizontal Control")]
+    public float surgeKp = 0.85f;
+    public float surgeKd = 1.15f;
+    public float maxSurgeCommand = 0.70f;
+
+    public float yawKp = 0.018f;
+    public float yawKd = 0.010f;
+    public float maxYawCommand = 0.55f;
+
+    [Tooltip("Maximum signed PWM command sent to each thruster.")]
+    [Range(0, 255)]
+    public int maxThrusterPwm = 170;
+
+    [Tooltip("If yaw turns the wrong way, flip this.")]
+    public bool invertYawDifferential = false;
+
+    [Tooltip("If forward motion is reversed, flip this.")]
+    public bool invertSurge = false;
+
+    [Header("Bearing Guidance")]
+    [Tooltip("If yaw error is larger than this, surge is strongly reduced so the ROV turns first.")]
+    public float yawErrorStopSurgeDeg = 75.0f;
+
+    [Tooltip("Surge command reaches full scale at this horizontal distance.")]
+    public float distanceForFullSurgeM = 1.2f;
+
+    [Tooltip("Minimum surge fraction while turning. Set small but nonzero.")]
+    public float minimumSurgeWhileTurning = 0.05f;
+
+    [Tooltip("Low-pass smoothing rate for motor commands.")]
+    public float commandSmoothingRate = 8.0f;
+
+    [Tooltip("Use bearing-to-target as yaw reference unless trajectory yaw is explicitly provided.")]
+    public bool preferBearingYawToPathYaw = true;
+
+    [Header("Depth Control")]
+    public bool useBallastDepthController = true;
+    public float defaultWaterLevel = 0.0f;
+
+    [Tooltip("If no depth controller exists, no vertical force is applied. This keeps responsibilities clean.")]
+    public bool warnIfNoDepthController = true;
+
+    [Header("Runtime")]
+    public int leftThrusterCmd;
+    public int rightThrusterCmd;
+    public int dcPortCmd;
+    public int dcStarboardCmd;
+
+    [Header("Controller Diagnostics")]
+    public int smoothedLeftThrusterCmd;
+    public int smoothedRightThrusterCmd;
+    public float horizontalDistanceToReferenceM;
+    public float surgeAlignmentFactor;
+    public float targetYawDeg;
+    public bool commandNonZero;
+
+    public float surgeCommand;
+    public float yawCommand;
+    public float distanceToReferenceM;
+    public float yawErrorDeg;
+
+    public string lastEvent = "idle";
+
+    private MethodInfo injectMotorFrameMethod;
+    private FieldInfo controlManagerAutoOpenField;
+    private PropertyInfo controlManagerAutoOpenProperty;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void FixedUpdate()
+    {
+        if (!controllerEnabled)
+        {
+            return;
+        }
+
+        if (backendMode != BackendMode.UnityNative)
+        {
+            return;
+        }
+
+        if (!hasReference || !currentReference.valid)
+        {
+            SendMotorCommand(0, 0, 0, 0);
+            lastEvent = "no_reference_hold_zero_command";
+            return;
+        }
+
+        RunUnityNativeController(Time.fixedDeltaTime);
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+
+        if (controlManager == null)
+        {
+            controlManager = GetComponent<ControlManager>();
+        }
+
+        if (ballastDepthController == null)
+        {
+            ballastDepthController = FindBehaviourByTypeName("BallastDepthController");
+        }
+
+        if (unityVirtualESP32 == null)
+        {
+            unityVirtualESP32 = FindBehaviourByTypeName("UnityVirtualESP32");
+        }
+
+        if (mimiskWaterInteraction == null)
+        {
+            mimiskWaterInteraction = FindBehaviourByTypeName("MIMISKWaterInteraction");
+        }
+
+        if (simpleRovBuoyancy == null)
+        {
+            simpleRovBuoyancy = FindBehaviourByTypeName("SimpleROVBuoyancy");
+        }
+
+        if (sensorManager == null)
+        {
+            sensorManager = FindBehaviourByTypeName("SensorManager");
+        }
+
+        CacheReflection();
+    }
+
+    [ContextMenu("Activate Unity Native Backend")]
+    public void ActivateUnityNativeBackend()
+    {
+        AutoFindReferences();
+
+        backendMode = BackendMode.UnityNative;
+        controllerEnabled = true;
+
+        if (rb != null)
+        {
+            rb.isKinematic = false;
+            rb.useGravity = true;
+            rb.WakeUp();
+        }
+
+        if (controlManager != null)
+        {
+            controlManager.enabled = true;
+
+            if (disableControlManagerSerialReaderInUnityNative)
+            {
+                SetControlManagerAutoOpen(false);
+                InvokeControlManagerStopReaderIfAvailable();
+            }
+        }
+
+        if (disableESPBridgeInUnityNative && unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.enabled = false;
+        }
+
+        if (mimiskWaterInteraction != null)
+        {
+            mimiskWaterInteraction.enabled = true;
+        }
+
+        if (simpleRovBuoyancy != null)
+        {
+            simpleRovBuoyancy.enabled = true;
+        }
+
+        if (sensorManager != null)
+        {
+            sensorManager.enabled = false;
+        }
+
+        if (ballastDepthController != null && useBallastDepthController)
+        {
+            ballastDepthController.enabled = true;
+            SetBoolMember(ballastDepthController, "enableDepthHold", true);
+            SetBoolMember(ballastDepthController, "enableKeyboardTargetControl", false);
+        }
+
+        lastEvent = "unity_native_backend_active";
+    }
+
+    [ContextMenu("Activate ESP Raspberry HIL Backend")]
+    public void ActivateESPRaspberryBackend()
+    {
+        AutoFindReferences();
+
+        backendMode = BackendMode.ESP_Raspberry_HIL;
+        controllerEnabled = false;
+        hasReference = false;
+
+        if (controlManager != null)
+        {
+            controlManager.enabled = true;
+        }
+
+        if (unityVirtualESP32 != null)
+        {
+            unityVirtualESP32.enabled = true;
+        }
+
+        if (mimiskWaterInteraction != null)
+        {
+            mimiskWaterInteraction.enabled = true;
+        }
+
+        if (simpleRovBuoyancy != null)
+        {
+            simpleRovBuoyancy.enabled = true;
+        }
+
+        if (sensorManager != null)
+        {
+            sensorManager.enabled = false;
+        }
+
+        lastEvent = "esp_raspberry_hil_backend_active";
+    }
+
+
+    private void InvokeControlManagerStopReaderIfAvailable()
+    {
+        if (controlManager == null)
+        {
+            return;
+        }
+
+        MethodInfo stopReader =
+            controlManager.GetType().GetMethod(
+                "StopReader",
+                BindingFlags.Instance |
+                BindingFlags.Public |
+                BindingFlags.NonPublic
+            );
+
+        if (stopReader != null)
+        {
+            try
+            {
+                stopReader.Invoke(controlManager, null);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    public void SetReference(MIMISKMiniROVReference reference)
+    {
+        currentReference = reference;
+        hasReference = reference.valid;
+
+        if (reference.valid && useBallastDepthController)
+        {
+            SetDepthTarget(reference.depthMeters);
+        }
+    }
+
+    public void ClearReferenceAndStop()
+    {
+        hasReference = false;
+        currentReference = new MIMISKMiniROVReference();
+        SendMotorCommand(0, 0, 0, 0);
+        lastEvent = "reference_cleared_stop_command";
+    }
+
+    public void SetDepthTarget(float depthMeters)
+    {
+        if (ballastDepthController == null)
+        {
+            if (warnIfNoDepthController)
+            {
+                lastEvent = "missing_ballast_depth_controller_depth_target_ignored";
+            }
+
+            return;
+        }
+
+        ballastDepthController.enabled = true;
+        SetBoolMember(ballastDepthController, "enableDepthHold", true);
+        SetFloatMember(ballastDepthController, "targetDepthMeters", Mathf.Max(0.0f, depthMeters));
+        SetFloatMember(ballastDepthController, "waterLevel", defaultWaterLevel);
+    }
+
+    private void RunUnityNativeController(float dt)
+    {
+        if (rb == null || controlManager == null)
+        {
+            lastEvent = "missing_rigidbody_or_control_manager";
+            return;
+        }
+
+        Vector3 errorWorld =
+            currentReference.positionWorld - rb.position;
+
+        Vector3 horizontalError =
+            new Vector3(
+                errorWorld.x,
+                0.0f,
+                errorWorld.z
+            );
+
+        horizontalDistanceToReferenceM =
+            horizontalError.magnitude;
+
+        distanceToReferenceM =
+            errorWorld.magnitude;
+
+        Vector3 localVelocity =
+            transform.InverseTransformDirection(rb.linearVelocity);
+
+        float desiredYawDeg;
+
+        if (currentReference.hasYaw && !preferBearingYawToPathYaw)
+        {
+            desiredYawDeg = currentReference.yawDeg;
+        }
+        else if (horizontalError.sqrMagnitude > 0.0001f)
+        {
+            desiredYawDeg =
+                Mathf.Atan2(horizontalError.x, horizontalError.z) *
+                Mathf.Rad2Deg;
+        }
+        else
+        {
+            desiredYawDeg = transform.eulerAngles.y;
+        }
+
+        targetYawDeg =
+            desiredYawDeg;
+
+        float currentYawDeg =
+            transform.eulerAngles.y;
+
+        yawErrorDeg =
+            Mathf.DeltaAngle(
+                currentYawDeg,
+                desiredYawDeg
+            );
+
+        float yawRateDegS =
+            rb.angularVelocity.y * Mathf.Rad2Deg;
+
+        float yaw =
+            yawKp * yawErrorDeg -
+            yawKd * yawRateDegS;
+
+        yaw =
+            Mathf.Clamp(
+                yaw,
+                -Mathf.Abs(maxYawCommand),
+                Mathf.Abs(maxYawCommand)
+            );
+
+        if (invertYawDifferential)
+        {
+            yaw = -yaw;
+        }
+
+        float distanceScale =
+            Mathf.Clamp01(
+                horizontalDistanceToReferenceM /
+                Mathf.Max(0.05f, distanceForFullSurgeM)
+            );
+
+        float yawAbs =
+            Mathf.Abs(yawErrorDeg);
+
+        float alignment =
+            1.0f -
+            Mathf.Clamp01(
+                yawAbs /
+                Mathf.Max(1.0f, yawErrorStopSurgeDeg)
+            );
+
+        alignment =
+            Mathf.Clamp(
+                alignment,
+                minimumSurgeWhileTurning,
+                1.0f
+            );
+
+        surgeAlignmentFactor =
+            alignment;
+
+        // Forward speed damping uses body-frame forward velocity.
+        float surge =
+            surgeKp * distanceScale * alignment -
+            surgeKd * Mathf.Max(0.0f, localVelocity.z);
+
+        surge =
+            Mathf.Clamp(
+                surge,
+                -Mathf.Abs(maxSurgeCommand),
+                Mathf.Abs(maxSurgeCommand)
+            );
+
+        if (invertSurge)
+        {
+            surge = -surge;
+        }
+
+        surgeCommand = surge;
+        yawCommand = yaw;
+
+        float left =
+            surge - yaw;
+
+        float right =
+            surge + yaw;
+
+        left =
+            Mathf.Clamp(left, -1.0f, 1.0f);
+
+        right =
+            Mathf.Clamp(right, -1.0f, 1.0f);
+
+        int rawLeft =
+            Mathf.RoundToInt(left * maxThrusterPwm);
+
+        int rawRight =
+            Mathf.RoundToInt(right * maxThrusterPwm);
+
+        float alpha =
+            1.0f -
+            Mathf.Exp(
+                -Mathf.Max(0.1f, commandSmoothingRate) *
+                Mathf.Max(0.001f, dt)
+            );
+
+        smoothedLeftThrusterCmd =
+            Mathf.RoundToInt(
+                Mathf.Lerp(
+                    smoothedLeftThrusterCmd,
+                    rawLeft,
+                    alpha
+                )
+            );
+
+        smoothedRightThrusterCmd =
+            Mathf.RoundToInt(
+                Mathf.Lerp(
+                    smoothedRightThrusterCmd,
+                    rawRight,
+                    alpha
+                )
+            );
+
+        commandNonZero =
+            Mathf.Abs(smoothedLeftThrusterCmd) > 0 ||
+            Mathf.Abs(smoothedRightThrusterCmd) > 0 ||
+            Mathf.Abs(dcPortCmd) > 0 ||
+            Mathf.Abs(dcStarboardCmd) > 0;
+
+        SendMotorCommand(
+            smoothedLeftThrusterCmd,
+            smoothedRightThrusterCmd,
+            dcPortCmd,
+            dcStarboardCmd
+        );
+
+        lastEvent =
+            "tracking_bearing_distance_" +
+            horizontalDistanceToReferenceM.ToString("F2") +
+            "_yawerr_" +
+            yawErrorDeg.ToString("F1") +
+            "_cmdL_" +
+            smoothedLeftThrusterCmd +
+            "_cmdR_" +
+            smoothedRightThrusterCmd;
+    }
+
+    private float EstimateYawTowardReference(Vector3 errorWorld)
+    {
+        Vector3 horizontal =
+            new Vector3(
+                errorWorld.x,
+                0.0f,
+                errorWorld.z
+            );
+
+        if (horizontal.sqrMagnitude < 0.0001f)
+        {
+            return transform.eulerAngles.y;
+        }
+
+        return Mathf.Atan2(horizontal.x, horizontal.z) * Mathf.Rad2Deg;
+    }
+
+    private void SendMotorCommand(
+        int left,
+        int right,
+        int dcPort,
+        int dcStarboard)
+    {
+        leftThrusterCmd =
+            Mathf.Clamp(left, -255, 255);
+
+        rightThrusterCmd =
+            Mathf.Clamp(right, -255, 255);
+
+        dcPortCmd =
+            Mathf.Clamp(dcPort, -255, 255);
+
+        dcStarboardCmd =
+            Mathf.Clamp(dcStarboard, -255, 255);
+
+        if (!injectMotorFramesToControlManager || controlManager == null)
+        {
+            return;
+        }
+
+        CacheReflection();
+
+        if (injectMotorFrameMethod != null)
+        {
+            injectMotorFrameMethod.Invoke(
+                controlManager,
+                new object[]
+                {
+                    (short)leftThrusterCmd,
+                    (short)rightThrusterCmd,
+                    (short)dcPortCmd,
+                    (short)dcStarboardCmd
+                }
+            );
+        }
+    }
+
+    private void CacheReflection()
+    {
+        if (controlManager != null && injectMotorFrameMethod == null)
+        {
+            injectMotorFrameMethod =
+                controlManager.GetType().GetMethod(
+                    "InjectMotorFrame",
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+
+            controlManagerAutoOpenField =
+                controlManager.GetType().GetField(
+                    "autoOpenOnStart",
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+
+            controlManagerAutoOpenProperty =
+                controlManager.GetType().GetProperty(
+                    "autoOpenOnStart",
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+        }
+    }
+
+    private void SetControlManagerAutoOpen(bool value)
+    {
+        if (controlManager == null)
+        {
+            return;
+        }
+
+        CacheReflection();
+
+        if (controlManagerAutoOpenField != null &&
+            controlManagerAutoOpenField.FieldType == typeof(bool))
+        {
+            controlManagerAutoOpenField.SetValue(controlManager, value);
+            return;
+        }
+
+        if (controlManagerAutoOpenProperty != null &&
+            controlManagerAutoOpenProperty.PropertyType == typeof(bool) &&
+            controlManagerAutoOpenProperty.CanWrite)
+        {
+            controlManagerAutoOpenProperty.SetValue(controlManager, value, null);
+        }
+    }
+
+    private void SetBoolMember(
+        object target,
+        string name,
+        bool value)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        BindingFlags flags =
+            BindingFlags.Instance |
+            BindingFlags.Public |
+            BindingFlags.NonPublic;
+
+        FieldInfo f =
+            target.GetType().GetField(name, flags);
+
+        if (f != null && f.FieldType == typeof(bool))
+        {
+            f.SetValue(target, value);
+            return;
+        }
+
+        PropertyInfo p =
+            target.GetType().GetProperty(name, flags);
+
+        if (p != null &&
+            p.PropertyType == typeof(bool) &&
+            p.CanWrite)
+        {
+            p.SetValue(target, value, null);
+        }
+    }
+
+    private void SetFloatMember(
+        object target,
+        string name,
+        float value)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        BindingFlags flags =
+            BindingFlags.Instance |
+            BindingFlags.Public |
+            BindingFlags.NonPublic;
+
+        FieldInfo f =
+            target.GetType().GetField(name, flags);
+
+        if (f != null && f.FieldType == typeof(float))
+        {
+            f.SetValue(target, value);
+            return;
+        }
+
+        PropertyInfo p =
+            target.GetType().GetProperty(name, flags);
+
+        if (p != null &&
+            p.PropertyType == typeof(float) &&
+            p.CanWrite)
+        {
+            p.SetValue(target, value, null);
+        }
+    }
+
+    private Behaviour FindBehaviourByTypeName(string typeName)
+    {
+        Behaviour[] behaviours =
+            GetComponentsInChildren<Behaviour>(true);
+
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            if (behaviours[i] != null &&
+                behaviours[i].GetType().Name == typeName)
+            {
+                return behaviours[i];
+            }
+        }
+
+        return null;
+    }
+}

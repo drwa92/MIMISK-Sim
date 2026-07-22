@@ -1,0 +1,877 @@
+using UnityEngine;
+
+[RequireComponent(typeof(MIMISKDroneModelController))]
+public class MIMISKDroneAquaLocPositionHold : MonoBehaviour
+{
+    public enum GuidanceMode
+    {
+        Disabled,
+        HoldCurrent,
+        HoldTarget,
+        GoToTarget,
+        LandOnWaterAtTarget
+    }
+
+    public enum HoldState
+    {
+        Inactive,
+        CaptureBrake,
+        PrecisionHold,
+        GoToTarget,
+        LandAtTarget
+    }
+
+    [Header("References")]
+    public MIMISKDroneAquaLocEstimator aquaLoc;
+    public MIMISKDroneModelController controller;
+    public MIMISKDroneUdpGamepadReceiver udpReceiver;
+
+    [Header("Enable")]
+    public bool enableGuidance = false;
+    public GuidanceMode guidanceMode = GuidanceMode.Disabled;
+    public HoldState holdState = HoldState.Inactive;
+    public bool takeControlOfDrone = true;
+
+    [Tooltip("Keep OFF when using MIMISKDroneKeyboardStationKeeping. The keyboard script owns gamepad enable/disable.")]
+    public bool suppressManualUdpInputWhenActive = false;
+
+    [Header("Compatibility / Safety")]
+    public bool autoEnableWhenModeIsNotDisabled = false;
+    public bool initializeHoldTargetAutomatically = true;
+    public bool allowManualStickOverride = false;
+    public float manualOverrideThreshold = 0.22f;
+    public float manualOverrideHoldSeconds = 0.15f;
+    public bool switchToManualModeOnOverride = true;
+
+    [Header("Target")]
+    public Vector3 targetPositionWorld;
+    public float targetYawDeg;
+    public bool holdYawAtActivation = true;
+
+    [Header("Feedback Conditioning")]
+    public bool enableFeedbackSmoothing = true;
+    public float feedbackPositionResponse = 9.0f;
+    public float feedbackVelocityResponse = 11.0f;
+    public float controlDeadbandM = 0.055f;
+
+    [Header("Bumpless Hold Capture")]
+    public bool enableBumplessCapture = true;
+    public float captureVelocityLeadSeconds = 0.30f;
+    public float maxCaptureLeadM = 0.32f;
+    public float captureReturnSeconds = 2.2f;
+    public float captureToPrecisionRadiusM = 0.32f;
+    public float captureToPrecisionSpeedMS = 0.16f;
+
+    [Header("Base Horizontal Position Hold")]
+    public float horizontalKp = 0.82f;
+    public float horizontalKd = 1.15f;
+    public float horizontalKi = 0.018f;
+    public float horizontalIntegralLimitM = 0.55f;
+
+    public bool useNonlinearPositionResponse = true;
+    public float nonlinearErrorScaleM = 1.00f;
+
+    [Header("State Gain Scheduling")]
+    public float captureKpScale = 0.72f;
+    public float captureKdScale = 1.15f;
+    public float captureSpeedScale = 0.65f;
+    public float captureCommandScale = 0.70f;
+
+    public float precisionKpScale = 0.62f;
+    public float precisionKdScale = 1.70f;
+    public float precisionSpeedScale = 0.45f;
+    public float precisionCommandScale = 0.58f;
+
+    public float goToKpScale = 1.00f;
+    public float goToKdScale = 1.00f;
+    public float goToSpeedScale = 1.00f;
+    public float goToCommandScale = 1.00f;
+
+    [Header("Close-Range Damping")]
+    public bool adaptiveCloseRangeDamping = true;
+    public float closeRangeRadiusM = 0.85f;
+    public float closeRangeDampingMultiplier = 1.85f;
+
+    [Header("Velocity and Command Limits")]
+    public float maxHorizontalSpeedMS = 0.62f;
+    public float maxCommandMagnitude = 0.62f;
+
+    [Header("Anti-Windup")]
+    public bool enableAntiWindup = true;
+    public float integralActivationRadiusM = 0.80f;
+    public float integratorLeakRate = 0.14f;
+
+    [Header("Disturbance Observer")]
+    public bool enableDisturbanceObserver = true;
+    public float disturbanceLearningRadiusM = 0.65f;
+    public float disturbanceLearningSpeedMS = 0.18f;
+    public float disturbanceObserverResponse = 0.18f;
+    public float disturbanceCompensationGain = 0.35f;
+    public float maxDisturbanceVelocityMS = 0.18f;
+
+    [Header("Arrival / Hold Quality")]
+    public float positionArrivalRadiusM = 0.22f;
+    public float velocityArrivalThresholdMS = 0.08f;
+    public float stableRequiredSeconds = 1.25f;
+    public float timeSinceActivationS;
+    public float stableHoldTimerS;
+
+    [Header("Command Filtering")]
+    public float commandResponse = 4.2f;
+    public float maxCommandSlewPerSecond = 1.6f;
+
+    [Header("Altitude / Yaw")]
+    public float minTargetAltitudeM = 0.6f;
+    public float maxTargetAltitudeM = 12.0f;
+    public bool useAquaLocYawForBodyFrame = true;
+
+    [Header("Debug")]
+    public bool hasValidLocalization;
+    public bool targetReached;
+
+    public Vector3 estimatedPositionWorld;
+    public Vector3 estimatedVelocityWorld;
+    public float estimatedYawDeg;
+
+    public Vector3 rawAquaLocPositionWorld;
+    public Vector3 rawAquaLocVelocityWorld;
+
+    public Vector3 positionErrorWorld;
+    public Vector3 activeControlTargetWorld;
+    public Vector3 horizontalIntegralWorld;
+    public Vector3 desiredVelocityWorld;
+    public Vector3 desiredVelocityBody;
+    public Vector3 disturbanceVelocityEstimateWorld;
+
+    public Vector4 rawCommandForwardRightYawAlt;
+    public Vector4 filteredCommandForwardRightYawAlt;
+
+    public float distanceToTargetM;
+    public float finalTargetDistanceM;
+    public float horizontalSpeedMS;
+    public bool commandSaturated;
+    public bool captureBlendActive;
+
+    [Header("Hold Quality Evaluation")]
+    public Vector3 holdActivationTruePositionWorld;
+    public Vector3 holdActivationEstimatedPositionWorld;
+    public float physicalDriftFromActivationM;
+    public float estimatedDriftFromActivationM;
+    public float captureBlend01;
+
+    private bool targetInitialized;
+    private bool guidanceWasActive;
+    private bool feedbackInitialized;
+
+    private Vector3 finalHoldTargetWorld;
+    private Vector3 captureStartTargetWorld;
+    private float captureTimer;
+    private float stateTimer;
+
+    private bool udpWasEnabledBeforeSuppression;
+    private bool udpStateCached;
+    private float manualOverrideTimer;
+
+    private void Awake()
+    {
+        if (controller == null)
+        {
+            controller = GetComponent<MIMISKDroneModelController>();
+        }
+
+        if (aquaLoc == null)
+        {
+            aquaLoc = GetComponent<MIMISKDroneAquaLocEstimator>();
+        }
+
+        if (udpReceiver == null)
+        {
+            udpReceiver = GetComponent<MIMISKDroneUdpGamepadReceiver>();
+        }
+    }
+
+    private void Start()
+    {
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            targetPositionWorld = aquaLoc.estimatedPositionWorld;
+            targetYawDeg = aquaLoc.estimatedYawDeg;
+        }
+        else
+        {
+            targetPositionWorld = transform.position;
+            targetYawDeg = transform.eulerAngles.y;
+        }
+
+        finalHoldTargetWorld = targetPositionWorld;
+        activeControlTargetWorld = targetPositionWorld;
+    }
+
+    private void FixedUpdate()
+    {
+        if (autoEnableWhenModeIsNotDisabled &&
+            guidanceMode != GuidanceMode.Disabled &&
+            !enableGuidance)
+        {
+            enableGuidance = true;
+        }
+
+        if (!enableGuidance || guidanceMode == GuidanceMode.Disabled)
+        {
+            if (guidanceWasActive)
+            {
+                ReleaseAutonomousControl();
+            }
+
+            return;
+        }
+
+        guidanceWasActive = true;
+
+        if (aquaLoc == null || controller == null || !aquaLoc.estimatorReady)
+        {
+            hasValidLocalization = false;
+            return;
+        }
+
+        hasValidLocalization = true;
+
+        if (allowManualStickOverride && ShouldReleaseToManualOverride(Time.fixedDeltaTime))
+        {
+            DisableAquaHold();
+
+            if (switchToManualModeOnOverride && controller != null)
+            {
+                controller.SetMode(MIMISKDroneModelController.DroneMode.ManualAttitude);
+            }
+
+            return;
+        }
+
+        UpdateFeedbackState(Time.fixedDeltaTime);
+        UpdateHoldQualityDebug();
+
+        if (guidanceMode == GuidanceMode.HoldCurrent)
+        {
+            SetTargetToCurrentAquaLocEstimate();
+            guidanceMode = GuidanceMode.HoldTarget;
+        }
+        else if (!targetInitialized)
+        {
+            if (guidanceMode == GuidanceMode.HoldTarget && initializeHoldTargetAutomatically)
+            {
+                SetTargetToCurrentAquaLocEstimate();
+            }
+            else
+            {
+                finalHoldTargetWorld = targetPositionWorld;
+                activeControlTargetWorld = targetPositionWorld;
+                targetInitialized = true;
+                EnterHoldState(guidanceMode == GuidanceMode.GoToTarget ? HoldState.GoToTarget : HoldState.PrecisionHold);
+            }
+        }
+
+        if (guidanceMode == GuidanceMode.LandOnWaterAtTarget)
+        {
+            EnterHoldState(HoldState.LandAtTarget);
+            controller.SetMode(MIMISKDroneModelController.DroneMode.LandingOnWater);
+        }
+        else
+        {
+            if (controller.mode == MIMISKDroneModelController.DroneMode.Takeoff ||
+                controller.mode == MIMISKDroneModelController.DroneMode.AltitudeHold ||
+                controller.mode == MIMISKDroneModelController.DroneMode.ManualAttitude)
+            {
+                controller.SetMode(MIMISKDroneModelController.DroneMode.ManualAttitude);
+            }
+        }
+
+        targetPositionWorld.y = Mathf.Clamp(
+            targetPositionWorld.y,
+            controller.waterSurfaceY + minTargetAltitudeM,
+            controller.waterSurfaceY + maxTargetAltitudeM
+        );
+
+        finalHoldTargetWorld.y = targetPositionWorld.y;
+
+        controller.targetAltitudeM = targetPositionWorld.y;
+        controller.targetYawDeg = targetYawDeg;
+
+        stateTimer += Time.fixedDeltaTime;
+        timeSinceActivationS += Time.fixedDeltaTime;
+
+        UpdateHoldState(Time.fixedDeltaTime);
+        UpdateActiveControlTarget(Time.fixedDeltaTime);
+        ComputeGuidanceCommand(Time.fixedDeltaTime);
+
+        if (takeControlOfDrone)
+        {
+            controller.SetExternalCommand(
+                filteredCommandForwardRightYawAlt.x,
+                filteredCommandForwardRightYawAlt.y,
+                filteredCommandForwardRightYawAlt.z,
+                filteredCommandForwardRightYawAlt.w
+            );
+        }
+    }
+
+    private void UpdateFeedbackState(float dt)
+    {
+        rawAquaLocPositionWorld = aquaLoc.estimatedPositionWorld;
+        rawAquaLocVelocityWorld = aquaLoc.estimatedVelocityWorld;
+
+        if (!enableFeedbackSmoothing || !feedbackInitialized)
+        {
+            estimatedPositionWorld = rawAquaLocPositionWorld;
+            estimatedVelocityWorld = rawAquaLocVelocityWorld;
+            feedbackInitialized = true;
+        }
+        else
+        {
+            float pAlpha =
+                1.0f - Mathf.Exp(-Mathf.Max(0.001f, feedbackPositionResponse) * dt);
+
+            float vAlpha =
+                1.0f - Mathf.Exp(-Mathf.Max(0.001f, feedbackVelocityResponse) * dt);
+
+            estimatedPositionWorld =
+                Vector3.Lerp(estimatedPositionWorld, rawAquaLocPositionWorld, pAlpha);
+
+            estimatedVelocityWorld =
+                Vector3.Lerp(estimatedVelocityWorld, rawAquaLocVelocityWorld, vAlpha);
+        }
+
+        estimatedYawDeg = aquaLoc.estimatedYawDeg;
+    }
+
+    private void EnterHoldState(HoldState newState)
+    {
+        if (holdState == newState)
+        {
+            return;
+        }
+
+        holdState = newState;
+        stateTimer = 0.0f;
+        stableHoldTimerS = 0.0f;
+    }
+
+    private void UpdateHoldState(float dt)
+    {
+        Vector3 finalHorizontalError =
+            new Vector3(
+                finalHoldTargetWorld.x - estimatedPositionWorld.x,
+                0.0f,
+                finalHoldTargetWorld.z - estimatedPositionWorld.z
+            );
+
+        finalTargetDistanceM = finalHorizontalError.magnitude;
+
+        Vector3 horizontalVelocity =
+            new Vector3(estimatedVelocityWorld.x, 0.0f, estimatedVelocityWorld.z);
+
+        if (holdState == HoldState.CaptureBrake)
+        {
+            if ((stateTimer > captureReturnSeconds && finalTargetDistanceM < captureToPrecisionRadiusM * 1.4f) ||
+                (finalTargetDistanceM < captureToPrecisionRadiusM &&
+                 horizontalVelocity.magnitude < captureToPrecisionSpeedMS))
+            {
+                EnterHoldState(HoldState.PrecisionHold);
+            }
+        }
+        else if (holdState == HoldState.GoToTarget)
+        {
+            if (finalTargetDistanceM < closeRangeRadiusM)
+            {
+                EnterHoldState(HoldState.PrecisionHold);
+            }
+        }
+    }
+
+    private void UpdateActiveControlTarget(float dt)
+    {
+        if (holdState == HoldState.CaptureBrake && captureBlendActive)
+        {
+            captureTimer += dt;
+
+            float t = Mathf.Clamp01(captureTimer / Mathf.Max(0.001f, captureReturnSeconds));
+            float smooth = t * t * (3.0f - 2.0f * t);
+
+            activeControlTargetWorld =
+                Vector3.Lerp(captureStartTargetWorld, finalHoldTargetWorld, smooth);
+
+            activeControlTargetWorld.y = finalHoldTargetWorld.y;
+            captureBlend01 = smooth;
+
+            if (t >= 1.0f)
+            {
+                captureBlendActive = false;
+                activeControlTargetWorld = finalHoldTargetWorld;
+            }
+        }
+        else
+        {
+            activeControlTargetWorld = finalHoldTargetWorld;
+            captureBlend01 = 1.0f;
+        }
+    }
+
+    private void ComputeGuidanceCommand(float dt)
+    {
+        positionErrorWorld = activeControlTargetWorld - estimatedPositionWorld;
+
+        Vector3 horizontalError = new Vector3(
+            positionErrorWorld.x,
+            0.0f,
+            positionErrorWorld.z
+        );
+
+        Vector3 horizontalVelocity = new Vector3(
+            estimatedVelocityWorld.x,
+            0.0f,
+            estimatedVelocityWorld.z
+        );
+
+        distanceToTargetM = horizontalError.magnitude;
+        horizontalSpeedMS = horizontalVelocity.magnitude;
+
+        Vector3 errorForControl = horizontalError;
+
+        if (errorForControl.magnitude < controlDeadbandM)
+        {
+            errorForControl = Vector3.zero;
+        }
+        else
+        {
+            errorForControl =
+                errorForControl.normalized * (errorForControl.magnitude - controlDeadbandM);
+        }
+
+        GetStateScheduledGains(
+            out float kp,
+            out float kd,
+            out float maxSpeed,
+            out float maxCommand
+        );
+
+        if (adaptiveCloseRangeDamping && distanceToTargetM < closeRangeRadiusM)
+        {
+            float proximity = 1.0f - Mathf.Clamp01(distanceToTargetM / closeRangeRadiusM);
+            kd *= Mathf.Lerp(1.0f, closeRangeDampingMultiplier, proximity);
+        }
+
+        Vector3 pVelocity;
+
+        if (useNonlinearPositionResponse)
+        {
+            float errorMag = errorForControl.magnitude;
+
+            if (errorMag > 0.0001f)
+            {
+                float speed =
+                    maxSpeed *
+                    SafeTanh(kp * errorMag / Mathf.Max(0.001f, nonlinearErrorScaleM));
+
+                pVelocity = errorForControl.normalized * speed;
+            }
+            else
+            {
+                pVelocity = Vector3.zero;
+            }
+        }
+        else
+        {
+            pVelocity = kp * errorForControl;
+        }
+
+        bool allowIntegral =
+            !enableAntiWindup ||
+            (holdState == HoldState.PrecisionHold &&
+             distanceToTargetM < integralActivationRadiusM &&
+             !commandSaturated);
+
+        if (allowIntegral)
+        {
+            horizontalIntegralWorld += errorForControl * dt;
+        }
+        else
+        {
+            horizontalIntegralWorld =
+                Vector3.Lerp(horizontalIntegralWorld, Vector3.zero, integratorLeakRate * dt);
+        }
+
+        if (horizontalIntegralWorld.magnitude > horizontalIntegralLimitM)
+        {
+            horizontalIntegralWorld =
+                horizontalIntegralWorld.normalized * horizontalIntegralLimitM;
+        }
+
+        Vector3 baseDesiredVelocity =
+            pVelocity
+            + horizontalKi * horizontalIntegralWorld
+            - kd * horizontalVelocity;
+
+        bool canLearnDisturbance =
+            enableDisturbanceObserver &&
+            holdState == HoldState.PrecisionHold &&
+            distanceToTargetM < disturbanceLearningRadiusM &&
+            horizontalSpeedMS < disturbanceLearningSpeedMS;
+
+        if (canLearnDisturbance)
+        {
+            Vector3 residualVelocity =
+                horizontalVelocity - baseDesiredVelocity;
+
+            residualVelocity.y = 0.0f;
+
+            float alpha =
+                1.0f - Mathf.Exp(-Mathf.Max(0.001f, disturbanceObserverResponse) * dt);
+
+            disturbanceVelocityEstimateWorld =
+                Vector3.Lerp(
+                    disturbanceVelocityEstimateWorld,
+                    residualVelocity,
+                    alpha
+                );
+
+            if (disturbanceVelocityEstimateWorld.magnitude > maxDisturbanceVelocityMS)
+            {
+                disturbanceVelocityEstimateWorld =
+                    disturbanceVelocityEstimateWorld.normalized * maxDisturbanceVelocityMS;
+            }
+        }
+
+        desiredVelocityWorld =
+            baseDesiredVelocity
+            - disturbanceCompensationGain * disturbanceVelocityEstimateWorld;
+
+        desiredVelocityWorld.y = 0.0f;
+
+        commandSaturated = false;
+
+        if (desiredVelocityWorld.magnitude > maxSpeed)
+        {
+            desiredVelocityWorld =
+                desiredVelocityWorld.normalized * maxSpeed;
+
+            commandSaturated = true;
+        }
+
+        float yawForBody = useAquaLocYawForBodyFrame
+            ? estimatedYawDeg
+            : transform.eulerAngles.y;
+
+        Quaternion yawRotation = Quaternion.Euler(0.0f, yawForBody, 0.0f);
+        desiredVelocityBody =
+            Quaternion.Inverse(yawRotation) * desiredVelocityWorld;
+
+        float controllerMaxSpeed =
+            Mathf.Max(0.1f, controller.maxManualHorizontalSpeedMS);
+
+        float desiredForwardMS =
+            controller.forwardVelocityAxisSign * desiredVelocityBody.z;
+
+        float desiredRightMS =
+            controller.rightVelocityAxisSign * desiredVelocityBody.x;
+
+        rawCommandForwardRightYawAlt = new Vector4(
+            Mathf.Clamp(desiredForwardMS / controllerMaxSpeed, -maxCommand, maxCommand),
+            Mathf.Clamp(desiredRightMS / controllerMaxSpeed, -maxCommand, maxCommand),
+            0.0f,
+            0.0f
+        );
+
+        if (Mathf.Abs(rawCommandForwardRightYawAlt.x) >= maxCommand * 0.99f ||
+            Mathf.Abs(rawCommandForwardRightYawAlt.y) >= maxCommand * 0.99f)
+        {
+            commandSaturated = true;
+        }
+
+        Vector4 delta = rawCommandForwardRightYawAlt - filteredCommandForwardRightYawAlt;
+        float maxDelta = maxCommandSlewPerSecond * dt;
+
+        if (delta.magnitude > maxDelta)
+        {
+            delta = delta.normalized * maxDelta;
+        }
+
+        Vector4 slewLimitedCommand =
+            filteredCommandForwardRightYawAlt + delta;
+
+        float commandAlpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, commandResponse) * dt);
+
+        filteredCommandForwardRightYawAlt =
+            Vector4.Lerp(
+                filteredCommandForwardRightYawAlt,
+                slewLimitedCommand,
+                commandAlpha
+            );
+
+        bool canDeclareReached =
+            holdState == HoldState.PrecisionHold ||
+            timeSinceActivationS > captureReturnSeconds + 0.25f;
+
+        bool instantTargetReached =
+            canDeclareReached &&
+            finalTargetDistanceM < positionArrivalRadiusM &&
+            horizontalSpeedMS < velocityArrivalThresholdMS;
+
+        if (instantTargetReached)
+        {
+            stableHoldTimerS += dt;
+        }
+        else
+        {
+            stableHoldTimerS = 0.0f;
+        }
+
+        targetReached =
+            stableHoldTimerS >= stableRequiredSeconds;
+    }
+
+    private void GetStateScheduledGains(
+        out float kp,
+        out float kd,
+        out float maxSpeed,
+        out float maxCommand)
+    {
+        kp = horizontalKp;
+        kd = horizontalKd;
+        maxSpeed = maxHorizontalSpeedMS;
+        maxCommand = maxCommandMagnitude;
+
+        if (holdState == HoldState.CaptureBrake)
+        {
+            kp *= captureKpScale;
+            kd *= captureKdScale;
+            maxSpeed *= captureSpeedScale;
+            maxCommand *= captureCommandScale;
+        }
+        else if (holdState == HoldState.PrecisionHold)
+        {
+            kp *= precisionKpScale;
+            kd *= precisionKdScale;
+            maxSpeed *= precisionSpeedScale;
+            maxCommand *= precisionCommandScale;
+        }
+        else if (holdState == HoldState.GoToTarget || holdState == HoldState.LandAtTarget)
+        {
+            kp *= goToKpScale;
+            kd *= goToKdScale;
+            maxSpeed *= goToSpeedScale;
+            maxCommand *= goToCommandScale;
+        }
+    }
+
+
+    private void UpdateHoldQualityDebug()
+    {
+        Vector3 trueHorizontal =
+            new Vector3(
+                aquaLoc != null ? aquaLoc.truePositionWorld.x - holdActivationTruePositionWorld.x : 0.0f,
+                0.0f,
+                aquaLoc != null ? aquaLoc.truePositionWorld.z - holdActivationTruePositionWorld.z : 0.0f
+            );
+
+        Vector3 estimatedHorizontal =
+            new Vector3(
+                estimatedPositionWorld.x - holdActivationEstimatedPositionWorld.x,
+                0.0f,
+                estimatedPositionWorld.z - holdActivationEstimatedPositionWorld.z
+            );
+
+        physicalDriftFromActivationM = trueHorizontal.magnitude;
+        estimatedDriftFromActivationM = estimatedHorizontal.magnitude;
+    }
+
+    private bool ShouldReleaseToManualOverride(float dt)
+    {
+        manualOverrideTimer = 0.0f;
+        return false;
+    }
+
+    private void ReleaseAutonomousControl()
+    {
+        guidanceWasActive = false;
+        holdState = HoldState.Inactive;
+
+        targetInitialized = false;
+        feedbackInitialized = false;
+        captureBlendActive = false;
+        captureBlend01 = 0.0f;
+        timeSinceActivationS = 0.0f;
+        stableHoldTimerS = 0.0f;
+        stateTimer = 0.0f;
+
+        horizontalIntegralWorld = Vector3.zero;
+        disturbanceVelocityEstimateWorld = Vector3.zero;
+        rawCommandForwardRightYawAlt = Vector4.zero;
+        filteredCommandForwardRightYawAlt = Vector4.zero;
+        commandSaturated = false;
+
+        if (controller != null)
+        {
+            controller.ClearExternalCommand();
+        }
+
+        if (udpReceiver != null && udpStateCached)
+        {
+            udpReceiver.enabled = udpWasEnabledBeforeSuppression;
+            udpStateCached = false;
+        }
+
+        manualOverrideTimer = 0.0f;
+    }
+
+    [ContextMenu("Set Target To Current AquaLoc Estimate")]
+    public void SetTargetToCurrentAquaLocEstimate()
+    {
+        Vector3 currentPosition;
+        Vector3 currentVelocity;
+
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            currentPosition = aquaLoc.estimatedPositionWorld;
+            currentVelocity = aquaLoc.estimatedVelocityWorld;
+
+            holdActivationEstimatedPositionWorld = aquaLoc.estimatedPositionWorld;
+            holdActivationTruePositionWorld = aquaLoc.truePositionWorld;
+
+            targetYawDeg = holdYawAtActivation
+                ? aquaLoc.estimatedYawDeg
+                : targetYawDeg;
+        }
+        else
+        {
+            currentPosition = transform.position;
+            currentVelocity = Vector3.zero;
+
+            holdActivationEstimatedPositionWorld = transform.position;
+            holdActivationTruePositionWorld = transform.position;
+
+            targetYawDeg = transform.eulerAngles.y;
+        }
+
+        targetPositionWorld = currentPosition;
+        finalHoldTargetWorld = currentPosition;
+
+        Vector3 horizontalVelocity =
+            new Vector3(currentVelocity.x, 0.0f, currentVelocity.z);
+
+        Vector3 lead =
+            horizontalVelocity * captureVelocityLeadSeconds;
+
+        if (lead.magnitude > maxCaptureLeadM)
+        {
+            lead = lead.normalized * maxCaptureLeadM;
+        }
+
+        captureStartTargetWorld = currentPosition + lead;
+        captureStartTargetWorld.y = currentPosition.y;
+
+        activeControlTargetWorld = captureStartTargetWorld;
+
+        captureTimer = 0.0f;
+        stateTimer = 0.0f;
+        timeSinceActivationS = 0.0f;
+        stableHoldTimerS = 0.0f;
+        captureBlend01 = 0.0f;
+
+        captureBlendActive =
+            enableBumplessCapture &&
+            lead.magnitude > 0.04f &&
+            captureReturnSeconds > 0.05f;
+
+        targetInitialized = true;
+        feedbackInitialized = false;
+
+        EnterHoldState(captureBlendActive ? HoldState.CaptureBrake : HoldState.PrecisionHold);
+    }
+
+    [ContextMenu("Enable Hold Current Position")]
+    public void EnableHoldCurrentPosition()
+    {
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.HoldCurrent;
+    }
+
+    [ContextMenu("Set Target 3m Forward")]
+    public void SetTargetThreeMetersForward()
+    {
+        if (aquaLoc != null && aquaLoc.estimatorReady)
+        {
+            float yaw = aquaLoc.estimatedYawDeg;
+            Vector3 forward =
+                Quaternion.Euler(0.0f, yaw, 0.0f) * Vector3.forward;
+
+            targetPositionWorld =
+                aquaLoc.estimatedPositionWorld + forward * 3.0f;
+
+            targetYawDeg = yaw;
+        }
+        else
+        {
+            targetPositionWorld =
+                transform.position + transform.forward * 3.0f;
+
+            targetYawDeg = transform.eulerAngles.y;
+        }
+
+        finalHoldTargetWorld = targetPositionWorld;
+        activeControlTargetWorld = targetPositionWorld;
+        captureBlendActive = false;
+        feedbackInitialized = false;
+
+        targetInitialized = true;
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.GoToTarget;
+        EnterHoldState(HoldState.GoToTarget);
+    }
+
+    [ContextMenu("Land On Water At Target")]
+    public void LandOnWaterAtTarget()
+    {
+        enableGuidance = true;
+        guidanceMode = GuidanceMode.LandOnWaterAtTarget;
+        EnterHoldState(HoldState.LandAtTarget);
+    }
+
+    [ContextMenu("Disable AquaHold")]
+    public void DisableAquaHold()
+    {
+        enableGuidance = false;
+        guidanceMode = GuidanceMode.Disabled;
+        ReleaseAutonomousControl();
+    }
+
+    private float SafeTanh(float x)
+    {
+        x = Mathf.Clamp(x, -10.0f, 10.0f);
+
+        float e2x = Mathf.Exp(2.0f * x);
+
+        return (e2x - 1.0f) / (e2x + 1.0f);
+    }
+
+    private void OnDisable()
+    {
+        if (guidanceWasActive)
+        {
+            ReleaseAutonomousControl();
+        }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireSphere(targetPositionWorld, 0.35f);
+        Gizmos.DrawLine(transform.position, targetPositionWorld);
+
+        Gizmos.color = Color.magenta;
+        Gizmos.DrawWireSphere(activeControlTargetWorld, 0.22f);
+
+        Gizmos.color = targetReached ? Color.green : Color.yellow;
+        Gizmos.DrawWireSphere(targetPositionWorld, positionArrivalRadiusM);
+    }
+}

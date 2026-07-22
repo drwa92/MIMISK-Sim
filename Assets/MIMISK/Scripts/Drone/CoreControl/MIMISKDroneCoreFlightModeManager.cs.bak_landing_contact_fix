@@ -1,0 +1,825 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+[DefaultExecutionOrder(-50)]
+[DisallowMultipleComponent]
+public class MIMISKDroneCoreFlightModeManager : MonoBehaviour
+{
+    public enum FlightMode
+    {
+        Disabled,
+        Disarmed,
+        TakeoffIdle,
+        Takeoff,
+        Gamepad,
+        PositionHold,
+        PathTracking,
+        LandingOnSurface,
+        SurfaceStable,
+        SurfaceHold,
+        Failsafe,
+        ExternalReference
+    }
+
+    public enum PathKind
+    {
+        Circle,
+        Square,
+        Spiral
+    }
+
+    [Header("References")]
+    public MIMISKDroneCoreRotorController core;
+    public MIMISKDroneCoreGamepadReceiver gamepad;
+    public Rigidbody rb;
+
+    [Header("Mode")]
+    public bool managerEnabled = true;
+    public FlightMode flightMode = FlightMode.Gamepad;
+
+    [Header("Keyboard")]
+    public Key idleKey = Key.I;
+    public Key takeoffKey = Key.T;
+    public Key gamepadKey = Key.M;
+    public Key holdKey = Key.H;
+    public Key pathKey = Key.N;
+    public Key landKey = Key.L;
+    public Key abortKey = Key.B;
+
+    [Header("Takeoff / Landing")]
+    public float waterSurfaceY = 0.0f;
+    public float takeoffAltitudeAboveSurfaceM = 2.0f;
+    public float takeoffVerticalSpeedMS = 0.55f;
+    public float landingDescentSpeedMS = 0.35f;
+    public float surfaceHoldHeightM = 0.20f;
+    public float modeArrivalToleranceM = 0.05f;
+
+    [Header("Gamepad Reference")]
+    public float manualMaxHorizontalSpeedMS = 0.75f;
+    public float manualAltitudeRateMS = 0.45f;
+    public float manualYawRateDegS = 35.0f;
+    public float manualReferenceResponseHz = 5.0f;
+
+    [Header("Path Tracking")]
+    public PathKind pathKind = PathKind.Circle;
+    public float pathRampTimeS = 2.0f;
+    public float missionDurationS = 40.0f;
+
+    public float circleRadiusM = 1.4f;
+    public float circleOmegaRadS = 0.23f;
+
+    public float squareSideM = 2.4f;
+    public float squareSpeedMS = 0.32f;
+
+    public float spiralOmegaRadS = 0.28f;
+    public float spiralInitialRadiusM = 0.25f;
+    public float spiralFinalRadiusM = 1.25f;
+    public float spiralDurationS = 36.0f;
+    public float spiralAltitudeRiseM = 0.35f;
+
+    [Header("Runtime Reference")]
+    public Vector3 referencePositionWorld;
+    public Vector3 referenceVelocityWorld;
+    public Vector3 referenceAccelerationWorld;
+    public float referenceYawDeg;
+
+    public Vector3 modeStartPositionWorld;
+    public float modeStartYawDeg;
+    public float modeTimerS;
+    public float pathReferenceTimeS;
+    public float pathRamp01;
+
+    public Vector4 latestCommand;
+    public string lastModeEvent = "none";
+
+    private Vector3 filteredManualVelocity;
+
+    private void Awake()
+    {
+        AutoFindReferences();
+    }
+
+    private void Start()
+    {
+        AutoFindReferences();
+
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        PushReferenceToCore();
+
+        if (flightMode == FlightMode.Gamepad)
+        {
+            EnterGamepadMode();
+        }
+        else if (flightMode == FlightMode.TakeoffIdle)
+        {
+            EnterTakeoffIdle();
+        }
+        else if (flightMode == FlightMode.PositionHold)
+        {
+            CapturePositionHold();
+        }
+    }
+
+    private void Update()
+    {
+        if (!managerEnabled)
+        {
+            return;
+        }
+
+        bool idlePressed = Keyboard.current != null && Keyboard.current[idleKey].wasPressedThisFrame;
+        bool takeoffPressed = Keyboard.current != null && Keyboard.current[takeoffKey].wasPressedThisFrame;
+        bool manualPressed = Keyboard.current != null && Keyboard.current[gamepadKey].wasPressedThisFrame;
+        bool holdPressed = Keyboard.current != null && Keyboard.current[holdKey].wasPressedThisFrame;
+        bool pathPressed = Keyboard.current != null && Keyboard.current[pathKey].wasPressedThisFrame;
+        bool landPressed = Keyboard.current != null && Keyboard.current[landKey].wasPressedThisFrame;
+        bool abortPressed = Keyboard.current != null && Keyboard.current[abortKey].wasPressedThisFrame;
+
+        if (gamepad != null)
+        {
+            idlePressed |= gamepad.idleDown || gamepad.armDown;
+            takeoffPressed |= gamepad.takeoffDown;
+            manualPressed |= gamepad.manualDown;
+            holdPressed |= gamepad.holdDown;
+            pathPressed |= gamepad.pathDown;
+            landPressed |= gamepad.landDown;
+            abortPressed |= gamepad.abortDown;
+        }
+
+        if (idlePressed)
+        {
+            EnterTakeoffIdle();
+        }
+
+        if (takeoffPressed)
+        {
+            StartTakeoff();
+        }
+
+        if (manualPressed)
+        {
+            EnterGamepadMode();
+        }
+
+        if (holdPressed)
+        {
+            CapturePositionHold();
+        }
+
+        if (pathPressed)
+        {
+            StartPathTracking(pathKind);
+        }
+
+        if (landPressed)
+        {
+            StartLandingOnSurface();
+        }
+
+        if (gamepad != null && gamepad.disarmDown)
+        {
+            EnterDisarmed();
+        }
+        else if (abortPressed)
+        {
+            EnterFailsafe();
+        }
+    }
+
+    private void FixedUpdate()
+    {
+        if (!managerEnabled || core == null)
+        {
+            return;
+        }
+
+        float dt = Time.fixedDeltaTime;
+        modeTimerS += dt;
+
+        if (flightMode == FlightMode.Disarmed ||
+            flightMode == FlightMode.Disabled)
+        {
+            if (core != null)
+            {
+                core.controlMode = MIMISKDroneCoreRotorController.ControlMode.Disabled;
+                core.CutMotors();
+            }
+
+            return;
+        }
+
+        if (flightMode == FlightMode.SurfaceStable ||
+            flightMode == FlightMode.SurfaceHold)
+        {
+            referenceVelocityWorld = Vector3.zero;
+            referenceAccelerationWorld = Vector3.zero;
+
+            if (core != null)
+            {
+                core.controlMode = MIMISKDroneCoreRotorController.ControlMode.Disabled;
+                core.CutMotors();
+            }
+
+            return;
+        }
+
+        if (flightMode == FlightMode.TakeoffIdle)
+        {
+            referenceVelocityWorld = Vector3.zero;
+            referenceAccelerationWorld = Vector3.zero;
+        }
+        else if (flightMode == FlightMode.Takeoff)
+        {
+            UpdateTakeoff(dt);
+        }
+        else if (flightMode == FlightMode.Gamepad)
+        {
+            UpdateGamepadReference(dt);
+        }
+        else if (flightMode == FlightMode.PositionHold)
+        {
+            referenceVelocityWorld = Vector3.zero;
+            referenceAccelerationWorld = Vector3.zero;
+        }
+        else if (flightMode == FlightMode.PathTracking)
+        {
+            UpdatePathTracking(dt);
+        }
+        else if (flightMode == FlightMode.LandingOnSurface)
+        {
+            UpdateLandingOnSurface(dt);
+        }
+        else if (flightMode == FlightMode.SurfaceStable ||
+                 flightMode == FlightMode.SurfaceHold)
+        {
+            referenceVelocityWorld = Vector3.zero;
+            referenceAccelerationWorld = Vector3.zero;
+        }
+
+        PushReferenceToCore();
+    }
+
+    [ContextMenu("Auto Find References")]
+    public void AutoFindReferences()
+    {
+        if (core == null)
+        {
+            core = GetComponent<MIMISKDroneCoreRotorController>();
+        }
+
+        if (gamepad == null)
+        {
+            gamepad = GetComponent<MIMISKDroneCoreGamepadReceiver>();
+        }
+
+        if (rb == null)
+        {
+            rb = GetComponent<Rigidbody>();
+        }
+    }
+
+
+    public void EnterDisarmed()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.Disarmed;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "disarmed";
+
+        if (core != null)
+        {
+            core.controlMode = MIMISKDroneCoreRotorController.ControlMode.Disabled;
+            core.CutMotors();
+        }
+    }
+
+    public void EnterTakeoffIdle()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.TakeoffIdle;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "takeoff_idle";
+        PushReferenceToCore();
+    }
+
+    public void StartTakeoff()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.Takeoff;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        lastModeEvent = "takeoff";
+        PushReferenceToCore();
+    }
+
+    public void EnterGamepadMode()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.Gamepad;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "gamepad";
+        PushReferenceToCore();
+    }
+
+    public void CapturePositionHold()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.PositionHold;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "position_hold";
+        PushReferenceToCore();
+    }
+
+
+    public void EnterFailsafe()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.Failsafe;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "failsafe_position_hold";
+
+        // For now, failsafe means hold current position.
+        // Later we can make this a slow descent.
+        flightMode = FlightMode.PositionHold;
+
+        PushReferenceToCore();
+    }
+
+    public void StartLandingOnSurface()
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.LandingOnSurface;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "landing_on_surface";
+        PushReferenceToCore();
+    }
+
+    public void StartPathTracking(PathKind kind)
+    {
+        Vector3 p;
+        Vector3 v;
+        float yaw;
+
+        GetCurrentState(out p, out v, out yaw);
+
+        flightMode = FlightMode.PathTracking;
+        pathKind = kind;
+        modeStartPositionWorld = p;
+        modeStartYawDeg = yaw;
+        modeTimerS = 0.0f;
+        pathReferenceTimeS = 0.0f;
+        pathRamp01 = 0.0f;
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = Vector3.zero;
+        referenceAccelerationWorld = Vector3.zero;
+        referenceYawDeg = yaw;
+
+        filteredManualVelocity = Vector3.zero;
+        lastModeEvent = "path_tracking_" + kind.ToString();
+        PushReferenceToCore();
+    }
+
+    private void UpdateTakeoff(float dt)
+    {
+        float targetY =
+            Mathf.Max(
+                referencePositionWorld.y,
+                waterSurfaceY + takeoffAltitudeAboveSurfaceM
+            );
+
+        float oldY = referencePositionWorld.y;
+
+        referencePositionWorld.y =
+            Mathf.MoveTowards(
+                referencePositionWorld.y,
+                targetY,
+                takeoffVerticalSpeedMS * dt
+            );
+
+        float vy = (referencePositionWorld.y - oldY) / Mathf.Max(0.001f, dt);
+
+        referenceVelocityWorld =
+            new Vector3(0.0f, vy, 0.0f);
+
+        referenceAccelerationWorld = Vector3.zero;
+
+        if (Mathf.Abs(referencePositionWorld.y - targetY) <= modeArrivalToleranceM)
+        {
+            CapturePositionHold();
+            lastModeEvent = "takeoff_complete_position_hold";
+        }
+    }
+
+    private void UpdateGamepadReference(float dt)
+    {
+        latestCommand =
+            gamepad != null ? gamepad.commandForwardRightYawAlt : Vector4.zero;
+
+        float forward = latestCommand.x;
+        float right = latestCommand.y;
+        float yaw = latestCommand.z;
+        float altitude = latestCommand.w;
+
+        Quaternion yawRotation =
+            Quaternion.Euler(0.0f, referenceYawDeg, 0.0f);
+
+        Vector3 bodyVelocityCommand =
+            new Vector3(right, 0.0f, forward) * manualMaxHorizontalSpeedMS;
+
+        Vector3 worldVelocityCommand =
+            yawRotation * bodyVelocityCommand;
+
+        Vector3 desiredVelocity =
+            new Vector3(
+                worldVelocityCommand.x,
+                altitude * manualAltitudeRateMS,
+                worldVelocityCommand.z
+            );
+
+        float alpha =
+            1.0f - Mathf.Exp(-Mathf.Max(0.001f, manualReferenceResponseHz) * dt);
+
+        filteredManualVelocity =
+            Vector3.Lerp(filteredManualVelocity, desiredVelocity, alpha);
+
+        referenceVelocityWorld = filteredManualVelocity;
+        referencePositionWorld += referenceVelocityWorld * dt;
+        referenceAccelerationWorld = Vector3.zero;
+
+        referenceYawDeg += yaw * manualYawRateDegS * dt;
+
+        while (referenceYawDeg >= 360.0f) referenceYawDeg -= 360.0f;
+        while (referenceYawDeg < 0.0f) referenceYawDeg += 360.0f;
+    }
+
+    private void UpdatePathTracking(float dt)
+    {
+        pathRamp01 =
+            Smooth01(
+                Mathf.Clamp01(
+                    pathRampTimeS <= 0.001f
+                        ? 1.0f
+                        : modeTimerS / pathRampTimeS
+                )
+            );
+
+        pathReferenceTimeS += pathRamp01 * dt;
+
+        Vector3 p;
+        Vector3 v;
+        Vector3 a;
+
+        EvaluatePathReference(
+            pathReferenceTimeS,
+            pathRamp01,
+            out p,
+            out v,
+            out a
+        );
+
+        referencePositionWorld = p;
+        referenceVelocityWorld = v;
+        referenceAccelerationWorld = a;
+        referenceYawDeg = modeStartYawDeg;
+
+        if (pathReferenceTimeS >= GetPathDuration())
+        {
+            CapturePositionHold();
+            lastModeEvent = "path_complete_position_hold";
+        }
+    }
+
+    private void UpdateLandingOnSurface(float dt)
+    {
+        float targetY =
+            waterSurfaceY + surfaceHoldHeightM;
+
+        float oldY = referencePositionWorld.y;
+
+        referencePositionWorld.y =
+            Mathf.MoveTowards(
+                referencePositionWorld.y,
+                targetY,
+                landingDescentSpeedMS * dt
+            );
+
+        float vy = (referencePositionWorld.y - oldY) / Mathf.Max(0.001f, dt);
+
+        referenceVelocityWorld =
+            new Vector3(0.0f, vy, 0.0f);
+
+        referenceAccelerationWorld = Vector3.zero;
+
+        if (Mathf.Abs(referencePositionWorld.y - targetY) <= modeArrivalToleranceM)
+        {
+            flightMode = FlightMode.SurfaceStable;
+            modeTimerS = 0.0f;
+            referencePositionWorld.y = targetY;
+            referenceVelocityWorld = Vector3.zero;
+            lastModeEvent = "surface_hold";
+        }
+    }
+
+    private void PushReferenceToCore()
+    {
+        if (core == null)
+        {
+            return;
+        }
+
+        if (flightMode == FlightMode.Disarmed ||
+            flightMode == FlightMode.Disabled ||
+            flightMode == FlightMode.SurfaceStable ||
+            flightMode == FlightMode.SurfaceHold)
+        {
+            core.controlMode = MIMISKDroneCoreRotorController.ControlMode.Disabled;
+            core.CutMotors();
+            return;
+        }
+
+        core.controllerEnabled = true;
+        core.acceptKeyboardShortcuts = false;
+        core.controlMode = MIMISKDroneCoreRotorController.ControlMode.ExternalReference;
+
+        core.SetExternalReference(
+            referencePositionWorld,
+            referenceVelocityWorld,
+            referenceAccelerationWorld,
+            referenceYawDeg
+        );
+    }
+
+    private void GetCurrentState(out Vector3 p, out Vector3 v, out float yaw)
+    {
+        if (core != null)
+        {
+            p = core.estimatedPositionWorld;
+            v = core.estimatedVelocityWorld;
+            yaw = core.estimatedYawDeg;
+
+            if (p.sqrMagnitude > 0.000001f)
+            {
+                return;
+            }
+        }
+
+        if (rb != null)
+        {
+            p = rb.position;
+            v = rb.linearVelocity;
+            yaw = rb.rotation.eulerAngles.y;
+            return;
+        }
+
+        p = transform.position;
+        v = Vector3.zero;
+        yaw = transform.eulerAngles.y;
+    }
+
+    private float GetPathDuration()
+    {
+        if (pathKind == PathKind.Square)
+        {
+            return 4.0f * squareSideM / Mathf.Max(0.05f, squareSpeedMS);
+        }
+
+        if (pathKind == PathKind.Spiral)
+        {
+            return Mathf.Max(missionDurationS, spiralDurationS);
+        }
+
+        return missionDurationS;
+    }
+
+    private void EvaluatePathReference(
+        float t,
+        float speedScale,
+        out Vector3 p,
+        out Vector3 v,
+        out Vector3 a)
+    {
+        if (pathKind == PathKind.Circle)
+        {
+            float R = circleRadiusM;
+            float w = circleOmegaRadS;
+            float wt = w * t;
+
+            p = modeStartPositionWorld + new Vector3(
+                R * (Mathf.Cos(wt) - 1.0f),
+                0.0f,
+                R * Mathf.Sin(wt)
+            );
+
+            v = new Vector3(
+                -R * w * Mathf.Sin(wt),
+                0.0f,
+                R * w * Mathf.Cos(wt)
+            ) * speedScale;
+
+            a = new Vector3(
+                -R * w * w * Mathf.Cos(wt),
+                0.0f,
+                -R * w * w * Mathf.Sin(wt)
+            ) * speedScale * speedScale;
+
+            return;
+        }
+
+        if (pathKind == PathKind.Spiral)
+        {
+            float T = Mathf.Max(0.1f, spiralDurationS);
+            float s = Mathf.Clamp01(t / T);
+            float r = Mathf.Lerp(spiralInitialRadiusM, spiralFinalRadiusM, s);
+            float rDot = t <= T ? (spiralFinalRadiusM - spiralInitialRadiusM) / T : 0.0f;
+            float w = spiralOmegaRadS;
+            float th = w * t;
+
+            p = modeStartPositionWorld + new Vector3(
+                r * Mathf.Cos(th) - spiralInitialRadiusM,
+                spiralAltitudeRiseM * s,
+                r * Mathf.Sin(th)
+            );
+
+            v = new Vector3(
+                rDot * Mathf.Cos(th) - r * w * Mathf.Sin(th),
+                spiralAltitudeRiseM / T,
+                rDot * Mathf.Sin(th) + r * w * Mathf.Cos(th)
+            ) * speedScale;
+
+            a = new Vector3(
+                -2.0f * rDot * w * Mathf.Sin(th) - r * w * w * Mathf.Cos(th),
+                0.0f,
+                2.0f * rDot * w * Mathf.Cos(th) - r * w * w * Mathf.Sin(th)
+            ) * speedScale * speedScale;
+
+            return;
+        }
+
+        EvaluateSquareReference(t, speedScale, out p, out v, out a);
+    }
+
+    private void EvaluateSquareReference(
+        float t,
+        float speedScale,
+        out Vector3 p,
+        out Vector3 v,
+        out Vector3 a)
+    {
+        float side = Mathf.Max(0.1f, squareSideM);
+        float speed = Mathf.Max(0.05f, squareSpeedMS);
+        float segTime = side / speed;
+        float totalTime = 4.0f * segTime;
+        float tau = Mathf.Repeat(t, totalTime);
+
+        Vector3 p0 = modeStartPositionWorld;
+        Vector3 p1 = modeStartPositionWorld + new Vector3(side, 0.0f, 0.0f);
+        Vector3 p2 = modeStartPositionWorld + new Vector3(side, 0.0f, side);
+        Vector3 p3 = modeStartPositionWorld + new Vector3(0.0f, 0.0f, side);
+
+        Vector3 a0;
+        Vector3 b0;
+
+        if (tau < segTime)
+        {
+            a0 = p0;
+            b0 = p1;
+        }
+        else if (tau < 2.0f * segTime)
+        {
+            a0 = p1;
+            b0 = p2;
+            tau -= segTime;
+        }
+        else if (tau < 3.0f * segTime)
+        {
+            a0 = p2;
+            b0 = p3;
+            tau -= 2.0f * segTime;
+        }
+        else
+        {
+            a0 = p3;
+            b0 = p0;
+            tau -= 3.0f * segTime;
+        }
+
+        float u = Mathf.Clamp01(tau / segTime);
+
+        p = Vector3.Lerp(a0, b0, u);
+        v = (b0 - a0).normalized * speed * speedScale;
+        a = Vector3.zero;
+    }
+
+    private float Smooth01(float x)
+    {
+        x = Mathf.Clamp01(x);
+        return x * x * (3.0f - 2.0f * x);
+    }
+}

@@ -1,0 +1,189 @@
+using UnityEngine;
+
+[DisallowMultipleComponent]
+public class MIMISKMiniROVTrajectoryPlanner : MonoBehaviour
+{
+    public enum TrajectoryMode
+    {
+        TextAssetTrajectory,
+        HoldAtRecoveryPoint
+    }
+
+    [Header("Trajectory Source")]
+    public TrajectoryMode trajectoryMode = TrajectoryMode.TextAssetTrajectory;
+    public TextAsset trajectoryFile;
+
+    [Header("Coordinate Mapping")]
+    [Tooltip("If ON: trajectory x/y are horizontal and trajectory z is depth/down. It maps to Unity (x, y, z) = (x, z, y).")]
+    public bool trajectoryZIsUnityVerticalY = true;
+
+    [Tooltip("If ON, trajectory positions are relative to mission origin/recovery point.")]
+    public bool trajectoryRelativeToMissionOrigin = true;
+
+    [Header("Runtime")]
+    public bool trajectoryLoaded;
+    public string trajectoryName = "none";
+    public int pointCount;
+    public float durationS;
+    public string lastEvent = "idle";
+
+    public MIMISKTrajectory loadedTrajectory;
+
+    [ContextMenu("Load Trajectory")]
+    public void LoadTrajectory()
+    {
+        if (trajectoryFile == null)
+        {
+            trajectoryLoaded = false;
+            loadedTrajectory = null;
+            pointCount = 0;
+            durationS = 0.0f;
+            trajectoryName = "none";
+            lastEvent = "missing_trajectory_file";
+            return;
+        }
+
+        loadedTrajectory =
+            MIMISKTrajectory.FromText(
+                trajectoryFile.text,
+                trajectoryFile.name
+            );
+
+        trajectoryLoaded =
+            loadedTrajectory != null &&
+            loadedTrajectory.IsValid;
+
+        trajectoryName =
+            trajectoryFile.name;
+
+        pointCount =
+            trajectoryLoaded && loadedTrajectory.points != null
+                ? loadedTrajectory.points.Count
+                : 0;
+
+        durationS =
+            trajectoryLoaded
+                ? loadedTrajectory.Duration
+                : 0.0f;
+
+        lastEvent =
+            trajectoryLoaded
+                ? "trajectory_loaded_points_" + pointCount
+                : "trajectory_invalid";
+    }
+
+    public bool IsReady()
+    {
+        if (!trajectoryLoaded)
+        {
+            LoadTrajectory();
+        }
+
+        return trajectoryLoaded;
+    }
+
+    public MIMISKMiniROVReference Evaluate(
+        float missionTimeS,
+        Vector3 missionOriginWorld)
+    {
+        MIMISKMiniROVReference r =
+            new MIMISKMiniROVReference();
+
+        r.valid = false;
+        r.missionTimeS = missionTimeS;
+        r.source = "trajectory_planner";
+
+        if (!IsReady())
+        {
+            return r;
+        }
+
+        MIMISKTrajectoryPoint p =
+            loadedTrajectory.Evaluate(missionTimeS);
+
+        Vector3 localPosition =
+            p.position;
+
+        Vector3 localVelocity =
+            p.velocity;
+
+        Vector3 worldPosition =
+            TrajectoryLocalToWorld(localPosition, missionOriginWorld);
+
+        Vector3 worldVelocity =
+            TrajectoryLocalVectorToWorld(localVelocity);
+
+        r.valid = true;
+        r.positionWorld = worldPosition;
+        r.velocityWorld = worldVelocity;
+        r.hasVelocity = p.hasVelocity;
+        r.hasYaw = p.hasYaw;
+        r.yawDeg = p.hasYaw ? p.yawRad * Mathf.Rad2Deg : 0.0f;
+        r.depthMeters = Mathf.Max(0.0f, -localPosition.z);
+        r.source = trajectoryName;
+
+        return r;
+    }
+
+    public MIMISKMiniROVReference MakeRecoveryReference(
+        Vector3 recoveryPointWorld,
+        float missionTimeS)
+    {
+        MIMISKMiniROVReference r =
+            new MIMISKMiniROVReference();
+
+        r.valid = true;
+        r.missionTimeS = missionTimeS;
+        r.positionWorld = recoveryPointWorld;
+        r.velocityWorld = Vector3.zero;
+        r.hasVelocity = false;
+        r.hasYaw = false;
+        r.depthMeters = Mathf.Max(0.0f, -recoveryPointWorld.y);
+        r.yawDeg = 0.0f;
+        r.source = "recovery_point";
+
+        return r;
+    }
+
+    public bool IsComplete(float missionTimeS)
+    {
+        if (!IsReady())
+        {
+            return false;
+        }
+
+        if (loadedTrajectory == null || !loadedTrajectory.IsValid)
+        {
+            return false;
+        }
+
+        return missionTimeS >= loadedTrajectory.points[loadedTrajectory.points.Count - 1].time;
+    }
+
+    private Vector3 TrajectoryLocalToWorld(
+        Vector3 local,
+        Vector3 originWorld)
+    {
+        if (!trajectoryRelativeToMissionOrigin)
+        {
+            originWorld = Vector3.zero;
+        }
+
+        if (trajectoryZIsUnityVerticalY)
+        {
+            return originWorld + new Vector3(local.x, local.z, local.y);
+        }
+
+        return originWorld + local;
+    }
+
+    private Vector3 TrajectoryLocalVectorToWorld(Vector3 local)
+    {
+        if (trajectoryZIsUnityVerticalY)
+        {
+            return new Vector3(local.x, local.z, local.y);
+        }
+
+        return local;
+    }
+}
