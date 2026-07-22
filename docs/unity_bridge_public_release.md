@@ -64,19 +64,4 @@ Connect On Start = true
 Reconnect If Failed = true
 ```
 
-## Public release note
 
-The bridge scripts should not contain hard-coded private scene paths. Scene object names such as `Drone`, `MiniROV`, `DroneCamera`, and `FrontCamera` may be used as defaults, but all references should be editable in the Unity Inspector.
-
-## What not to release initially
-
-Do not include the following in the bridge-only package unless licensing and cleanup are complete:
-
-```text
-large scene files
-third-party 3D models
-private assets
-old prototype tether scripts
-experimental backups
-large logs or rosbags
-```
