@@ -13,6 +13,28 @@ MIMISK-Sim is a Unity-based aerial--aquatic digital-twin simulator for drone-dep
 - ROS2/gRPC bridge for telemetry, camera streams, commands, manual input, and external references.
 
 
+
+## Demo
+
+<p align="center">
+  <video src="figures/media/mimisk_sim_complete_demo.mp4" controls width="900"></video>
+</p>
+
+<p align="center">
+  <em>Complete MIMISK-Sim mission demonstration: surface deployment, underwater MiniROV inspection, runtime tether tracking, and recovery and reattachment.</em>
+</p>
+
+### Preview
+
+<p align="center">
+  <img src="figures/media/mimisk_sim_4panel_demo_900.gif" alt="MIMISK-Sim workflow demo" width="900"/>
+</p>
+
+<p align="center">
+  <em>Surface deployment, underwater MiniROV inspection, runtime tether tracking, and Recovery and Reattachment.</em>
+</p>
+
+
 ## Repository Structure
 
 ```text
